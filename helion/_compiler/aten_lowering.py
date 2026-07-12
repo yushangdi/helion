@@ -22,6 +22,7 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .cute.argreduce import codegen_cute_tile_argreduce
+from .cute.cute_mma import codegen_cute_mma
 from .cute.cute_mma import codegen_cute_mma_direct_mm
 from .cute.indexing import CutePackedAffineLoad
 from .cute.indexing import CuteShapeChainView
@@ -1210,6 +1211,10 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         if out_dtype is not None
         else None
     )
+    if node.target is torch.ops.aten.bmm.default:
+        mma_result = codegen_cute_mma(ctx, node, with_acc=False)
+        if mma_result is not None:
+            return mma_result
     direct_mma_result = codegen_cute_mma_direct_mm(
         ctx,
         node,

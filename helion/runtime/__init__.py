@@ -2433,6 +2433,19 @@ def _append_cute_wrapper_plan(
         assert value is None or isinstance(value, str)
         return value
 
+    def append_permuted_cute_tensor_view(
+        name: str,
+        arg_idx: int,
+        order: tuple[int, ...],
+    ) -> None:
+        shape = ", ".join(f"arg{arg_idx}_shape{dim}" for dim in order)
+        stride = ", ".join(f"arg{arg_idx}_stride{dim}" for dim in order)
+        body.append(
+            f"    {name} = cute.make_tensor("
+            f"arg{arg_idx}.iterator, "
+            f"layout=cute.make_layout(({shape}), stride=({stride})))"
+        )
+
     def require_positive_int(value: int | None, name: str) -> int:
         assert type(value) is int, name
         assert value > 0, name
@@ -2451,8 +2464,10 @@ def _append_cute_wrapper_plan(
         epi_tile_n: int | None = None,
         d_store_box_n: int | None = None,
         epi_tile_raw_expr: str | None = None,
+        tensor_name: str | None = None,
     ) -> None:
         assert len(kernel_args) == 2
+        tensor_expr = tensor_name if tensor_name is not None else f"arg{tensor_idx}"
         explicit_epi_tile = any(
             value is not None for value in (epi_tile_m, epi_tile_n, d_store_box_n)
         )
@@ -2497,13 +2512,13 @@ def _append_cute_wrapper_plan(
                 ),
                 (
                     f"    {cta_v_layout} = cute.composition("
-                    f"cute.make_identity_layout(arg{tensor_idx}.shape), {epi_tile})"
+                    f"cute.make_identity_layout({tensor_expr}.shape), {epi_tile})"
                 ),
                 (
                     f"    {tma_atom}, {tma_tensor} = "
                     "cute.nvgpu.cpasync.make_tiled_tma_atom("
                     f"{copy_op}, "
-                    f"arg{tensor_idx}, cute.slice_({smem_layout}, (None, None, 0)), "
+                    f"{tensor_expr}, cute.slice_({smem_layout}, (None, None, 0)), "
                     f"{cta_v_layout})"
                 ),
             )
@@ -2561,12 +2576,10 @@ def _append_cute_wrapper_plan(
         hd = head_dim
         dtype = str(plan.get("dtype", "cutlass.Float16"))
         assert dtype in ("cutlass.Float16", "cutlass.BFloat16")
-        # (S, D, B) views over the existing (B, S, D) row-major buffers.
+        # (S, D, B) / (D, S, B) views over the existing (B, S, D) buffers.
         bw = "cutlass.utils.blackwell_helpers"
         qkd = f"(128, 128, {hd})"
         pvd = f"(128, {hd}, 128)"
-        sdb = f"cute.make_layout(({seq}, {hd}, {batch}), stride=({hd}, 1, {seq * hd}))"
-        dsb = f"cute.make_layout(({hd}, {seq}, {batch}), stride=(1, {hd}, {seq * hd}))"
         ssb = (
             f"cute.make_layout(({seq}, {seq}, {batch}), stride=({seq}, 1, {seq * seq}))"
         )
@@ -2574,12 +2587,11 @@ def _append_cute_wrapper_plan(
         majk = "cute.nvgpu.OperandMajorMode.K"
         cg1 = "cute.nvgpu.tcgen05.CtaGroup.ONE"
         sel = "cute.select"
+        append_permuted_cute_tensor_view("_flash_mQ", q_idx, (1, 2, 0))
+        append_permuted_cute_tensor_view("_flash_mK", k_idx, (1, 2, 0))
+        append_permuted_cute_tensor_view("_flash_mV", v_idx, (2, 1, 0))
+        append_permuted_cute_tensor_view("_flash_mO", o_idx, (1, 2, 0))
         flash_lines = [
-            f"_flash_mQ = cute.make_tensor(arg{q_idx}.iterator, {sdb})",
-            f"_flash_mK = cute.make_tensor(arg{k_idx}.iterator, {sdb})",
-            # V is MN-major: (D, S, B).
-            f"_flash_mV = cute.make_tensor(arg{v_idx}.iterator, {dsb})",
-            f"_flash_mO = cute.make_tensor(arg{o_idx}.iterator, {sdb})",
             f"_flash_qk_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majk}, cutlass.Float32, {cg1}, (128, 128))",
             f"_flash_pv_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, cute.nvgpu.OperandMajorMode.MN, cutlass.Float32, {cg1}, (128, {hd}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
             f"_flash_qsl = {bw}.make_smem_layout_a(_flash_qk_mma, {qkd}, {dtype}, {q_stage})",
@@ -2718,6 +2730,10 @@ def _append_cute_wrapper_plan(
         c_stage_count = plan_int("c_stage_count")
         output_dtype = str(plan["output_dtype"])
         kernel_args = [str(arg) for arg in cast("list[object]", plan["kernel_args"])]
+        d_tensor_name = None
+        if bool(plan.get("d_batched")):
+            d_tensor_name = f"{kernel_args[0]}_d_tma"
+            append_permuted_cute_tensor_view(d_tensor_name, d_idx, (1, 2, 0))
         append_tcgen05_epilogue_tma_wrapper(
             tensor_idx=d_idx,
             bm=bm,
@@ -2730,6 +2746,7 @@ def _append_cute_wrapper_plan(
             epi_tile_n=plan_optional_int("epi_tile_n"),
             d_store_box_n=plan_optional_int("d_store_box_n"),
             epi_tile_raw_expr=plan_optional_str("epi_tile_raw_expr"),
+            tensor_name=d_tensor_name,
         )
         return
     if kind == "tcgen05_aux_tma":
@@ -2780,6 +2797,8 @@ def _append_cute_wrapper_plan(
     # K-major (column-major / K-contiguous) B. Absent on the MN-major
     # (row-major B) default path.
     b_k_major = bool(plan.get("b_k_major"))
+    lhs_batched = bool(plan.get("lhs_batched"))
+    rhs_batched = bool(plan.get("rhs_batched"))
     kernel_args = [str(arg) for arg in cast("list[object]", plan["kernel_args"])]
     assert len(kernel_args) == 4
     tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b = kernel_args
@@ -2812,7 +2831,10 @@ def _append_cute_wrapper_plan(
     cluster_layout_vmnk = f"{tma_atom_a}_cluster_layout_vmnk"
     smem_a_layout = f"{tma_atom_a}_smem_layout"
     smem_b_layout = f"{tma_atom_b}_smem_layout"
+    lhs_tma = f"{tma_atom_a}_lhs_tma"
     rhs_tma = f"{tma_atom_b}_rhs_tma"
+    lhs_tma_operand = lhs_tma if lhs_batched else f"arg{lhs_idx}"
+    rhs_tma_operand = rhs_tma
     smem_a_layout_expr = tcgen05_smem_layout_expr(
         tiled_mma=tiled_mma,
         bm=bm,
@@ -2834,36 +2856,43 @@ def _append_cute_wrapper_plan(
         swizzle_override=smem_swizzle_b,
         b_k_major=b_k_major,
     )
-    body.extend(
+    if lhs_batched:
+        append_permuted_cute_tensor_view(lhs_tma, lhs_idx, (1, 2, 0))
+    if rhs_batched:
+        append_permuted_cute_tensor_view(rhs_tma, rhs_idx, (2, 1, 0))
+    ab_tma_lines = [
         (
-            (
-                f"    {tiled_mma} = cutlass.utils.blackwell_helpers.make_trivial_tiled_mma("
-                f"{input_dtype}, "
-                f"{input_dtype}, "
+            f"    {tiled_mma} = cutlass.utils.blackwell_helpers.make_trivial_tiled_mma("
+            f"{input_dtype}, "
+            f"{input_dtype}, "
+            "cute.nvgpu.OperandMajorMode.K, "
+            + (
                 "cute.nvgpu.OperandMajorMode.K, "
-                + (
-                    "cute.nvgpu.OperandMajorMode.K, "
-                    if b_k_major
-                    else "cute.nvgpu.OperandMajorMode.MN, "
-                )
-                + f"{acc_dtype}, "
-                f"{cta_group}, "
-                f"({bm}, {bn}), "
-                "cute.nvgpu.tcgen05.OperandSource.SMEM)"
-            ),
-            (
-                f"    {cluster_layout_vmnk} = cute.tiled_divide("
-                f"cute.make_layout({cluster_shape}), ({tiled_mma}.thr_id.shape,))"
-            ),
-            f"    {smem_a_layout} = {smem_a_layout_expr}",
-            f"    {smem_b_layout} = {smem_b_layout_expr}",
-            (
-                f"    {rhs_tma} = cute.make_tensor("
-                f"arg{rhs_idx}.iterator, "
-                "layout=cute.make_layout("
-                f"(arg{rhs_idx}_shape1, arg{rhs_idx}_shape0), "
-                f"stride=(arg{rhs_idx}_stride1, arg{rhs_idx}_stride0)))"
-            ),
+                if b_k_major
+                else "cute.nvgpu.OperandMajorMode.MN, "
+            )
+            + f"{acc_dtype}, "
+            f"{cta_group}, "
+            f"({bm}, {bn}), "
+            "cute.nvgpu.tcgen05.OperandSource.SMEM)"
+        ),
+        (
+            f"    {cluster_layout_vmnk} = cute.tiled_divide("
+            f"cute.make_layout({cluster_shape}), ({tiled_mma}.thr_id.shape,))"
+        ),
+        f"    {smem_a_layout} = {smem_a_layout_expr}",
+        f"    {smem_b_layout} = {smem_b_layout_expr}",
+    ]
+    if not rhs_batched:
+        ab_tma_lines.append(
+            f"    {rhs_tma} = cute.make_tensor("
+            f"arg{rhs_idx}.iterator, "
+            "layout=cute.make_layout("
+            f"(arg{rhs_idx}_shape1, arg{rhs_idx}_shape0), "
+            f"stride=(arg{rhs_idx}_stride1, arg{rhs_idx}_stride0)))"
+        )
+    ab_tma_lines.extend(
+        [
             # B is viewed as (N, K). For row-major B (MN-major) the N axis
             # (position 0) is contiguous; for column-major B (K-major, native
             # fp8 layout) the K axis (position 1) is contiguous.
@@ -2885,7 +2914,7 @@ def _append_cute_wrapper_plan(
                 f"    {tma_atom_a}, {tma_tensor_a} = cute.nvgpu.make_tiled_tma_atom_A("
                 "cutlass.utils.blackwell_helpers.cluster_shape_to_tma_atom_A("
                 f"{cluster_shape}, {tiled_mma}.thr_id), "
-                f"arg{lhs_idx}, "
+                f"{lhs_tma_operand}, "
                 f"cute.slice_({smem_a_layout}, (None, None, None, 0)), "
                 f"({bm}, {bn}, {bk}), {tiled_mma}"
                 + (f", {cluster_layout_vmnk}.shape" if cluster_n > 1 else "")
@@ -2898,12 +2927,13 @@ def _append_cute_wrapper_plan(
                 f"    {tma_atom_b}, {tma_tensor_b} = cute.nvgpu.make_tiled_tma_atom_B("
                 "cutlass.utils.blackwell_helpers.cluster_shape_to_tma_atom_B("
                 f"{cluster_shape}, {tiled_mma}.thr_id), "
-                f"{rhs_tma}, "
+                f"{rhs_tma_operand}, "
                 f"cute.slice_({smem_b_layout}, (None, None, None, 0)), "
                 f"({bm}, {bn}, {bk}), {tiled_mma}, {cluster_layout_vmnk}.shape)"
             ),
-        )
+        ]
     )
+    body.extend(ab_tma_lines)
     call_args.extend(kernel_args)
 
 
@@ -3573,15 +3603,25 @@ def _build_cute_schema_and_args(
     if bake_tensor_shapes:
         any_obj = cast("Any", cute_kernel)
         wrapper_plans = getattr(any_obj, "_helion_cute_wrapper_plans", None)
-        wrapper_plans_disable_bake = bool(wrapper_plans) and not all(
-            plan.get("kind") == "helion_small_biased_attention"
+        # tcgen05 matmul plans already bake the static tile/problem shapes into
+        # the device code, so baking the wrapper's tensor shapes is safe here and
+        # drops the redundant runtime shape/stride launch args. For 3-D (batched)
+        # operands those extra args otherwise push the launch onto CUTLASS-DSL's
+        # slow per-arg ``generate_execution_args`` path instead of the TVM-FFI
+        # fast path -- a large per-call host-overhead difference. The dynamic
+        # shape/stride propagation that baking would miscompile only exists on
+        # the universal (non-tcgen05) MMA path, which carries no wrapper plans.
+        plans_bakeable = bool(wrapper_plans) and all(
+            str(plan.get("kind", "")).startswith("tcgen05")
+            or plan.get("kind") == "helion_small_biased_attention"
             for plan in wrapper_plans
         )
+        wrapper_plans_disable_bake = bool(wrapper_plans) and not plans_bakeable
         disable_bake = bool(
             getattr(any_obj, "_helion_cute_disable_bake_tensor_shapes", False)
             or wrapper_plans_disable_bake
         )
-        if disable_bake:
+        if disable_bake and not plans_bakeable:
             bake_tensor_shapes = False
     schema: list[tuple[object, ...]] = []
     launch_args: list[object] = []
