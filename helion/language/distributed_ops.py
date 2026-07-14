@@ -396,3 +396,4 @@ def _(tracer: object, descriptor: AsyncCopyDescriptor) -> None:
 # @_decorators.codegen(op, "<backend>") registrations run with the same eager
 # timing as when the bodies lived in this file -- no behavior change.
 from .._compiler.pallas import pallas_distributed_ops  # noqa: E402, F401
+from .._compiler.triton import triton_distributed_ops  # noqa: E402, F401
