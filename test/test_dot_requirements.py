@@ -126,6 +126,11 @@ _cute_two_matmuls_force_persistent_kernel = helion.kernel(
     backend="cute",
     autotune_force_persistent=True,
 )
+_cute_two_matmuls_distributed_kernel = helion.kernel(
+    _cute_two_matmuls_impl,
+    backend="cute",
+    distributed=True,
+)
 
 
 @helion.kernel(backend="cute")
@@ -1737,7 +1742,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 "CuTe tcgen05 multi-root kernels do not support persistent pid types",
             ),
         ):
-            _cute_two_matmuls_kernel.bind(args)
+            _cute_two_matmuls_distributed_kernel.bind(args)
 
     def test_narrow_tcgen05_autotune_to_validated_configs_helper(self) -> None:
         """Direct unit test for the narrowing helper that does not depend

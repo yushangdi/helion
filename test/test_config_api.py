@@ -328,10 +328,11 @@ class TestSettingsEnv(TestCase):
     def test_distributed_limits_pid_types_to_persistent(self) -> None:
         settings = helion.Settings()
         with (
-            patch("torch.distributed.is_initialized", return_value=True),
             patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
         ):
-            env = CompileEnvironment(torch.device("cuda", 0), settings)
+            env = CompileEnvironment(
+                torch.device("cuda", 0), settings, is_distributed=True
+            )
         self.assertEqual(
             env.config_spec.allowed_pid_types,
             ("persistent_blocked", "persistent_interleaved"),
@@ -341,11 +342,12 @@ class TestSettingsEnv(TestCase):
         # max_blocks=10000, 200 SMs -> 10000 // 200 = 50 -> floor pow2 = 32
         settings = helion.Settings()
         with (
-            patch("torch.distributed.is_initialized", return_value=True),
             patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
             patch("helion.runtime.get_num_sm", return_value=200),
         ):
-            env = CompileEnvironment(torch.device("cuda", 0), settings)
+            env = CompileEnvironment(
+                torch.device("cuda", 0), settings, is_distributed=True
+            )
         self.assertEqual(env.config_spec.max_num_sm_multiplier, 32)
 
     def test_persistent_block_limit_handles_zero_raw_max(self) -> None:
@@ -353,11 +355,12 @@ class TestSettingsEnv(TestCase):
         # without crashing on `1 << -1`.
         settings = helion.Settings()
         with (
-            patch("torch.distributed.is_initialized", return_value=True),
             patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=144),
             patch("helion.runtime.get_num_sm", return_value=148),
         ):
-            env = CompileEnvironment(torch.device("cuda", 0), settings)
+            env = CompileEnvironment(
+                torch.device("cuda", 0), settings, is_distributed=True
+            )
         self.assertEqual(env.config_spec.max_num_sm_multiplier, 1)
 
     def test_backend_env_var_accepts_cute(self) -> None:
