@@ -121,6 +121,81 @@ def bench_serial(call: Callable[[], object], warmup: int, rep: int) -> float:
     return times[len(times) // 2]
 
 
+_FILLER: tuple[Callable[[], object], int] | None = None
+
+
+def _filler(target_us: float) -> tuple[Callable[[], object], int]:
+    """A kernel-agnostic GPU-time filler used to keep the launch queue deep.
+
+    A fixed matmul repeated so one ``filler`` burst is ~``target_us`` of GPU work
+    (roughly one transformer layer's non-target GPU time). Calibrated once and
+    cached per process; the exact op does not matter, only that it occupies the
+    GPU so the queue stays saturated while the target op launches.
+    """
+    global _FILLER
+    if _FILLER is not None:
+        return _FILLER
+    a = torch.randn(1024, 4096, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+
+    def mm() -> None:
+        torch.mm(a, b)
+
+    mm()
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(20):
+        mm()
+    torch.cuda.synchronize()
+    one_us = (time.perf_counter() - t0) / 20 * 1e6
+    _FILLER = (mm, max(1, round(target_us / one_us)))
+    return _FILLER
+
+
+def bench_busy(
+    call: Callable[[], object], warmup: int, rep: int, fill_us: float = 45.0
+) -> float:
+    """Median per-call HOST latency (ms) under a saturated GPU launch queue.
+
+    ``bench_serial`` syncs after *every* call, so the launch queue is always
+    empty and the launch never blocks -- it cannot see the launch backpressure an
+    op pays in a real eager forward, where the layer's matmuls sit ahead of it in
+    the queue and ``cuLaunchKernel*`` stalls on queue space / the driver lock.
+    This mode keeps the queue deep with a GPU-time filler (~``fill_us`` per
+    iteration) and times ONLY the call with ``perf_counter``, never syncing per
+    call, so it reproduces the host-bound cost -- driver launch contention plus
+    host dispatch -- that a busy serving loop actually experiences. (In practice
+    this tracks the in-model host time to within a few us; ``--serial`` and
+    ``--walltime`` do not, because they run the op on an otherwise-idle GPU.)
+    """
+    mm, nfill = _filler(fill_us)
+
+    def timed_once() -> float:
+        for _ in range(nfill):
+            mm()  # enqueue GPU work; do NOT sync -> queue stays deep
+        start = time.perf_counter()
+        call()  # launches into a deep queue -> blocks like a real forward
+        return (time.perf_counter() - start) * 1e3
+
+    call()  # ensure compiled
+    torch.cuda.synchronize()
+
+    estimate_start = time.perf_counter()
+    for _ in range(5):
+        timed_once()
+    torch.cuda.synchronize()
+    estimate_ms = (time.perf_counter() - estimate_start) * 1e3 / 5
+
+    n_warmup = max(1, int(warmup / estimate_ms)) if estimate_ms > 0 else 25
+    n_repeat = max(1, int(rep / estimate_ms)) if estimate_ms > 0 else 100
+    for _ in range(n_warmup):
+        timed_once()
+    torch.cuda.synchronize()
+
+    times = sorted(timed_once() for _ in range(n_repeat))
+    return times[len(times) // 2]
+
+
 def _bench(
     call: Callable[[], object],
     use_cudagraph: bool,
@@ -128,9 +203,13 @@ def _bench(
     rep: int,
     walltime: bool = False,
     serial: bool = False,
+    busy: bool = False,
+    fill_us: float = 45.0,
 ) -> float:
     if serial:
         return bench_serial(call, warmup=warmup, rep=rep)
+    if busy:
+        return bench_busy(call, warmup=warmup, rep=rep, fill_us=fill_us)
     if walltime:
         return bench_walltime(call, warmup=warmup, rep=rep)
     if use_cudagraph:
@@ -149,6 +228,8 @@ def run_sweep(
     verbose: bool = True,
     walltime: bool = False,
     serial: bool = False,
+    busy: bool = False,
+    fill_us: float = 45.0,
 ) -> dict:
     """Benchmark helion vs baselines over ``shapes``; return metrics (print if verbose).
 
@@ -166,6 +247,11 @@ def run_sweep(
     after every call so host dispatch and GPU execution are summed rather than
     overlapped (still clearing L2 between runs). ``serial`` takes precedence
     over ``walltime``.
+
+    ``busy=True`` times each call with ``bench_busy``, which keeps the GPU launch
+    queue saturated with a ``fill_us``-microsecond filler so the launch hits the
+    backpressure it pays in a real eager forward -- the only mode that reproduces
+    the in-model host-bound cost. ``serial`` takes precedence over ``busy``.
     """
 
     def _p(*args: object) -> None:
@@ -189,10 +275,14 @@ def run_sweep(
             header_printed = True
 
         helion_call()  # warmup / compile
-        ms_helion = _bench(helion_call, use_cudagraph, warmup, rep, walltime, serial)
+        ms_helion = _bench(
+            helion_call, use_cudagraph, warmup, rep, walltime, serial, busy, fill_us
+        )
         base_ms: dict[str, float] = {}
         for name, call in baseline_calls:
-            base_ms[name] = _bench(call, use_cudagraph, warmup, rep, walltime, serial)
+            base_ms[name] = _bench(
+                call, use_cudagraph, warmup, rep, walltime, serial, busy, fill_us
+            )
             speedups_by_base[name].append(
                 base_ms[name] / ms_helion if ms_helion > 0 else float("nan")
             )

@@ -260,6 +260,8 @@ def main(
     limit: int | None = None,
     walltime: bool = False,
     serial: bool = False,
+    busy: bool = False,
+    fill_us: float = 45.0,
 ) -> dict:
     import os
     import sys
@@ -332,6 +334,8 @@ def main(
         shape_header=f"{'tokens':>7s}  {'hidden':>6s}  {'group':>6s}",
         walltime=walltime,
         serial=serial,
+        busy=busy,
+        fill_us=fill_us,
     )
 
 
@@ -363,10 +367,27 @@ if __name__ == "__main__":
         "so CPU and GPU time are summed (not overlapped as --walltime allows); "
         "still clears L2 between runs. Takes precedence over --walltime",
     )
+    parser.add_argument(
+        "--busy",
+        action="store_true",
+        help="time host dispatch per call while keeping the GPU launch queue "
+        "saturated with a filler, so the launch hits the backpressure it pays in "
+        "a real eager forward; the only mode that reproduces in-model host cost. "
+        "Takes precedence over --walltime (but not --serial)",
+    )
+    parser.add_argument(
+        "--fill-us",
+        type=float,
+        default=45.0,
+        help="GPU-time (us) of the --busy backpressure filler per call "
+        "(~one layer's non-target GPU work); default 45",
+    )
     cli_args = parser.parse_args()
     main(
         cudagraph=not cli_args.no_cudagraph,
         limit=cli_args.limit,
         walltime=cli_args.walltime,
         serial=cli_args.serial,
+        busy=cli_args.busy,
+        fill_us=cli_args.fill_us,
     )
