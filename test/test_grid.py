@@ -125,15 +125,6 @@ class TestGrid(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))
 
     @skipIfMetal("aten.addmm not yet registered for Metal backend")
-    @xfailIfPallas(
-        "Nested hl.grid + emit_pipeline corrupts output: only the first "
-        "hl.grid level becomes a pallas_call grid axis (sliced by BlockSpec); "
-        "subsequent hl.grid levels become outer emit_pipeline bodies whose "
-        "iteration index isn't bound to a stable name before inner bodies "
-        "shadow `_pipeline_indices`. Inner indexing falls back to literal 0 "
-        "for those dims, so only the (0, 0, ...) slot of the output is "
-        "correct."
-    )
     def test_grid_2d_idx_nested(self):
         @helion.kernel(static_shapes=True)
         def grid_2d_idx_nested(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -163,10 +154,18 @@ class TestGrid(RefEagerTestBase, TestCase):
             torch.randn([3, 4, 64, 32], device=DEVICE, dtype=HALF_DTYPE),
             torch.randn([32, 16], device=DEVICE, dtype=HALF_DTYPE),
         )
-        code, result = code_and_output(grid_2d_idx_nested, args)
+        # Pin the small (mma.sync) config this test used before the H100 matmul seed
+        # heuristic began promoting a [64, 16, 16] default. That default tiles M in a
+        # single 64-wide block, which Triton lowers to a Hopper WGMMA (wgmma.mma_async);
+        # Triton miscompiles that WGMMA inside this nested-hl.grid sequential loop on sm90
+        # (every loop iteration returns iteration 0's result). Pinning keeps this test
+        # checking nested-grid correctness, decoupled from the matmul heuristic default.
+        code, result = code_and_output(
+            grid_2d_idx_nested, args, block_sizes=[16, 16, 16]
+        )
         torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))
 
-    @skipIfMetal("BUG: hl.grid begin/end broken with CuteNDTileStrategy on Metal")
+    @skipIfMetal("BUG: hl.grid begin/end broken with PerThreadNDTileStrategy on Metal")
     def test_grid_begin_end(self):
         @helion.kernel(autotune_effort="none")
         def grid_begin_end(x: torch.Tensor) -> torch.Tensor:
@@ -187,7 +186,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(grid_begin_end, (x,))
         torch.testing.assert_close(result, grid_begin_end_pytorch(x))
 
-    @skipIfMetal("BUG: hl.grid begin/end broken with CuteNDTileStrategy on Metal")
+    @skipIfMetal("BUG: hl.grid begin/end broken with PerThreadNDTileStrategy on Metal")
     def test_grid_begin_end_step(self):
         @helion.kernel(autotune_effort="none")
         def grid_begin_end_step(x: torch.Tensor) -> torch.Tensor:
@@ -208,7 +207,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(grid_begin_end_step, (x,))
         torch.testing.assert_close(result, grid_begin_end_step_pytorch(x))
 
-    @skipIfMetal("BUG: hl.grid begin/end broken with CuteNDTileStrategy on Metal")
+    @skipIfMetal("BUG: hl.grid begin/end broken with PerThreadNDTileStrategy on Metal")
     def test_grid_end_step_kwarg(self):
         @helion.kernel(autotune_effort="none")
         def grid_end_step_kwarg(x: torch.Tensor) -> torch.Tensor:

@@ -21,13 +21,13 @@ from helion._testing import code_and_output
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
-from helion._testing import skipIfCudaSharedMemoryLessThan
 from helion._testing import skipIfFn
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfSharedMemoryLessThan
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import xfailIfPallas
@@ -38,6 +38,7 @@ import helion.language as hl
 datadir = Path(__file__).parent / "data"
 basic_kernels = import_path(datadir / "basic_kernels.py")
 FIXED_BLOCK_SIZE = 16
+BLOCK_SIZE_CHOICES = (32, 256)
 
 
 @helion.kernel
@@ -69,6 +70,64 @@ def inplace_nested_loop_kernel(x: torch.Tensor) -> torch.Tensor:
         for tile_inner in hl.tile(x.size(1)):
             x[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
     return x
+
+
+@helion.kernel()
+def inplace_then_independent_reduction(
+    x: torch.Tensor, a: torch.Tensor, b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, k = a.size()
+    _, n = b.size()
+    out = torch.empty([m, n], device=a.device, dtype=a.dtype)
+    for tile in hl.tile(x.size(0)):
+        x[tile] = x[tile] + 1
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
+        out[tile_m, tile_n] = acc
+    return x, out
+
+
+@helion.kernel()
+def atomic_then_independent_reduction(
+    x: torch.Tensor, a: torch.Tensor, b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, k = a.size()
+    _, n = b.size()
+    out = torch.empty([m, n], device=a.device, dtype=a.dtype)
+    for tile_outer in hl.tile(x.size(0)):
+        for tile_inner in hl.tile(x.size(1)):
+            hl.atomic_add(x, [tile_outer, tile_inner], 1.0)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
+        out[tile_m, tile_n] = acc
+    return x, out
+
+
+@helion.kernel()
+def store_with_output_metadata(x: torch.Tensor, out: torch.Tensor) -> None:
+    for tile in hl.tile(x.size(0), block_size=1):
+        _metadata = (
+            out.device,
+            out.dim(),
+            out.dtype,
+            out.ndim,
+            out.ndimension(),
+            out.shape,
+            out.size(),
+            out.stride(),
+        )
+        hl.store(out, [tile], x[tile].to(out.dtype))
+
+
+@helion.kernel()
+def store_with_output_read(x: torch.Tensor, out: torch.Tensor) -> None:
+    for tile in hl.tile(x.size(0), block_size=1):
+        prior = hl.load(out, [tile])
+        hl.store(out, [tile], (x[tile] + prior).to(out.dtype))
 
 
 @onlyBackends(["triton", "cute", "pallas"])
@@ -522,6 +581,49 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertEqual(spec.min_size, 32)
         self.assertEqual(spec.max_size, 256)
 
+    @xfailIfPallas("config_spec introspection not applicable on pallas")
+    @skipIfRefEager(
+        "Accessing config_spec.block_sizes is not supported in ref eager mode"
+    )
+    def test_register_block_size_host_bounds(self):
+        # min/max may come from host values rather than literals, including via
+        # `*args` unpacking of a global tuple.
+        @helion.kernel()
+        def starred(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            bs = hl.register_block_size(*BLOCK_SIZE_CHOICES)
+            for tile0 in hl.tile(x.size(0), block_size=bs):
+                out[tile0] = x[tile0] + 1
+            return out
+
+        @helion.kernel()
+        def indexed(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            bs = hl.register_block_size(BLOCK_SIZE_CHOICES[0], BLOCK_SIZE_CHOICES[1])
+            for tile0 in hl.tile(x.size(0), block_size=bs):
+                out[tile0] = x[tile0] + 1
+            return out
+
+        args = (torch.randn([1024], device=DEVICE, dtype=torch.float32),)
+        for fn in (starred, indexed):
+            code, result = code_and_output(fn, args, block_size=64)
+            torch.testing.assert_close(result, args[0] + 1)
+            spec = fn.bind(args).config_spec.block_sizes[0]
+            self.assertEqual((spec.min_size, spec.max_size), BLOCK_SIZE_CHOICES)
+
+    def test_tile_starred_args(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            sizes = [x.size(0), x.size(1)]
+            for tile0, tile1 in hl.tile(*[sizes]):
+                out[tile0, tile1] = x[tile0, tile1] + 1
+            return out
+
+        args = (torch.randn([64, 64], device=DEVICE, dtype=torch.float32),)
+        code, result = code_and_output(fn, args, block_sizes=[16, 16])
+        torch.testing.assert_close(result, args[0] + 1)
+
     @skipIfTileIR("Result mismatch with tileir backend")
     @skipIfFn(
         lambda: _get_backend() == "cute",
@@ -964,11 +1066,57 @@ class TestLoops(RefEagerTestBase, TestCase):
         spec = nested_loop_kernel.bind(args).config_spec
         self.assertGreater(len(spec.range_num_stages), 0)
 
+    @xfailIfPallas("range_num_stages is Triton-specific")
+    @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
+    @skipIfRefEager("not supported in ref eager mode")
+    def test_output_metadata_read_does_not_disable_range_num_stages(self):
+        x = torch.randn([16], device=DEVICE)
+        out = torch.empty_like(x)
+        spec = store_with_output_metadata.bind((x, out)).config_spec
+        self.assertGreater(len(spec.range_num_stages), 0)
+        normalized = spec.normalized_config(
+            helion.Config(pid_type="persistent_blocked", range_num_stages=[1])
+        )
+        self.assertEqual(normalized.range_num_stages, [1])
+
+    @skipIfRefEager("not supported in ref eager mode")
+    def test_output_data_read_disables_range_num_stages(self):
+        x = torch.randn([16], device=DEVICE)
+        out = torch.empty_like(x)
+        spec = store_with_output_read.bind((x, out)).config_spec
+        self.assertEqual(len(spec.range_num_stages), 0)
+
     @skipIfRefEager("not supported in ref eager mode")
     def test_range_num_stages_removed_for_inplace_kernel(self):
         args = (torch.randn([16, 16], device=DEVICE),)
         spec = inplace_nested_loop_kernel.bind(args).config_spec
         self.assertEqual(len(spec.range_num_stages), 0)
+
+    @xfailIfPallas("range_num_stages is Triton-specific")
+    @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
+    @skipIfRefEager("not supported in ref eager mode")
+    def test_inplace_loop_only_disables_its_own_pipeline(self):
+        args = (
+            torch.randn([16], device=DEVICE),
+            torch.randn([16, 16], device=DEVICE),
+            torch.randn([16, 16], device=DEVICE),
+        )
+        spec = inplace_then_independent_reduction.bind(args).config_spec
+        self.assertGreater(len(spec.range_num_stages), 0)
+
+    @xfailIfPallas("range_num_stages is Triton-specific")
+    @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
+    @skipIfRefEager("not supported in ref eager mode")
+    def test_atomic_loop_only_disables_its_own_pipeline(self):
+        args = (
+            torch.randn([16, 16], device=DEVICE),
+            torch.randn([16, 16], device=DEVICE),
+            torch.randn([16, 16], device=DEVICE),
+        )
+        spec = atomic_then_independent_reduction.bind(args).config_spec
+        valid_block_ids = spec.range_num_stages.valid_block_ids()
+        self.assertNotIn(1, valid_block_ids)
+        self.assertIn(4, valid_block_ids)
 
     @skipIfTileIR("tileir backend will ignore `range_multi_buffers` hint")
     @skipIfNotTriton("range loop hints are Triton-specific")
@@ -1465,6 +1613,43 @@ class TestLoops(RefEagerTestBase, TestCase):
         # change num_stages=1
         self.assertIn("num_stages=1", code)
 
+        one_warp_code, one_warp_result = code_and_output(
+            matmul,
+            (a, b),
+            block_sizes=[64, 16, 16],
+            indexing="block_ptr",
+            loop_orders=[[1, 0]],
+            num_warps=1,
+            pid_type="persistent_blocked",
+            range_num_stages=[4, 2],
+            range_unroll_factors=[4, 4],
+        )
+        torch.testing.assert_close(one_warp_result, expected, atol=1e-2, rtol=1e-2)
+        self.assertIn("num_stages=4", one_warp_code)
+
+        if torch.cuda.is_available() and torch.cuda.get_device_capability() >= (10, 0):
+            effective_multi_warp_code, effective_multi_warp_result = code_and_output(
+                matmul,
+                (a, b),
+                block_sizes=[64, 16, 16],
+                indexing="block_ptr",
+                loop_orders=[[1, 0]],
+                num_warps=1,
+                pid_type="persistent_blocked",
+                range_num_stages=[4, 2],
+                range_unroll_factors=[4, 4],
+                range_warp_specializes=[None, True],
+            )
+            torch.testing.assert_close(
+                effective_multi_warp_result,
+                expected,
+                atol=1e-2,
+                rtol=1e-2,
+            )
+            self.assertIn("warp_specialize=True", effective_multi_warp_code)
+            self.assertIn("num_warps=4", effective_multi_warp_code)
+            self.assertNotIn("num_stages=4", effective_multi_warp_code)
+
     def test_loop_with_symbolic_bounds(self):
         @helion.kernel(
             config=helion.Config(
@@ -1482,10 +1667,88 @@ class TestLoops(RefEagerTestBase, TestCase):
         x = torch.randn(128, 1024, dtype=torch.float32, device=DEVICE)
         torch.testing.assert_close(fn(x), x)
 
+    @skipIfRefEager("inspects generated code; ref eager never lowers a kernel")
+    @skipIfNotTriton(
+        "asserts on Triton's rendered bound; Pallas lowers a dependent tile "
+        "bound through its own loop codegen and never reaches this path"
+    )
+    def test_min_max_over_derived_tile_edge_keeps_its_own_formula(self):
+        """A tile edge folded into ``min``/``max`` must keep its own formula.
+
+        ``min``/``max`` are device function replacements, so they fold their
+        operands into one sympy expression at trace time.  That drops the
+        ``tile_end``/``tile_count``/``tile_id`` op and leaves a bare symbol,
+        whose origin then has to be honored when it is rendered.  Emitting the
+        loop offset for all of them substitutes ``tile.begin``: for an end
+        bound that is a zero trip count on the first tile.
+
+        The 200x200 input is deliberately not a multiple of the 128 block, so
+        the final tile is partial and the end has to clamp.
+        """
+        cfg = helion.Config(block_sizes=[128, 128])
+
+        @helion.kernel(config=cfg)
+        def end_min(x) -> torch.Tensor:
+            out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            for tile_q in hl.tile(x.size(0)):
+                acc = hl.zeros([tile_q], dtype=torch.float32)
+                for tile_k in hl.tile(0, min(x.size(1), tile_q.end)):
+                    acc += x[tile_q, tile_k].sum(-1)
+                out[tile_q] = acc.to(out.dtype)
+            return out
+
+        @helion.kernel(config=cfg)
+        def end_max(x) -> torch.Tensor:
+            out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            for tile_q in hl.tile(x.size(0)):
+                acc = hl.zeros([tile_q], dtype=torch.float32)
+                for tile_k in hl.tile(0, max(8, tile_q.end)):
+                    acc += x[tile_q, tile_k].sum(-1)
+                out[tile_q] = acc.to(out.dtype)
+            return out
+
+        @helion.kernel(config=cfg)
+        def count_min(x) -> torch.Tensor:
+            out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            for tile_q in hl.tile(x.size(0)):
+                acc = hl.zeros([tile_q], dtype=torch.float32)
+                for tile_k in hl.tile(0, min(x.size(1), tile_q.count)):
+                    acc += x[tile_q, tile_k].sum(-1)
+                out[tile_q] = acc.to(out.dtype)
+            return out
+
+        @helion.kernel(config=cfg)
+        def id_min(x) -> torch.Tensor:
+            out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            for tile_q in hl.tile(x.size(0)):
+                acc = hl.zeros([tile_q], dtype=torch.float32)
+                for tile_k in hl.tile(0, min(x.size(1), 2 * tile_q.id + 1)):
+                    acc += x[tile_q, tile_k].sum(-1)
+                out[tile_q] = acc.to(out.dtype)
+            return out
+
+        x = torch.randn(200, 200, device=DEVICE)
+        # Each edge renders its own formula; the offset alone would mean begin.
+        # The id case also pins the parenthesization: unbracketed, ``2 *
+        # offset_0 // BLOCK`` would floor-divide the product instead.
+        for label, kernel, fragment in (
+            ("end/min", end_min, "offset_0 + _BLOCK_SIZE_0"),
+            ("end/max", end_max, "offset_0 + _BLOCK_SIZE_0"),
+            ("count", count_min, "tl.cdiv("),
+            ("id", id_min, "2 * (offset_0 // _BLOCK_SIZE_0)"),
+        ):
+            with self.subTest(edge=label):
+                # Codegen the declared config, not the spec default: the
+                # partial final tile depends on the 128 block size.
+                code = kernel.bind((x,)).to_triton_code(cfg)
+                rendered = [ln for ln in code.splitlines() if "symnode_0 = " in ln]
+                self.assertTrue(rendered, f"no rendered bound in:\n{code}")
+                self.assertIn(fragment, rendered[0])
+
     @skipIfNotTriton(
         "tl.debug_barrier() is only emitted in Triton device codegen (not Pallas/JAX)"
     )
-    @skipIfCudaSharedMemoryLessThan(
+    @skipIfSharedMemoryLessThan(
         131072, reason="block sizes exceed device shared memory limit"
     )
     def test_sequential_loops_global_memory_barrier(self):
@@ -1572,7 +1835,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         "tl.debug_barrier() is Triton codegen-specific; "
         "the negative assertion is trivially true on non-Triton backends"
     )
-    @skipIfCudaSharedMemoryLessThan(
+    @skipIfSharedMemoryLessThan(
         65536, reason="block sizes exceed device shared memory limit"
     )
     def test_sequential_loops_no_barrier_without_cross_loop_raw(self):

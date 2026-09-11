@@ -4,6 +4,8 @@ from typing import TYPE_CHECKING
 
 from .. import exc
 from .base_search import BaseSearch
+from .benchmark_provider import LocalBenchmarkProvider
+from .benchmark_provider import _MultiShapeAutotuneArgs
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -12,6 +14,7 @@ if TYPE_CHECKING:
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from .base_search import _AutotunableKernel
+    from .benchmark_provider import BenchmarkProvider
     from .config_generation import ConfigGeneration
 
 
@@ -26,8 +29,17 @@ class FiniteSearch(BaseSearch):
         kernel: _AutotunableKernel,
         args: Sequence[object],
         configs: Sequence[Config] | None = None,
+        *,
+        benchmark_provider_cls: Callable[..., BenchmarkProvider] | None = None,
     ) -> None:
-        super().__init__(kernel, args)
+        if benchmark_provider_cls is None:
+            super().__init__(kernel, args)
+        else:
+            super().__init__(
+                kernel,
+                args,
+                benchmark_provider_cls=benchmark_provider_cls,
+            )
         self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
             overrides=self.settings.autotune_config_overrides or None,
             advanced_controls_files=self.settings.autotune_search_acf or None,
@@ -38,6 +50,18 @@ class FiniteSearch(BaseSearch):
         if len(self.configs) < 2:
             raise exc.NotEnoughConfigs(len(self.configs))
 
+    def _algorithm_cache_policy(self) -> dict[str, object] | None:
+        if self._benchmark_provider_cls is not LocalBenchmarkProvider:
+            return None
+        return {
+            "finite_version": 1,
+            "configs": tuple(self.configs),
+            "benchmark_provider": LocalBenchmarkProvider,
+        }
+
+    def _generation_invalid_config_count(self) -> int:
+        return self.config_gen.invalid_config_count
+
     def _autotune(self) -> Config:
         best_config = None
         best_time = float("inf")
@@ -45,6 +69,8 @@ class FiniteSearch(BaseSearch):
             if result.perf < best_time:
                 best_time = result.perf
                 best_config = result.config
+        if best_config is None and isinstance(self.args, _MultiShapeAutotuneArgs):
+            raise exc.NoConfigFound
         assert best_config is not None
         return best_config
 

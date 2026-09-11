@@ -219,7 +219,7 @@ if triton_is_available():
             if not torch.xpu.is_available():
                 return False
 
-            return version.parse(triton.__version__) >= version.parse("3.5")
+            return get_triton_version() >= version.parse("3.5")
 
         if not (_cuda_tensor_desc_available() or _xpu_tensor_desc_available()):
             return False
@@ -340,6 +340,14 @@ else:
 
     def use_tileir_tunables() -> bool:  # type: ignore[misc]
         return False
+
+
+@functools.cache
+def get_triton_version() -> version.Version:
+    """Return the installed Triton version as a parsed, cached value."""
+    import triton
+
+    return version.parse(triton.__version__)
 
 
 def supports_tensor_descriptor() -> bool:
@@ -480,47 +488,6 @@ def supports_amd_cdna_tunables() -> bool:
         return False
 
 
-# CUs per XCD by base CDNA architecture.  Used to derive the live,
-# partition-visible XCD count from the observed CU count (see get_num_xcd).
-_CUS_PER_XCD: dict[str, int] = {
-    "gfx942": 38,  # CDNA3 (MI300)
-    "gfx950": 32,  # CDNA4 (MI350)
-    "gfx951": 32,  # CDNA4 (MI355)
-}
-
-
-def get_num_xcd(device: torch.device | int | None = None) -> int:
-    """Number of XCDs visible for ``device`` on AMD CDNA, else ``1``.
-
-    Derived from the live, partition-visible compute-unit count rather than the
-    architecture name, so MI300A (6 XCDs) and compute-partition modes such as CPX
-    (which expose a single XCD) are handled correctly.  Returns ``1`` -- which
-    disables xcd_remap -- for unknown architectures or a CU count that does not
-    look like an integer number of XCDs.
-    """
-    if not torch.cuda.is_available():
-        return 1
-    try:
-        props = torch.cuda.get_device_properties(
-            device if device is not None else torch.cuda.current_device()
-        )
-    except Exception:
-        return 1
-    arch = getattr(props, "gcnArchName", None)
-    if not arch:
-        return 1
-    cus_per_xcd = _CUS_PER_XCD.get(arch.split(":")[0])
-    if cus_per_xcd is None:
-        return 1
-    cu_count = props.multi_processor_count
-    num_xcd = round(cu_count / cus_per_xcd)
-    # Tolerate harvested parts, but bail out (return 1) if the live CU count does
-    # not look like an integer number of XCDs.
-    if num_xcd < 1 or abs(num_xcd * cus_per_xcd - cu_count) > cus_per_xcd // 4:
-        return 1
-    return num_xcd
-
-
 def device_num_sm(device: torch.device | int | None = None) -> int:
     """SM/CU count for ``device`` (or the current device), or 1 if unavailable.
 
@@ -646,10 +613,30 @@ def _fp8_block_ptr_padding_broken() -> bool:
     """
     if not triton_is_available():
         return False
-    import triton
-
-    triton_version = version.parse(triton.__version__)
+    triton_version = get_triton_version()
     return version.parse("3.8.0") <= triton_version < version.parse("3.9.0")
+
+
+def sm100_dot_tmem_lhs_broken(device: torch.device) -> bool:
+    # call private func we can patch in testing
+    return _sm100_dot_tmem_lhs_broken(device)
+
+
+def _sm100_dot_tmem_lhs_broken(device: torch.device) -> bool:
+    """Whether ``tl.dot`` crashes with a misaligned address on sm100 when its LHS
+    operand is promoted to tensor memory and the accumulator is wider than 256.
+
+    On Blackwell, Triton's ``PromoteLHSToTMem`` pass places any dot LHS that is
+    not a plain load (e.g. the result of another dot, or any elementwise op) in
+    tensor memory.  With an M block of 64 the resulting TMEM allocation must
+    share rows with the accumulator, but an accumulator wider than 256 columns
+    is interleaved across both row halves, which the tcgen05 lowering
+    mishandles (triton-lang/triton#10309, unfixed as of triton 3.8/main).
+    Worked around in ``emit_tl_dot_with_padding`` by splitting the dot into two
+    M=32 halves; drop the workaround once the upstream fix ships.
+    """
+    capability = target_device_capability(device)
+    return capability is not None and capability[0] == 10
 
 
 @functools.cache

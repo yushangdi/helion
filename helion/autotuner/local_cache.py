@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+from collections.abc import Sequence
 import dataclasses
+import enum
 import hashlib
 import inspect
 import itertools
@@ -25,12 +28,115 @@ from .base_cache import StrictAutotuneCacheKey
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-    from collections.abc import Sequence
     from typing import Callable
 
     from .base_search import BaseSearch
 
 log: logging.Logger = logging.getLogger(__name__)
+
+
+class _UncacheableSearchPolicy(TypeError):
+    pass
+
+
+def _uncacheable_search_policy(autotuner: BaseSearch) -> dict[str, str]:
+    autotuner._search_policy_cacheable = False
+    nonce = getattr(autotuner, "_uncacheable_search_policy_nonce", None)
+    if nonce is None:
+        nonce = str(uuid.uuid4())
+        autotuner._uncacheable_search_policy_nonce = nonce
+    return {"uncacheable_nonce": nonce}
+
+
+def _search_policy_json_value(
+    value: object, active_containers: set[int] | None = None
+) -> object:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, type):
+        return {"type": f"{value.__module__}.{value.__qualname__}"}
+
+    active = set() if active_containers is None else active_containers
+    value_id = id(value)
+    if value_id in active:
+        raise _UncacheableSearchPolicy("recursive policy value")
+    active.add(value_id)
+    try:
+        if isinstance(value, Config):
+            return {
+                "type": "helion.runtime.config.Config",
+                "fields": _search_policy_json_value(value.config, active),
+            }
+        if isinstance(value, enum.Enum):
+            return {
+                "type": f"{type(value).__module__}.{type(value).__qualname__}",
+                "value": _search_policy_json_value(value.value, active),
+            }
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            return {
+                "type": f"{type(value).__module__}.{type(value).__qualname__}",
+                "fields": {
+                    field.name: _search_policy_json_value(
+                        getattr(value, field.name), active
+                    )
+                    for field in dataclasses.fields(value)
+                },
+            }
+        if isinstance(value, Mapping):
+            if not all(isinstance(key, str) for key in value):
+                raise _UncacheableSearchPolicy("mapping keys must be strings")
+            return {
+                key: _search_policy_json_value(item, active)
+                for key, item in sorted(value.items())
+            }
+        if isinstance(value, Sequence) and not isinstance(
+            value, (str, bytes, bytearray)
+        ):
+            return [_search_policy_json_value(item, active) for item in value]
+        raise _UncacheableSearchPolicy(
+            "unsupported policy value "
+            f"{type(value).__module__}.{type(value).__qualname__}"
+        )
+    finally:
+        active.remove(value_id)
+
+
+def _cute_flash_search_policy_hash(
+    autotuner: BaseSearch, *, cute_flash_search_enabled: bool
+) -> str:
+    """Hash the effective built-in search policy for CuTe flash caches.
+
+    A cached quick or explicitly truncated search must not satisfy a later full
+    request. Unknown/custom policies get a unique one-shot key; other kernels
+    retain their historical cache keys.
+    """
+    if not cute_flash_search_enabled:
+        return ""
+
+    policy = autotuner.cache_policy()
+    if policy is None:
+        log.warning(
+            "CuTe-flash autotune cache reuse is disabled for unsupported search "
+            "policy %s",
+            type(autotuner).__qualname__,
+        )
+        policy = _uncacheable_search_policy(autotuner)
+    try:
+        canonical_policy = _search_policy_json_value(policy)
+        encoded = json.dumps(
+            canonical_policy,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        log.warning("CuTe-flash autotune cache reuse is disabled: %s", error)
+        encoded = json.dumps(
+            _uncacheable_search_policy(autotuner),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def get_helion_cache_dir() -> Path:
@@ -136,15 +242,29 @@ class LocalAutotuneCache(AutotuneCacheBase):
         self.key = self._generate_key()
 
     def _generate_key(self) -> LooseAutotuneCacheKey:
-        in_memory_cache_key = self.kernel.kernel._create_bound_kernel_cache_key(
-            self.kernel,
-            tuple(self.args),
-            self.kernel.kernel._base_specialization_key(self.args),
+        from .benchmark_provider import _MultiShapeAutotuneArgs
+
+        multi_args = (
+            self.args if isinstance(self.args, _MultiShapeAutotuneArgs) else None
         )
+        if multi_args is None:
+            in_memory_cache_key = self.kernel.kernel._create_bound_kernel_cache_key(
+                self.kernel,
+                tuple(self.args),
+                self.kernel.kernel._base_specialization_key(self.args),
+            )
+            specialization_key = in_memory_cache_key.specialization_key
+            extra_results = in_memory_cache_key.extra_results
+            compiler_seed_results = in_memory_cache_key.compiler_seed_results
+            dev = extract_device(self.args)
+        else:
+            specialization_key = multi_args.workload_key
+            extra_results = ()
+            compiler_seed_results = ()
+            dev = multi_args.cases[0][0].env.device
         kernel_source = textwrap.dedent(inspect.getsource(self.kernel.kernel.fn))
         kernel_source_hash = hashlib.sha256(kernel_source.encode("utf-8")).hexdigest()
 
-        dev = extract_device(self.args)
         assert dev is not None
 
         hardware = get_device_name(dev)
@@ -183,12 +303,19 @@ class LocalAutotuneCache(AutotuneCacheBase):
                 runtime_name = "unknown"
 
         assert hardware is not None and runtime_name is not None
-        config_spec_hash = self.kernel.config_spec.structural_fingerprint_hash(
+        config_spec_hash = self.kernel.config_spec.cache_fingerprint_hash(
             advanced_controls_files=self.autotuner.settings.autotune_search_acf or None
         )
+        search_policy_hash = _cute_flash_search_policy_hash(
+            self.autotuner,
+            cute_flash_search_enabled=bool(
+                getattr(self.kernel.config_spec, "cute_flash_search_enabled", False)
+            ),
+        )
         return LooseAutotuneCacheKey(
-            specialization_key=in_memory_cache_key.specialization_key,
-            extra_results=in_memory_cache_key.extra_results,
+            specialization_key=specialization_key,
+            extra_results=extra_results,
+            compiler_seed_results=compiler_seed_results,
             kernel_source_hash=kernel_source_hash,
             hardware=hardware,
             runtime_name=runtime_name,
@@ -196,6 +323,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
             config_spec_hash=config_spec_hash,
             extra_cache_key=self.kernel.extra_cache_key(),
             best_of_k=self.autotuner.settings.autotune_best_of_k,
+            search_policy_hash=search_policy_hash,
         )
 
     def _get_local_cache_path(self) -> Path:
@@ -217,7 +345,11 @@ class LocalAutotuneCache(AutotuneCacheBase):
         # Store key as dict for safer reconstruction (avoids eval)
         key_dict = {
             "type": type(self.key).__name__,
-            "fields": {k: str(v) for k, v in vars(self.key).items()},
+            "fields": {
+                k: str(v)
+                for k, v in vars(self.key).items()
+                if k != "search_policy_hash" or v
+            },
         }
 
         data: dict[str, object] = {
@@ -296,3 +428,20 @@ class StrictLocalAutotuneCache(LocalAutotuneCache):
     def _generate_key(self) -> StrictAutotuneCacheKey:
         loose_key = super()._generate_key()
         return StrictAutotuneCacheKey(**vars(loose_key))
+
+
+def stable_autotune_hash(autotuner: BaseSearch) -> str | None:
+    """Return the autotuner's stable local-cache hash for this run.
+
+    This is the same hash used as the ``.best_config`` cache filename stem, so
+    artifacts keyed by it line up with the cache entry and differ per
+    kernel/shape. Best-effort: returns ``None`` if the kernel is not cacheable
+    or the key can't be built, so callers must tolerate ``None``.
+    """
+    try:
+        if not autotuner.kernel.is_cacheable():
+            return None
+        return LocalAutotuneCache(autotuner)._generate_key().stable_hash()
+    except Exception:
+        log.debug("Could not compute autotune cache hash", exc_info=True)
+        return None

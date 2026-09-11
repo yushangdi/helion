@@ -10,6 +10,7 @@ from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfPallas
 from helion._testing import skipUnlessPallas
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
@@ -504,14 +505,7 @@ class TestPallasPartialSlice(TestCase):
         self.assertIn("16:", code)
         torch.testing.assert_close(out, src)
 
-    @xfailIfPallas(
-        "fully-bounded slice (8:16) is lowered to an index tensor by the "
-        "front-end, not a slice, so it hits the indirect scatter/gather path "
-        "instead of ArbitrarySlicePattern"
-    )
     def test_partial_slice_both_bounds(self) -> None:
-        # Slice with both start and stop set (``8:16``): a middle window,
-        # not just an open-ended prefix/suffix.
         @helion.kernel(backend="pallas")
         def kernel(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
             for tile in hl.tile(src.size(0)):
@@ -522,7 +516,8 @@ class TestPallasPartialSlice(TestCase):
 
         src = torch.randn((64, 32), device=DEVICE)
         dst = torch.zeros((64, 32), device=DEVICE)
-        _code, out = code_and_output(kernel, (src, dst), block_sizes=[16])
+        code, out = code_and_output(kernel, (src, dst), block_sizes=[16])
+        self.assertIn("8:16", code)
         expected = src.clone()
         expected[:, 8:16] *= 2.0
         torch.testing.assert_close(out, expected)
@@ -712,6 +707,86 @@ class TestPallasVmemScalarLoad(TestCase):
         self.assertGreaterEqual(code.count("pltpu.roll"), 2)
         expected = source.float().sum(-1, keepdim=True) + source.float()
         torch.testing.assert_close(result, expected.to(DEVICE))
+
+
+@onlyBackends(["pallas"])
+@skipUnlessPallas("JAX/Pallas TPU not available")
+class TestPallasClampedRefs(TestCase):
+    """Loads/stores through BlockSpec refs clamped to min(block, dim)."""
+
+    def test_load_pad_store_slice_roundtrip(self) -> None:
+        # dim 100 < block 128: load is zero-padded to block shape, store
+        # value is sliced back to the clamped ref.
+        @helion.kernel(backend="pallas")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile0, tile1 in hl.tile(x.size()):
+                out[tile0, tile1] = x[tile0, tile1] * 2.0
+            return out
+
+        x = torch.randn((64, 100), device=DEVICE)
+        code, out = code_and_output(kernel, (x,), block_sizes=[16, 128])
+        self.assertIn("jnp.pad", code)
+        self.assertIn(":100", code)
+        torch.testing.assert_close(out, x * 2.0)
+
+    def test_size1_dim_broadcasts_unpadded(self) -> None:
+        # size-1 dim under a wider block must broadcast, not be zero-padded.
+        @helion.kernel(backend="pallas")
+        def kernel(x: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile0, tile1 in hl.tile(x.size()):
+                out[tile0, tile1] = x[tile0, tile1] * m[tile0, :]
+            return out
+
+        x = torch.randn((64, 128), device=DEVICE)
+        m = torch.randn((64, 1), device=DEVICE)
+        code, out = code_and_output(kernel, (x, m), block_sizes=[16, 128])
+        self.assertNotIn("jnp.pad", code)
+        torch.testing.assert_close(out, x * m)
+
+    def test_atomic_add_clamped_ref(self) -> None:
+        # dim 10 < block 32: the RMW reads _prev and stores to a clamped ref,
+        # so the padded value operand must be sliced back to match.
+        @helion.kernel(backend="pallas")
+        def kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(x.size(0)):
+                hl.atomic_add(x, [tile], y[tile])
+            return x
+
+        x = torch.zeros(10, device=DEVICE)
+        y = torch.ones(10, device=DEVICE)
+        _code, out = code_and_output(kernel, (x, y), block_sizes=[32])
+        torch.testing.assert_close(out, torch.ones(10, device=DEVICE))
+
+    @skipIfPallas("indirect access is unsupported by both one-hot and DMA lowering")
+    def test_masked_load_spanning_tensor(self) -> None:
+        # Tile spans past the tensor's extent (concat pattern): the padded
+        # load composes with extra_mask / where.
+        @helion.kernel(backend="pallas")
+        def kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                [x.size(0), x.size(1) + y.size(1)], dtype=x.dtype, device=x.device
+            )
+            for tile0, tile1 in hl.tile(out.size()):
+                x_part = hl.load(
+                    x, [tile0, tile1], extra_mask=(tile1.index < x.size(1))[None, :]
+                )
+                y_part = hl.load(
+                    y,
+                    [tile0, tile1.index - x.size(1)],
+                    extra_mask=(tile1.index >= x.size(1))[None, :],
+                )
+                out[tile0, tile1] = torch.where(
+                    (tile1.index < x.size(1))[None, :], x_part, y_part
+                )
+            return out
+
+        x = torch.randn((32, 20), device=DEVICE)
+        y = torch.randn((32, 44), device=DEVICE)
+        code, out = code_and_output(kernel, (x, y), block_sizes=[16, 64])
+        self.assertIn("jnp.pad", code)
+        torch.testing.assert_close(out, torch.cat([x, y], dim=1))
 
 
 instantiate_parametrized_tests(TestPallasJaggedCarrySimple)

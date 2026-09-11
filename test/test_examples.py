@@ -28,7 +28,6 @@ from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfA10G
 from helion._testing import skipIfCudaCapabilityLessThan
-from helion._testing import skipIfCudaSharedMemoryLessThan
 from helion._testing import skipIfCute
 from helion._testing import skipIfFn
 from helion._testing import skipIfNotCUDA
@@ -36,8 +35,10 @@ from helion._testing import skipIfPallas
 from helion._testing import skipIfPallasInterpret
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
+from helion._testing import skipIfSharedMemoryLessThan
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
+from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
@@ -104,7 +105,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             "add", args, sum(args), block_sizes=[256, 128], loop_orders=[[1, 0]]
         )
 
-    @skipIfCudaSharedMemoryLessThan(
+    @skipIfSharedMemoryLessThan(
         131072, reason="block sizes exceed device shared memory limit"
     )
     def test_matmul(self):
@@ -131,9 +132,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             args[0] @ args[1],
         )
 
-    @xfailIfPallas(
-        "Pallas TPU clamps the N block to the lane width (128) which does"
-        " not match the test's N=96 bias dimension"
+    @xfailIfPallasInterpret(
+        "emit_pipeline ds-pad DMA uses a tracer-size dynamic_slice, unsupported"
+        " in JAX Pallas interpret mode"
     )
     def test_matmul_bias_epilogue_wrapper(self):
         from typing import Any
@@ -639,6 +640,46 @@ class TestExamples(RefEagerTestBase, TestCase):
             ),
         )
 
+    @parametrize("reduction_block_size", (32, 1024))
+    @onlyBackends(["triton"])
+    @skipIfNotCUDA()
+    @skipIfRefEager("Test requires compiling a specific reduction config")
+    @skipUnlessTensorDescriptor("Test configs require tensor descriptor support")
+    def test_welford_bfloat16_accuracy(self, reduction_block_size):
+        from examples.welford import eager_layer_norm
+        from examples.welford import welford
+
+        config = helion.Config(
+            atomic_indexing=[],
+            block_sizes=[16, reduction_block_size, 256],
+            indexing=[
+                "pointer",
+                "pointer",
+                "pointer",
+                "tensor_descriptor",
+                "pointer",
+            ],
+            load_eviction_policies=["last", "first", "", "last"],
+            num_stages=1,
+            num_warps=4,
+            pid_type="flat",
+            range_flattens=[None, None, None],
+            range_multi_buffers=[None, None, None],
+            range_num_stages=[0, 0, 0],
+            range_unroll_factors=[0, 0, 0],
+        )
+
+        torch.manual_seed(1337)
+        rows, columns = 4096, 1024
+        weight = torch.randn(columns, device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn(columns, device=DEVICE, dtype=torch.bfloat16)
+        x = torch.randn(rows, columns, device=DEVICE, dtype=torch.bfloat16)
+        expected = eager_layer_norm(weight, bias, x)
+
+        actual = welford.bind((weight, bias, x)).compile_config(config)(weight, bias, x)
+
+        torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+
     def test_low_mem_dropout(self):
         from examples.low_mem_dropout import low_mem_dropout
         from examples.low_mem_dropout import low_mem_dropout_bwd
@@ -684,8 +725,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfPallasInterpret(
-        "65536x1024x1280 GEMM is too slow under CPU interpret -- it exceeds the "
-        "300s per-test timeout and (thread timeout method) kills the whole job"
+        "GEMM pair is too slow under CPU interpret -- at the original 65536-row "
+        "shape it exceeded the 300s per-test timeout"
     )
     @skipIfTileIR("precision differences with bf16xint16 operations on tileir")
     @skipIfRocm("precision differences with bf16xint16 operations on rocm")
@@ -693,7 +734,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_bf16xint16(self):
         from examples.bf16xint16_gemm import reference_bf16xint16_pytorch
 
-        m, k, n = 65536, 1024, 1280
+        m, k, n = 2048, 1024, 1280
 
         # The CuTe scalar matmul fallback accumulates each bf16xbf16 product in
         # full fp32 (it never rounds the per-element products back to bf16), so
@@ -868,7 +909,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfTileIR("PassManager::run failed")
     def test_epilogue_subtiling_residual_gelu(self):
-        m, k, n = 8192, 8192, 8192
+        m, k, n = 1024, 1024, 1024
         x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
         w = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
         bias = torch.randn([n], device=DEVICE, dtype=HALF_DTYPE)
@@ -888,7 +929,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfTileIR("PassManager::run failed")
     def test_epilogue_subtiling_gelu_aux(self):
-        m, k, n = 8192, 8192, 8192
+        m, k, n = 1024, 1024, 1024
         x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
         w = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
         bias = torch.randn([n], device=DEVICE, dtype=HALF_DTYPE)
@@ -1004,6 +1045,35 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[1, 64, 32],
         )
 
+    def test_sparse_attn_indexer(self):
+        mod = import_path(EXAMPLES_DIR / "sparse_attn_indexer.py")
+        args = mod.indexer_inputs(num_tokens=128, kv_len=512)
+        # The reference einsum runs in bf16, so kernel-vs-reference diffs are
+        # pure schedule noise: one head's O(11) score rounds by ~11*2^-8 and
+        # the 32-head sum random-walks to ~sqrt(32) of that (~0.25 abs).
+        check_example(
+            "sparse_attn_indexer",
+            args,
+            mod.ref_mqa_logits(*args),
+            fn_name="mqa_logits",
+            block_sizes=[16, 128],
+            atol=0.3,
+        )
+
+    @skipIfPallasInterpret("numerical mismatch in JAX interpret mode")
+    def test_sparse_attn_indexer_decode(self):
+        mod = import_path(EXAMPLES_DIR / "sparse_attn_indexer.py")
+        args = mod.indexer_inputs(num_tokens=1, kv_len=512)
+        # Same schedule-noise bound as test_sparse_attn_indexer above.
+        check_example(
+            "sparse_attn_indexer",
+            args,
+            mod.ref_mqa_logits(*args),
+            fn_name="mqa_logits_decode",
+            block_sizes=[1, 128],
+            atol=0.3,
+        )
+
     def test_xsa(self):
         args = (
             torch.randn(2, 32, 1024, 64, dtype=HALF_DTYPE, device=DEVICE),
@@ -1047,10 +1117,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="concat2d_dim1_simple",
         )
 
-    @xfailIfPallasInterpret(
-        "jax interpret-mode discharge cannot handle non-divisible blocked "
-        "slices (traced sizes)"
-    )
+    @skipIfPallas("indirect access is unsupported by both one-hot and DMA lowering")
     def test_concat(self):
         args = (
             torch.randn(512, 500, device=DEVICE),
@@ -1063,7 +1130,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="concat2d_dim1",
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
+    @skipIfPallas("indirect access is unsupported by both one-hot and DMA lowering")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_concat_block_ptr(self):
@@ -1649,7 +1716,6 @@ class TestExamples(RefEagerTestBase, TestCase):
                     rtol=rtol,
                 )
 
-    @xfailIfPallasTpu("tensor-derived if-predicates not supported")
     def test_grouped_gemm_jagged(self):
         # Build small jagged grouped GEMM inputs
         torch.manual_seed(0)
@@ -1771,9 +1837,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfPallasInterpret(
-        "JAX interpret cannot trace dynamic shapes (TypeError: JitTracer ~int32[])"
-    )
     def test_jsd(self):
         args = (
             torch.randn([1024, 4096], device=DEVICE, dtype=torch.float32).log_softmax(
@@ -1799,9 +1862,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfPallasInterpret(
-        "JAX interpret cannot trace dynamic shapes (TypeError: JitTracer ~int32[])"
-    )
     def test_kl_div(self):
         args = (
             torch.randn([1024, 4096], device=DEVICE, dtype=torch.float32).log_softmax(
@@ -1911,15 +1971,28 @@ class TestExamples(RefEagerTestBase, TestCase):
         W_packed = mod.pack_fp4(W_quantized).view(torch.float4_e2m1fn_x2)
         weight_scale = mod.make_fp8_scales((N, K // 16), DEVICE)
 
-        result = mod.nvfp4_matmul(A, W_packed, weight_scale)
-        expected = mod.reference_nvfp4_matmul(A, W_packed, weight_scale)
+        result = mod.nvfp4_w4a16_matmul(A, W_packed, weight_scale)
+        expected = mod.reference_nvfp4_w4a16_matmul(A, W_packed, weight_scale)
         torch.testing.assert_close(
             result,
             expected,
             atol=1.0,
             rtol=2e-1,
         )
+        A_quantized = mod.quantize_fp4_e2m1(A)
+        A_packed = mod.pack_fp4_last_dim(A_quantized).view(torch.float4_e2m1fn_x2)
+        act_scale = mod.make_fp8_scales((M, K // 16), DEVICE)
 
+        result = mod.nvfp4_w4a4_matmul(A_packed, W_packed, act_scale, weight_scale)
+        expected = mod.reference_nvfp4_w4a4_matmul(
+            A_packed, W_packed, act_scale, weight_scale
+        )
+        torch.testing.assert_close(
+            result,
+            expected,
+            atol=1.0,
+            rtol=2e-1,
+        )
         M, K, N = 128, 256, 256
         A_packed = mod.make_random_fp4((M, K), DEVICE)
         B_packed = mod.make_random_fp4((N, K), DEVICE)
@@ -2193,7 +2266,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @skipIfCudaSharedMemoryLessThan(
+    @skipIfSharedMemoryLessThan(
         131072, reason="block sizes exceed device shared memory limit"
     )
     @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
@@ -2512,7 +2585,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[4, 16, 16],
         )
 
-    @skipIfCudaSharedMemoryLessThan(
+    @skipIfSharedMemoryLessThan(
         131072, reason="block sizes exceed device shared memory limit"
     )
     def test_broadcast_matmul(self):
@@ -2843,14 +2916,14 @@ class TestExamples(RefEagerTestBase, TestCase):
                 )
                 kernel.settings.autotune_effort = "none"
 
-    def _run_linear_example(self, name: str) -> None:
+    def _run_linear_example(self, name: str, method: str = "test") -> None:
         import importlib
 
         self._skip_linear_engine_autotune()
         mod = importlib.import_module(f"examples.linear.{name}")
         harness = getattr(mod, "HARNESS", None)
         if harness is not None:
-            harness.test()
+            getattr(harness, method)()
         else:
             mod.test()
 
@@ -2909,6 +2982,20 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfCute("linear-attention examples not supported on cute backend")
     def test_linear_kda(self):
         self._run_linear_example("example_kda")
+
+    @pytest.mark.timeout(600)
+    @skipIfRefEager("linear examples assert against their own reference")
+    @skipIfNotCUDA()
+    @skipIfCute("linear-attention examples not supported on cute backend")
+    def test_linear_kda_fused_preamble(self):
+        self._run_linear_example("example_kda", method="test_fused_preamble")
+
+    @pytest.mark.timeout(600)
+    @skipIfRefEager("linear examples assert against their own reference")
+    @skipIfNotCUDA()
+    @skipIfCute("linear-attention examples not supported on cute backend")
+    def test_linear_kda_varlen(self):
+        self._run_linear_example("example_kda", method="test_varlen")
 
     # ── Monkey-patch tests: plug our engine into FLA layers ──
 

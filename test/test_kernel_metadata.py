@@ -110,7 +110,9 @@ class TestCodegenSettings(TestCase):
                 "dot_precision",
                 "fast_math",
                 "index_dtype",
+                "pallas_collective_id",
                 "pallas_interpret",
+                "pallas_topk_recall_target",
                 "persistent_reserved_sms",
                 "static_shapes",
                 "triton_do_not_specialize",
@@ -135,7 +137,9 @@ class TestRunId(TestCase):
             "dot_precision": ("tf32", "ieee"),
             "fast_math": (False, True),
             "index_dtype": (None, torch.int64),
+            "pallas_collective_id": (None, 42),
             "pallas_interpret": (False, True),
+            "pallas_topk_recall_target": (0.99, 1.0),
             "persistent_reserved_sms": (0, 8),
             "static_shapes": (True, False),
             "triton_do_not_specialize": (False, True),
@@ -185,6 +189,7 @@ class TestAutotuneLogSink(TestCase):
             sidecar = json.loads(
                 sink.meta_path.read_text(encoding="utf-8").splitlines()[0]
             )
+            source_path_exists = sink.source_path.exists()
 
         header, data = rows[0], rows[1:]
         self.assertEqual(header, _LEAN_CSV_HEADER)
@@ -195,6 +200,7 @@ class TestAutotuneLogSink(TestCase):
 
         self.assertTrue(cell("config"))
         self.assertIn("32", cell("config"))
+        self.assertFalse(source_path_exists)
 
         self.assertEqual(set(sidecar), _SIDECAR_KEYS)
         self.assertIn("def _add_kernel", sidecar["kernel_source"])
@@ -240,7 +246,7 @@ class TestAutotuneDatasetE2E(TestCase):
             bound_kernel = add.bind(args)
             random.seed(123)
             search = FiniteSearch(bound_kernel, args, configs=configs)
-            search.autotune()
+            search.autotune(skip_cache=True)
 
         csv_path = base_path.with_suffix(".csv")
         meta_path = base_path.with_suffix(".meta.jsonl")
@@ -256,6 +262,8 @@ class TestAutotuneDatasetE2E(TestCase):
         for line in meta_lines:
             record = json.loads(line)
             self.assertIn("kernel_source", record)
+            self.assertFalse(record["settings"]["force_autotune"])
+            self.assertTrue(record["settings"]["effective_cache_read_bypass"])
             configs_by_id.update(record["configs"])
             run_ids.add(record["run_id"])
             if _HAS_NETWORKX:

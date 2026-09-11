@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ast
 import collections
 import contextlib
+import contextvars
 import dataclasses
 import logging
 import sys
@@ -9,7 +11,6 @@ import threading
 import types
 import typing
 from typing import TYPE_CHECKING
-from typing import Protocol
 import warnings
 
 import sympy
@@ -25,11 +26,10 @@ from torch._inductor.codegen.wrapper import (
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._subclasses import FakeTensor
 from torch._subclasses import FakeTensorMode
+import torch.distributed as dist
 from torch.fx.experimental.symbolic_shapes import DimDynamic
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
-from torch.utils._sympy.symbol import SymT
-from torch.utils._sympy.symbol import symbol_is_type
 
 from .. import exc
 from .._compat import shape_env_size_hint
@@ -49,12 +49,66 @@ log = logging.getLogger(__name__)
 TensorDescriptorLayoutSignature = tuple[int | None, tuple[bool, ...]]
 
 
+@dataclasses.dataclass(frozen=True)
+class ConfigValueExpression:
+    """Small integer expression whose leaves are emitted config values."""
+
+    operation: str
+    arguments: tuple[int | str | ConfigValueExpression, ...]
+
+    def evaluate(self, config: Config) -> int:
+        def value(arg: int | str | ConfigValueExpression) -> int:
+            if isinstance(arg, ConfigValueExpression):
+                return arg.evaluate(config)
+            if isinstance(arg, str):
+                result = config[arg]
+                if not isinstance(result, int):
+                    raise TypeError(f"config value {arg!r} is not an integer")
+                return result
+            return arg
+
+        args = tuple(value(arg) for arg in self.arguments)
+        if self.operation == "config":
+            assert len(self.arguments) == 1 and isinstance(self.arguments[0], str)
+            return value(self.arguments[0])
+        if self.operation == "cdiv":
+            assert len(args) == 2
+            return (args[0] + args[1] - 1) // args[1]
+        if self.operation == "next_power_of_2":
+            assert len(args) == 1
+            return next_power_of_2(args[0])
+        raise ValueError(f"unknown config expression operation {self.operation!r}")
+
+
 @dataclasses.dataclass
 class TensorDescriptorLayoutGuard:
     ndim: int
     element_size: int
     memory_op_indices: set[int] = dataclasses.field(default_factory=set)
     atomic_op_indices: set[int] = dataclasses.field(default_factory=set)
+
+
+@dataclasses.dataclass(frozen=True)
+class RuntimeInputSpecialization:
+    """Internal runtime-input projection used to extend a kernel cache key.
+
+    ``classifier_identity`` distinguishes classifier semantics when compiler
+    discovery registers the same named projection more than once.
+    ``reusable_tensor_properties`` is an optional promise that the classifier's
+    result depends only on the named storage properties (plus tensor metadata
+    already covered by eager dispatch guards), never on tensor contents.  It
+    lets repeated calls with the exact same tensors reuse a prevalidated result.
+    Runtime cache state is deliberately excluded from descriptor equality.
+    """
+
+    sources: tuple[Source, ...]
+    classifier_identity: typing.Hashable
+    classifier: typing.Callable[[typing.Sequence[object]], typing.Hashable] = (
+        dataclasses.field(compare=False, repr=False)
+    )
+    reusable_tensor_properties: frozenset[
+        typing.Literal["data_ptr", "storage_span"]
+    ] = frozenset()
 
 
 def _is_supported_tensor_input_source(source: Source) -> bool:
@@ -200,16 +254,18 @@ if TYPE_CHECKING:
 
     from .. import Config
     from ..runtime.settings import Settings
+    from .autotuner_heuristics.registry import CompilerHeuristicSpecializationFact
     from .backend import Backend
     from .pallas.compact_worklist import CompactWorklistPlan
     from .pallas.compact_worklist import ResidentCacheDecision
     from .pallas.compact_worklist import ResidentPrepHoist
 
-    class _TLS(Protocol):
-        env: CompileEnvironment | None
+
+class _TLS(threading.local):
+    env: CompileEnvironment | None = None
 
 
-tls: _TLS = typing.cast("_TLS", threading.local())
+tls = _TLS()
 
 
 class HelionKernelSource(EphemeralSource):
@@ -274,6 +330,7 @@ class CompileEnvironment:
         self.index_dtype: torch.dtype = (
             index_dtype or settings.index_dtype or torch.int32
         )
+        self._is_distributed = is_distributed
         self.process_group_name = None
         self._backend = get_backend_class(settings.backend)()
         self._backend.validate_environment()
@@ -293,8 +350,27 @@ class CompileEnvironment:
         # TODO(jansel): check for guards in the shapeenv
         self.fake_mode = FakeTensorMode(shape_env=self.shape_env)
         self.input_sources: dict[torch.Tensor, Source] = {}
+        self._ambiguous_tensor_input_source_ids: set[int] = set()
+        self._runtime_arg_values_by_name: contextvars.ContextVar[
+            dict[str, object] | None
+        ] = contextvars.ContextVar(
+            f"helion_runtime_arg_values_{id(self)}",
+            default=None,
+        )
+        self.cute_resolved_wrapper_plans: list[dict[str, object]] = []
+        # Host integer helpers such as cdiv/next_power_of_2 deliberately return
+        # unbacked SymInts during tracing. Preserve the config expression beside
+        # that symbol so a fixed block size derived from a user tunable can still
+        # be resolved for each candidate configuration.
+        self.config_value_expressions: dict[sympy.Expr, ConfigValueExpression] = {}
         self.block_sizes: list[BlockSizeInfo] = []
         self.debug_shape_renames: dict[sympy.Basic, sympy.Basic] = {}
+        self._debug_shape_rename_override: contextvars.ContextVar[
+            dict[sympy.Basic, sympy.Basic] | None
+        ] = contextvars.ContextVar(
+            f"helion_debug_shape_renames_{id(self)}",
+            default=None,
+        )
         try:
             from ..runtime import get_num_sm
 
@@ -306,7 +382,15 @@ class CompileEnvironment:
             target_device_capability=target_device_capability(device),
             device=device,
             num_sm=_num_sm,
+            log_restrictions_verbose=settings.autotune_log_search_space_verbose,
         )
+        # Correctness facts registered by compiler heuristics can depend on
+        # dynamic runtime inputs even when seed generation is disabled or later
+        # found ineligible. Bound-kernel caching consumes this set separately
+        # from specialization requirements of heuristics that emitted seeds.
+        self.compiler_fact_specialization_facts: frozenset[
+            CompilerHeuristicSpecializationFact
+        ] = frozenset()
         # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
             collections.Counter()
@@ -315,9 +399,18 @@ class CompileEnvironment:
         self.kernel_min_element_bits: int = 32  # smallest dtype bits across all tensors
         self.specialized_vars: set[sympy.Symbol] = set()
         self.specialized_strides: set[TensorPropertySource] = set()
+        # Config-backed values created by hl.register_tunable().
+        self.tunable_symbols: set[sympy.Symbol] = set()
         self.tensor_descriptor_layout_guards: dict[
             Source, TensorDescriptorLayoutGuard
         ] = {}
+        self.runtime_input_specializations: dict[str, RuntimeInputSpecialization] = {}
+        # Immutable classifier outputs captured from the arguments that created
+        # this BoundKernel.  Codegen may run later and obtain those arguments
+        # through weak references, after their storage metadata has changed.
+        # Runtime-dependent optimizations must match this snapshot before they
+        # consume a live alignment or aliasing fact.
+        self.bound_runtime_input_specialization_results: dict[str, typing.Hashable] = {}
         self._tensor_input_source_cache: dict[int, Source | None] = {}
         self.jagged_tile_parent_ids: dict[int, list[int]] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
@@ -353,40 +446,132 @@ class CompileEnvironment:
         self._foreign_symint_cache: dict[
             tuple[int, sympy.Expr], int | torch.SymInt
         ] = {}
-        if settings.autotune_force_persistent or is_distributed:
-            for pid_type in (
-                "flat",
-                "xyz",
-            ):
-                self.config_spec.disallow_pid_type(pid_type)
+        # The distributed restriction is deferred to
+        # restrict_pid_types_for_persistent() so it can gate on a real per-kernel
+        # signal after tracing rather than the process-global dist.is_initialized().
+        # force_persistent restricts pid_types unconditionally; the symm-mem
+        # signal-pad clamp is symm-mem-specific and left to
+        # restrict_pid_types_for_persistent().
+        if settings.autotune_force_persistent:
+            self._disallow_nonpersistent_pid_types(
+                reason="autotune_force_persistent is set"
+            )
 
+        # TODO(hinriksnaer): tracing flag, not env config. move to CompilerState?
+        self.has_barrier: bool = False
+
+    def _disallow_nonpersistent_pid_types(self, reason: str | None = None) -> None:
+        """Restrict the search space to persistent kernels. Idempotent."""
+        for pid_type in ("flat", "xyz"):
+            self.config_spec.disallow_pid_type(pid_type, reason=reason)
+
+    def require_persistent_blocked(self, reason: str) -> None:
+        """Restrict program-ID selection to blocked persistent execution."""
+        for pid_type in ("flat", "xyz", "persistent_interleaved"):
+            self.config_spec.disallow_pid_type(pid_type, reason=reason)
+
+    def restrict_pid_types_for_persistent(self, args: Sequence[object]) -> None:
+        """Restrict to persistent kernels when the kernel needs cross-rank sync.
+
+        Called after tracing so it can gate on a real per-kernel signal (an
+        ``hl.barrier()`` or a symmetric-memory tensor argument) rather than the
+        process-global ``dist.is_initialized()``, which would needlessly shrink
+        the search space for every kernel in a distributed process. A barrier or
+        symm-mem tensor forces persistent pid_types; the signal-pad clamp is a
+        symm-mem-only constraint, so a barrier-only kernel keeps its full
+        ``max_num_sm_multiplier`` range.
+        """
+        if not dist.is_initialized():
+            return
+
+        # Two independent signals: a barrier forces persistent pid_types, while a
+        # symmetric-memory kernel additionally needs the signal-pad clamp.
+        # ``_is_distributed`` already folds in ``kernel_uses_symm_mem(args)``; scan
+        # the args only as the newer-torch fallback when it is unset.
+        uses_symm_mem = self._is_distributed
+        if not uses_symm_mem:
+            from .._dist_utils import is_symm_mem_tensor
+
+            uses_symm_mem = any(
+                isinstance(arg, torch.Tensor)
+                and is_symm_mem_tensor(arg, self.process_group_name)
+                for arg in args
+            )
+
+        if not uses_symm_mem and not self.has_barrier:
+            return
+
+        self._disallow_nonpersistent_pid_types(
+            reason="a distributed process group is initialized (persistent "
+            "kernels required)"
+        )
+        if uses_symm_mem:
+            self._clamp_max_num_sm_multiplier_for_symm_mem()
+
+    def _clamp_max_num_sm_multiplier_for_symm_mem(self) -> None:
+        """Clamp max_num_sm_multiplier to the symmetric-memory signal-pad budget."""
         # CUDA symmetric-memory persistent-kernel sizing only. Guard on CUDA: the
         # Pallas/TPU backend traces with a cpu-device torch tensor (the torch<->jax
         # bridge), so under a multi-host (dist-initialized) serve this would call
         # get_num_sm(cpu) -> "TODO: implement for other devices" and crash the
         # kernel compile. _SymmetricMemory / SM-multiplier are irrelevant to Pallas.
-        if is_distributed and device.type == "cuda":
-            from torch._C._distributed_c10d import _SymmetricMemory
+        if self.device.type != "cuda":
+            return
 
-            from .._dist_utils import max_num_blocks_for_symm_mem
-            from ..runtime import get_num_sm
+        from torch._C._distributed_c10d import _SymmetricMemory
 
-            num_sms = get_num_sm(device, reserved_sms=settings.persistent_reserved_sms)
-            # Floor to previous power of two since PowerOfTwoFragment requires pow2 bounds
-            raw_max = min(
-                max_num_blocks_for_symm_mem() // num_sms,
-                self.config_spec.max_num_sm_multiplier,
+        from .._dist_utils import max_num_blocks_for_symm_mem
+        from ..runtime import get_num_sm
+
+        num_sms = get_num_sm(
+            self.device, reserved_sms=self.settings.persistent_reserved_sms
+        )
+        # Floor to previous power of two since PowerOfTwoFragment requires pow2 bounds
+        raw_max = min(
+            max_num_blocks_for_symm_mem() // num_sms,
+            self.config_spec.max_num_sm_multiplier,
+        )
+        newmax = 1 << (raw_max.bit_length() - 1) if raw_max > 0 else 1
+        if newmax < self.config_spec.max_num_sm_multiplier:
+            warnings.warn(
+                f"max_num_sm_multipler is reduced from {self.config_spec.max_num_sm_multiplier} to {newmax} due to the restriction of _SymmetricMemory.signal_pad_size={_SymmetricMemory.signal_pad_size}. Increase the signal pad size to allow autotuner to choose among all possible values in the range.",
+                stacklevel=1,
             )
-            newmax = 1 << (raw_max.bit_length() - 1) if raw_max > 0 else 1
-            if newmax < self.config_spec.max_num_sm_multiplier:
-                warnings.warn(
-                    f"max_num_sm_multipler is reduced from {self.config_spec.max_num_sm_multiplier} to {newmax} due to the restriction of _SymmetricMemory.signal_pad_size={_SymmetricMemory.signal_pad_size}. Increase the signal pad size to allow autotuner to choose among all possible values in the range.",
-                    stacklevel=1,
-                )
-            self.config_spec.max_num_sm_multiplier = newmax
+        self.config_spec.max_num_sm_multiplier = newmax
 
-        # TODO(hinriksnaer): tracing flag, not env config. move to CompilerState?
-        self.has_barrier: bool = False
+    @property
+    def runtime_arg_values_by_name(self) -> dict[str, object]:
+        return self._runtime_arg_values_by_name.get() or {}
+
+    @contextlib.contextmanager
+    def use_runtime_arg_values(
+        self, values: dict[str, object]
+    ) -> typing.Iterator[None]:
+        token = self._runtime_arg_values_by_name.set(values)
+        try:
+            yield
+        finally:
+            self._runtime_arg_values_by_name.reset(token)
+
+    @property
+    def active_debug_shape_renames(self) -> dict[sympy.Basic, sympy.Basic]:
+        return self._debug_shape_rename_override.get() or self.debug_shape_renames
+
+    @property
+    def has_debug_shape_rename_override(self) -> bool:
+        return self._debug_shape_rename_override.get() is not None
+
+    @contextlib.contextmanager
+    def use_debug_shape_renames(
+        self, values: dict[sympy.Basic, sympy.Basic]
+    ) -> typing.Iterator[None]:
+        token = self._debug_shape_rename_override.set(
+            {**self.debug_shape_renames, **values}
+        )
+        try:
+            yield
+        finally:
+            self._debug_shape_rename_override.reset(token)
 
     def specialize_expr(self, expr: sympy.Expr) -> sympy.Expr:
         """Substitute any specialized vars with their concrete values."""
@@ -446,6 +631,9 @@ class CompileEnvironment:
         cache_key = id(fake_tensor)
         if cache_key in self._tensor_input_source_cache:
             return self._tensor_input_source_cache[cache_key]
+        if cache_key in self._ambiguous_tensor_input_source_ids:
+            self._tensor_input_source_cache[cache_key] = None
+            return None
 
         source = self.input_sources.get(fake_tensor)
         from .host_function import HostFunction
@@ -471,6 +659,59 @@ class CompileEnvironment:
 
         self._tensor_input_source_cache[cache_key] = result
         return result
+
+    def runtime_value_for_tensor(self, fake_tensor: torch.Tensor) -> object | None:
+        """Replay a traced tensor's input source against the current real arguments."""
+        source = self.tensor_input_source(fake_tensor)
+        if source is None:
+            return None
+        return _replay_tensor_input_source(source, self.runtime_arg_values_by_name)
+
+    def register_runtime_input_specialization(
+        self,
+        key: str,
+        specialization: RuntimeInputSpecialization,
+    ) -> None:
+        """Register an internal projection from runtime inputs to a cache-key fact."""
+        previous = self.runtime_input_specializations.setdefault(key, specialization)
+        if previous != specialization:
+            raise RuntimeError(f"conflicting runtime input specializations for {key!r}")
+
+    def snapshot_runtime_input_specialization_results(
+        self,
+        root_values: typing.Mapping[str, object],
+    ) -> None:
+        """Capture storage facts used by runtime-dependent code generation.
+
+        Content-dependent classifiers are intentionally excluded. The codegen
+        consumers need only facts described by ``reusable_tensor_properties``;
+        filtering avoids an extra device read for worklist classifiers.
+        """
+        self.bound_runtime_input_specialization_results = {
+            key: specialization.classifier(
+                tuple(
+                    _replay_tensor_input_source(source, root_values)
+                    for source in specialization.sources
+                )
+            )
+            for key, specialization in self.runtime_input_specializations.items()
+            if specialization.reusable_tensor_properties
+            and all(
+                _is_supported_tensor_input_source(source)
+                for source in specialization.sources
+            )
+        }
+
+    def runtime_input_specialization_matches_bound(
+        self,
+        key: str,
+        result: typing.Hashable,
+    ) -> bool:
+        """Whether a live classifier result matches this bound's cache identity."""
+        return (
+            key in self.bound_runtime_input_specialization_results
+            and self.bound_runtime_input_specialization_results[key] == result
+        )
 
     def tensor_descriptor_layout_signature(
         self, fake_tensor: torch.Tensor
@@ -563,23 +804,52 @@ class CompileEnvironment:
             # VMEM byte budget is enforced separately at runtime.
             return None
 
+        uses_triton_codegen = self.codegen_name == "triton"
+        cs_block_sizes = self.config_spec.block_sizes
+        config_block_ids = set(cs_block_sizes.valid_block_ids())
         block_sym_to_id: dict[sympy.Symbol, int] = {}
-        for bs in self.block_sizes:
-            block_sym_to_id[bs.symbol()] = bs.block_id
+        block_sym_to_info: dict[sympy.Symbol, BlockSizeInfo] = {}
+        if uses_triton_codegen:
+            for info in self.block_sizes:
+                symbol = info.symbol()
+                # Reused reduction dimensions deliberately share the original
+                # tile symbol. Preserve the first origin rather than allowing a
+                # later fixed/reduction alias to erase its tunable provenance.
+                block_sym_to_info.setdefault(symbol, info)
+                if info.block_id in config_block_ids:
+                    block_sym_to_id.setdefault(symbol, info.block_id)
+        else:
+            for bs in self.block_sizes:
+                block_sym_to_id[bs.symbol()] = bs.block_id
 
         seen_exprs: set[str] = set()
-        cs_block_sizes = self.config_spec.block_sizes
         for shape in self.kernel_tensor_sizes:
             if not shape:
                 continue
             numel_expr = sympy.Mul(*shape) if len(shape) > 1 else shape[0]
+            if uses_triton_codegen:
+                substitutions: dict[sympy.Basic, sympy.Basic] = {}
+                for symbol in numel_expr.free_symbols:
+                    if (
+                        not isinstance(symbol, sympy.Symbol)
+                        or symbol in block_sym_to_id
+                        or (info := block_sym_to_info.get(symbol)) is None
+                    ):
+                        continue
+                    extent = self._search_invariant_extent_for_numel_constraint(info)
+                    if extent is not None:
+                        substitutions[symbol] = sympy.Integer(extent)
+                if substitutions:
+                    numel_expr = numel_expr.xreplace(substitutions)
+
             all_free = numel_expr.free_symbols
             involved_syms = all_free & block_sym_to_id.keys()
             if not involved_syms:
                 continue
             # Skip expressions with non-block-size free symbols (e.g.,
             # runtime tensor dimensions) — they can't be evaluated at
-            # config generation time.
+            # config generation time. A rollable reduction remains symbolic
+            # here and is skipped by the same rule.
             if all_free - block_sym_to_id.keys():
                 log.debug(
                     "skipping numel constraint for shape %s: expression has "
@@ -622,9 +892,37 @@ class CompileEnvironment:
                 )
             )
 
+    def _search_invariant_extent_for_numel_constraint(
+        self, block_size: BlockSizeInfo
+    ) -> int | None:
+        """Return an extent fixed across the generated Triton search choices."""
+        source = block_size.block_size_source
+        if isinstance(source, FixedBlockSizeSource):
+            value = source.value
+        elif isinstance(source, ReductionLoopBlockSizeSource):
+            reduction_loops = self.config_spec.reduction_loops
+            if block_size.block_id in reduction_loops.valid_block_ids():
+                loop_spec = reduction_loops.block_id_lookup(block_size.block_id)
+                if loop_spec._flat_fragment(self.config_spec).low < loop_spec.size_hint:
+                    return None
+            value = block_size.size
+        else:
+            return None
+        if not isinstance(value, (int, torch.SymInt)):
+            return None
+        expr = self.specialize_expr(self.shape_env.replace(_to_sympy(value)))
+        if expr.free_symbols or not expr.is_Integer:
+            return None
+        extent = int(expr)
+        if isinstance(source, ReductionLoopBlockSizeSource):
+            # Every fragment-generated choice is persistent, so codegen uses
+            # the full backend-rounded reduction dimension.
+            extent = self.backend.static_rdim_size(extent)
+        return extent
+
     def _disable_range_num_stages_for_aliasing(self) -> None:
         """
-        Disable range_num_stages choices if any kernel argument name is both read and written.
+        Disable pipelining only on loops that read and write the same argument.
 
         Workaround for https://github.com/triton-lang/triton/issues/8259
         """
@@ -632,17 +930,55 @@ class CompileEnvironment:
         if not self.config_spec.range_num_stages:
             return
 
+        from .ast_extension import ExtendedAST
         from .ast_read_writes import ReadWrites
         from .host_function import HostFunction
+        from .loop_dependency_checker import canonical_host_tensor_name
+        from .loop_dependency_checker import collect_host_tensor_aliases
+        from .type_info import IterType
+        from .type_info import SequenceType
+        from .type_info import TileIndexType
 
         host_fn = HostFunction.current()
-        rw = ReadWrites.from_list(host_fn.body)
-        if not (rw.reads and rw.writes):
-            return
-
         arg_names = set(host_fn.params.arguments.keys())
-        if set(rw.reads) & set(rw.writes) & arg_names:
-            self.config_spec.range_num_stages.clear()
+        aliases = collect_host_tensor_aliases(host_fn.body)
+        unsafe_block_ids: set[int] = set()
+        for node in ast.walk(ast.Module(body=host_fn.body, type_ignores=[])):
+            if not isinstance(node, ast.For) or not isinstance(node, ExtendedAST):
+                continue
+            rw = ReadWrites.from_list(node.body)
+            # Name traversal sees the target passed to an in-place store and
+            # host-side tensor metadata as reads, but neither reads storage.
+            reads = {
+                canonical_host_tensor_name(name, aliases)
+                for name, count in rw.reads.items()
+                if count
+                > rw.inplace_writes.get(name, 0) + rw.tensor_metadata_reads.get(name, 0)
+            }
+            reads.update(
+                canonical_host_tensor_name(name, aliases) for name in rw.atomic_reads
+            )
+            writes = {canonical_host_tensor_name(name, aliases) for name in rw.writes}
+            if not (reads & writes & arg_names):
+                continue
+            iter_node = node.iter
+            if not isinstance(iter_node, ExtendedAST):
+                continue
+            iter_type = iter_node._type_info
+            if not isinstance(iter_type, IterType):
+                continue
+            inner = iter_type.inner
+            if isinstance(inner, SequenceType):
+                unsafe_block_ids.update(
+                    item.block_id
+                    for item in inner.unpack()
+                    if isinstance(item, TileIndexType)
+                )
+            elif isinstance(inner, TileIndexType):
+                unsafe_block_ids.add(inner.block_id)
+        for block_id in unsafe_block_ids:
+            if block_id in self.config_spec.range_num_stages.valid_block_ids():
+                self.config_spec.range_num_stages.disable_block_id(block_id)
 
     def allocate_block_size(
         self,
@@ -707,19 +1043,26 @@ class CompileEnvironment:
                 block_idx = origin_info.origin.block_id
                 existing_block = self.block_sizes[block_idx]
 
-        def _is_unbacked_symint(x: int | torch.SymInt) -> bool:
-            if not isinstance(x, torch.SymInt):
-                return False
-            expr = x._sympy_()
-            if isinstance(expr, sympy.Symbol):
-                return symbol_is_type(expr, SymT.UNBACKED_INT)
-            return False
+        def _has_unbacked(x: int | torch.SymInt) -> bool:
+            return isinstance(x, torch.SymInt) and bool(
+                free_unbacked_symbols(x._sympy_())
+            )
 
-        # Check for existing reduction dimensions with the same size
+        # Check for existing reduction dimensions with the same size. When an
+        # unbacked symbol is involved, the comparison must not guard:
+        # ``rdim.size == size`` on a mixed unbacked-SymInt/int pair forces a
+        # ShapeEnv guard that SPECIALIZES the unbacked block symbol to the
+        # rdim's concrete size (e.g. a tile_m block symbol silently becomes
+        # head_dim==64 when comparing against an existing rdim), corrupting
+        # every downstream shape of that tile. known_equal answers via
+        # _maybe_evaluate_static (no new guards) and returns False when the
+        # equality is undecidable. Backed sizes keep the guarding ``==`` so
+        # distinct input symbols that are equal by hint (e.g. x.size(1) vs
+        # weight.size(0)) still unify into a single rdim.
         for rdim in self.block_sizes:
             if not rdim.reduction or not isinstance(rdim.size, (int, torch.SymInt)):
                 continue
-            if _is_unbacked_symint(rdim.size) and _is_unbacked_symint(size):
+            if _has_unbacked(rdim.size) or _has_unbacked(size):
                 if self.known_equal(rdim.size, size):
                     return rdim
             elif rdim.size == size:
@@ -1082,7 +1425,13 @@ class CompileEnvironment:
             result = self.fake_mode.fake_tensor_converter.from_real_tensor(
                 self.fake_mode, tensor, shape_env=self.shape_env, source=source
             )
-        self.input_sources[result] = source
+        result = self.backend.normalize_input_fake_tensor(result)
+        previous_source = self.input_sources.get(result)
+        if previous_source is not None and previous_source != source:
+            self._ambiguous_tensor_input_source_ids.add(id(result))
+            self._tensor_input_source_cache.pop(id(result), None)
+        else:
+            self.input_sources[result] = source
         if isinstance(source, LocalSource):
             for i, s in enumerate(result.size()):
                 if isinstance(s, torch.SymInt) and isinstance(
@@ -1163,10 +1512,10 @@ class CompileEnvironment:
         return self.index_type()
 
     def sympy_debug(self, expr: sympy.Basic) -> str:
-        return str(expr.xreplace(self.debug_shape_renames))
+        return str(expr.xreplace(self.active_debug_shape_renames))
 
     def __enter__(self) -> Self:
-        assert getattr(tls, "env", None) is None, "CompileEnvironment already active"
+        assert tls.env is None, "CompileEnvironment already active"
         self.fake_mode.__enter__()
         tls.env = self
         return self
@@ -1182,20 +1531,13 @@ class CompileEnvironment:
 
     @staticmethod
     def current() -> CompileEnvironment:
-        try:
-            if (env := tls.env) is not None:
-                return env
-        except AttributeError:
-            pass
+        if (env := tls.env) is not None:
+            return env
         raise NoCurrentEnvironment from None
 
     @staticmethod
     def has_current() -> bool:
-        try:
-            CompileEnvironment.current()
-            return True
-        except NoCurrentEnvironment:
-            return False
+        return tls.env is not None
 
     def get_block_id(self, size: int | torch.SymInt | sympy.Basic) -> int | None:
         """
@@ -1296,19 +1638,46 @@ class CompileEnvironment:
         return None
 
     def canonical_block_id(self, block_id: int) -> int:
-        """Follow fixed block-size aliases back to their canonical symbolic owner."""
+        """Follow block-size aliases back to their canonical symbolic owner.
+
+        Reduction lowering creates a separate output-range block even when
+        that range is exactly an already-active tile block.  In that case
+        ``allocate_reduction_dimension`` deliberately reuses the tile's
+        symbolic variable, so preserve that identity here as well as for the
+        explicit ``FixedBlockSizeSource`` aliases.
+        """
 
         seen: set[int] = set()
         current = block_id
         while current not in seen:
             seen.add(current)
-            source = self.block_sizes[current].block_size_source
-            if not isinstance(source, FixedBlockSizeSource):
+            info = self.block_sizes[current]
+            source = info.block_size_source
+            if isinstance(source, FixedBlockSizeSource):
+                value = source.value
+            elif self.backend_name == "cute" and isinstance(
+                source, ReductionLoopBlockSizeSource
+            ):
+                value = info.size
+            else:
                 break
-            value = source.value
             if not isinstance(value, torch.SymInt):
                 break
-            next_block_id = self.get_block_id(value)
+            value_expr = value._sympy_()
+            # ``get_block_id`` intentionally prefers the newest matching
+            # reduction block.  Canonicalization needs the opposite: locate
+            # the earlier owner whose symbol was reused when this alias was
+            # allocated.  This is also usable after HostFunction teardown.
+            next_block_id = next(
+                (
+                    candidate.block_id
+                    for candidate in self.block_sizes[:current]
+                    if candidate.symbol() == value_expr
+                ),
+                None,
+            )
+            if next_block_id is None:
+                next_block_id = self.get_block_id(value)
             if next_block_id is None or next_block_id == current:
                 break
             current = next_block_id

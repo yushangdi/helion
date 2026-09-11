@@ -1,77 +1,139 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import lru_cache
-import inspect
+import importlib.metadata
+import logging
 
-# The cute backend hard-requires the CuTe DSL 4.5.1 API generation, the
+from packaging.version import InvalidVersion
+from packaging.version import Version
+
+log = logging.getLogger(__name__)
+
+# The cute backend hard-requires the CuTe DSL 4.7 API generation, the
 # apache-tvm-ffi package, and CUDA >= 13. ``check_cute_backend_requirements``
 # (wired through ``CuteBackend.validate_environment``) enforces this up front so
 # the rest of the backend can assume the modern APIs unconditionally rather than
 # carry per-build compatibility shims and inline workarounds.
 CUTE_MIN_CUDA_VERSION = "13"
+# Central validated CuTe compatibility generation. A bump must revalidate the
+# raw tcgen05 runtime-N PTX fallback in ``cute_mma`` alongside the typed APIs;
+# the pin-consistency test makes every checked-in DSL upgrade pass this line.
+CUTE_VALIDATED_VERSION = Version("4.7.0")
+CUTE_MIN_VERSION = CUTE_VALIDATED_VERSION
+CUTE_TCGEN05_RUNTIME_N_PTX_VALIDATED_VERSION = CUTE_VALIDATED_VERSION
+L2_EVICT_LAST_STORE_ABI_VERSION = 1
+
+
+def cp_async_supported(
+    target_device_capability: tuple[int, int] | None,
+) -> bool:
+    """Whether the target can execute PTX ``cp.async`` instructions."""
+
+    return target_device_capability is not None and target_device_capability >= (8, 0)
+
+
+def fixed_l2_evict_last_store_policy_supported(
+    target_device_capability: tuple[int, int] | None,
+    cuda_version: str | None,
+) -> bool:
+    """Whether the validated opaque store-policy descriptor is safe to emit.
+
+    The descriptor was obtained from CUDA 13 for SM103.  Keep this probe free
+    of CuTe imports so config normalization can use it before backend setup.
+    """
+
+    return target_device_capability == (10, 3) and bool(
+        cuda_version and cuda_version.split(".", 1)[0] == "13"
+    )
+
+
+@dataclass(frozen=True)
+class _CuteDSLVersionProbe:
+    version: Version | None = None
+    missing: bool = False
+    invalid: str | None = None
+
+
+@lru_cache(maxsize=1)
+def _installed_cute_dsl_version() -> _CuteDSLVersionProbe:
+    """Probe and cache the installed DSL version, including failure states."""
+    try:
+        return _CuteDSLVersionProbe(
+            version=Version(importlib.metadata.version("nvidia-cutlass-dsl"))
+        )
+    except importlib.metadata.PackageNotFoundError:
+        return _CuteDSLVersionProbe(missing=True)
+    except InvalidVersion as error:
+        return _CuteDSLVersionProbe(invalid=str(error))
+
+
+def tcgen05_runtime_n_ptx_compatible() -> bool:
+    """Whether the installed DSL matches the raw runtime-N PTX validation."""
+
+    installed = _installed_cute_dsl_version().version
+    if installed is None:
+        return False
+    return installed == CUTE_TCGEN05_RUNTIME_N_PTX_VALIDATED_VERSION
+
+
+@lru_cache(maxsize=1)
+def warn_tcgen05_runtime_n_ptx_fallback() -> None:
+    """Warn once when a grouped worklist needs the newer-DSL fallback.
+
+    This is intentionally separate from the side-effect-free compatibility
+    probe. Callers invoke the warning only after proving a grouped N,M worklist
+    candidate or selecting its explicit runtime-direct codegen path.
+    """
+
+    installed = _installed_cute_dsl_version().version
+    if installed is None:
+        return
+    if installed > CUTE_TCGEN05_RUNTIME_N_PTX_VALIDATED_VERSION:
+        log.warning(
+            "Installed nvidia-cutlass-dsl %s is newer than the exact %s version "
+            "validated for grouped tcgen05 runtime-N PTX. Grouped runtime-N "
+            "compiler seeds and promoted defaults are disabled; explicit "
+            "runtime-direct worklist configs fall back to typed static-width "
+            "MMA, including for ragged source-M tails. Use %s for the validated "
+            "narrow runtime-N path.",
+            installed,
+            CUTE_TCGEN05_RUNTIME_N_PTX_VALIDATED_VERSION,
+            CUTE_TCGEN05_RUNTIME_N_PTX_VALIDATED_VERSION,
+        )
 
 
 @lru_cache(maxsize=1)
 def _cute_backend_requirement_error() -> str | None:
     """Return why the cute backend cannot run here, or ``None`` if it can.
 
-    Cached because the answer is fixed for the lifetime of the process. The
-    CuTe DSL generation is detected by *feature*, not by ``cutlass.__version__``:
-    the published wheels under-report the API generation (the 4.5.1 API has
-    shipped in wheels that still self-report ``4.5.0``), so a version-string
-    comparison would spuriously reject a working install.
+    Cached because the answer is fixed for the lifetime of the process.
     """
-    try:
-        import cutlass.cute as cute  # noqa: F401
-        from cutlass.cutlass_dsl.cutlass import if_generate
-        from cutlass.pipeline import PipelineTmaUmma
-        from cutlass.utils import TmemAllocator
-    except ImportError as e:
-        return f"the CuTe DSL is not importable (need nvidia-cutlass-dsl >= 4.5.1): {e}"
-
-    # 4.5.1 names the TmemAllocator skip-init kwarg ``initialize_mbarrier`` (it
-    # was ``dealloc_mbarrier_initialized`` in intermediate builds and absent from
-    # 4.5.0.dev0). ``@dsl_user_op`` strips kwargs from the public wrapper, so
-    # resolve ``__wrapped__`` first.
-    init = TmemAllocator.__init__
-    inner = getattr(init, "__wrapped__", init)
-    try:
-        params = inspect.signature(inner).parameters
-    except (TypeError, ValueError):
-        params = {}
-    if "initialize_mbarrier" not in params:
+    probe = _installed_cute_dsl_version()
+    installed_version = probe.version
+    if probe.missing:
         return (
-            "the installed CuTe DSL is too old (need >= 4.5.1: "
-            "TmemAllocator.initialize_mbarrier kwarg is missing)"
+            "the CuTe DSL is not installed "
+            f"(need nvidia-cutlass-dsl >= {CUTE_MIN_VERSION})"
+        )
+    if probe.invalid is not None:
+        return (
+            "the installed CuTe DSL version is invalid "
+            f"(need >= {CUTE_MIN_VERSION}): {probe.invalid}"
+        )
+    assert installed_version is not None
+    if installed_version < CUTE_MIN_VERSION:
+        return (
+            "the installed CuTe DSL is too old "
+            f"(need >= {CUTE_MIN_VERSION}, found {installed_version})"
         )
 
-    # 4.5.1 fixed the multi-result ``scf.if`` lowering used by nested
-    # ``PipelineState.advance()`` (4.5.0.dev0 raised a DSLRuntimeError from the
-    # ``OpResultList`` path) and gave ``PipelineTmaUmma.producer_tail`` peer-CTA
-    # semantics (older source gated the whole tail to the leader CTA). Both are
-    # detected from source.
     try:
-        if "ir.OpResultList" not in inspect.getsource(if_generate):
-            return (
-                "the installed CuTe DSL is too old (need >= 4.5.1: "
-                "if_generate is missing the OpResultList fix)"
-            )
-        tail_src = inspect.getsource(PipelineTmaUmma.producer_tail)
-    except (OSError, TypeError) as e:
-        return f"the installed CuTe DSL source cannot be inspected (need >= 4.5.1): {e}"
-    leader_markers = (
-        "block_idx_in_cluster",
-        "cta_rank",
-        "cluster_rank",
-        "rank_in_cluster",
-        "is_leader_cta",
-    )
-    if "producer_acquire(" not in tail_src or any(
-        marker in tail_src for marker in leader_markers
-    ):
+        import cutlass.cute as cute  # noqa: F401
+    except ImportError as e:
         return (
-            "the installed CuTe DSL is too old (need >= 4.5.1: "
-            "PipelineTmaUmma.producer_tail lacks peer-CTA semantics)"
+            "the CuTe DSL is not importable "
+            f"(need nvidia-cutlass-dsl >= {CUTE_MIN_VERSION}): {e}"
         )
 
     try:

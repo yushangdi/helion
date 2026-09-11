@@ -26,6 +26,7 @@ from ..language.tile_proxy import _CheckForIndexCalls
 from .ast_extension import ExtendedAST
 from .compile_environment import AutoSize
 from .compile_environment import CompileEnvironment
+from .compile_environment import ConfigValueExpression
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import LoopSpecBlockSizeSource
 from .compile_environment import _symint_expr
@@ -43,6 +44,7 @@ from .variable_origin import TensorStrideOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterator
     from collections.abc import Sequence
     from typing_extensions import Self
 
@@ -87,6 +89,10 @@ class TypeInfo:
             return SymIntType(origin, value)
         if isinstance(value, torch.SymFloat):
             return SymFloatType(origin, value)
+        from ..language.distributed_ops import AsyncCopyDescriptor
+
+        if isinstance(value, AsyncCopyDescriptor):
+            return AsyncCopyDescriptorType(origin=origin, element_types={})
         if type(value) in (int, float, bool, type(None), range):
             return LiteralType(origin, value)
         if type(value) in (str, torch.dtype, torch.device):
@@ -302,16 +308,11 @@ class TensorType(TypeInfo):
             )
 
     def __str__(self) -> str:
+        env = CompileEnvironment.current()
         shape: list[str] = []
         for s in self.fake_value.size():
             if isinstance(s, torch.SymInt):
-                shape.append(
-                    str(
-                        s._sympy_().xreplace(
-                            CompileEnvironment.current().debug_shape_renames
-                        )
-                    )
-                )
+                shape.append(env.sympy_debug(s._sympy_()))
             else:
                 shape.append(str(s))
         dtype = self.fake_value.dtype
@@ -447,11 +448,17 @@ class TensorType(TypeInfo):
                 rhs_rank = value.fake_value.ndim
                 # Allow scalar tensors (rank 0) to be assigned to any rank (broadcasts)
                 if rhs_rank != 0 and lhs_rank != rhs_rank:
-                    raise exc.RankMismatch(
-                        lhs_rank,
-                        rhs_rank,
-                        f"LHS shape: {tuple(lhs_shape)}, RHS shape: {tuple(value.fake_value.shape)}",
+                    env = CompileEnvironment.current()
+                    can_squeeze = rhs_rank > lhs_rank and all(
+                        env.known_equal(value.fake_value.size(d), 1)
+                        for d in range(rhs_rank - lhs_rank)
                     )
+                    if not can_squeeze:
+                        raise exc.RankMismatch(
+                            lhs_rank,
+                            rhs_rank,
+                            f"LHS shape: {tuple(lhs_shape)}, RHS shape: {tuple(value.fake_value.shape)}",
+                        )
             elif isinstance(value, (NumericType, LiteralType)):
                 # Allow scalar assignment to tensor (broadcasts to tensor shape)
                 pass
@@ -710,6 +717,43 @@ class StringType(TypeInfo):
         return "str"
 
 
+def _iter_body_excluding_nested_defs(node: ast.AST) -> Iterator[ast.AST]:
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        yield child
+        yield from _iter_body_excluding_nested_defs(child)
+
+
+class NestedFunctionType(TypeInfo):
+    func_node: ast.FunctionDef
+
+    def __init__(
+        self,
+        origin: Origin,
+        func_node: ast.FunctionDef,
+    ) -> None:
+        super().__init__(origin)
+        self.func_node = func_node
+
+    def __str__(self) -> str:
+        return f"NestedFunctionType({self.func_node.name})"
+
+    def find_effective_return(self) -> ast.Return | None:
+        func_node = self.func_node
+        for stmt in func_node.body:
+            for desc in _iter_body_excluding_nested_defs(stmt):
+                if isinstance(desc, ast.Return):
+                    raise exc.StatementNotSupported(
+                        f"Early return inside control flow is not supported "
+                        f"in nested function '{func_node.name}'"
+                    )
+        for stmt in func_node.body:
+            if isinstance(stmt, ast.Return):
+                return stmt
+        return None
+
+
 class ConfigFragmentType(LiteralType):
     """TypeInfo for config fragments are treated as constant literals during compilation."""
 
@@ -809,7 +853,33 @@ class CallableType(LiteralType):
             for x in proxy_args
         ):
             if self.value in self._new_symint_on_host_fns() and origin.is_host():
-                return SymIntType.new_unbacked(origin)
+                result = SymIntType.new_unbacked(origin)
+                operation = self._config_value_operation()
+                derived_args: list[int | str | ConfigValueExpression] = []
+                for arg in proxy_args:
+                    if isinstance(arg, int):
+                        derived_args.append(arg)
+                    elif isinstance(arg, torch.SymInt):
+                        expr = _symint_expr(arg)
+                        if expr is None:
+                            break
+                        expression = env.config_value_expressions.get(expr)
+                        if expression is None:
+                            break
+                        derived_args.append(expression)
+                    else:
+                        break
+                else:
+                    result_expr = _symint_expr(result.value)
+                    if (
+                        operation is not None
+                        and not proxy_kwargs
+                        and result_expr is not None
+                    ):
+                        env.config_value_expressions[result_expr] = (
+                            ConfigValueExpression(operation, tuple(derived_args))
+                        )
+                return result
             if isinstance(self.value, type) and issubclass(
                 self.value, ConfigFragmentType
             ):
@@ -872,6 +942,23 @@ class CallableType(LiteralType):
             pass
         return cast("dict[object, None]", dict.fromkeys(fns))
 
+    def _config_value_operation(self) -> str | None:
+        from .._utils import cdiv
+        from .._utils import next_power_of_2
+
+        if self.value in (cdiv, next_power_of_2):
+            return self.value.__name__
+        try:
+            import triton as _triton
+
+            if self.value is _triton.cdiv:
+                return "cdiv"
+            if self.value is _triton.next_power_of_2:
+                return "next_power_of_2"
+        except ImportError:
+            pass
+        return None
+
 
 def _raise_shape_specializing(*args: object) -> None:
     raise exc.ShapeSpecializingCall
@@ -908,7 +995,15 @@ class NumericType(TypeInfo):
         raise NotImplementedError
 
     def __str__(self) -> str:
-        return f"{type(self).__name__}({self.value})"
+        env = CompileEnvironment.current()
+        # Preserve the existing debug/golden rendering except while semantic
+        # fingerprinting supplies canonical symbolic-shape names.
+        value = (
+            env.sympy_debug(self.value._sympy_())
+            if env.has_debug_shape_rename_override
+            else self.value
+        )
+        return f"{type(self).__name__}({value})"
 
     def proxy(self) -> torch.SymInt | torch.SymBool | torch.SymFloat | int:
         return self.value
@@ -1144,14 +1239,27 @@ class TileIndexType(TypeInfo):
             if isinstance(numel, torch.SymInt):
                 maybe_bounded_by = _detect_outer_block_bound(numel, env)
                 if maybe_bounded_by is not None:
+                    bounded_by = maybe_bounded_by
                     try:
                         outer_spec = env.config_spec.block_sizes.block_id_lookup(
                             maybe_bounded_by
                         )
                     except KeyError:
-                        pass
+                        # A fixed outer tile has no autotuner BlockSizeSpec, but it
+                        # still bounds this inner loop. Retain the relationship and
+                        # use the fixed source's value as the search ceiling.
+                        if 0 <= maybe_bounded_by < len(env.block_sizes):
+                            outer_info = env.block_sizes[maybe_bounded_by]
+                            source = outer_info.block_size_source
+                            if isinstance(source, FixedBlockSizeSource):
+                                try:
+                                    outer_max = max(
+                                        1,
+                                        int(env.size_hint(source.value)),
+                                    )
+                                except Exception:
+                                    outer_max = None
                     else:
-                        bounded_by = maybe_bounded_by
                         outer_max = outer_spec.max_size
             env.config_spec.block_sizes.append(
                 BlockSizeSpec(
@@ -1570,6 +1678,68 @@ class StackTensorType(ClassType):
             .proxy()
             .new_empty(self._device_indexing_size(key)),
         )
+
+
+class AsyncCopyDescriptorType(ClassType):
+    """Type of a Helion asynchronous remote-copy handle."""
+
+    # pyrefly: ignore [bad-override]
+    def proxy(self) -> object:
+        from ..language.distributed_ops import AsyncCopyDescriptor
+
+        return AsyncCopyDescriptor()
+
+    def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
+        if attr in ("start", "wait", "wait_send", "wait_recv"):
+            return _AsyncCopyDescriptorMethodType(origin, self, attr)
+        return super().propagate_attribute(attr, origin)
+
+
+class _AsyncCopyDescriptorMethodType(TypeInfo):
+    descriptor_type: AsyncCopyDescriptorType
+    method_name: str
+
+    def __init__(
+        self,
+        origin: Origin,
+        descriptor_type: AsyncCopyDescriptorType,
+        method_name: str,
+    ) -> None:
+        super().__init__(origin)
+        self.descriptor_type = descriptor_type
+        self.method_name = method_name
+
+    def propagate_call(
+        self, args: tuple[TypeInfo, ...], kwargs: dict[str, TypeInfo], origin: Origin
+    ) -> TypeInfo:
+        if args or kwargs:
+            raise exc.TypeInferenceError(
+                f"AsyncCopyDescriptor.{self.method_name}() takes no arguments"
+            )
+        from ..language.distributed_ops import start_async_remote_copy_descriptor
+        from ..language.distributed_ops import wait_async_remote_copy
+        from ..language.distributed_ops import wait_recv_async_remote_copy
+        from ..language.distributed_ops import wait_send_async_remote_copy
+
+        descriptor_ops = {
+            "start": start_async_remote_copy_descriptor,
+            "wait": wait_async_remote_copy,
+            "wait_send": wait_send_async_remote_copy,
+            "wait_recv": wait_recv_async_remote_copy,
+        }
+        result = CallableType(origin, descriptor_ops[self.method_name]).propagate_call(
+            (self.descriptor_type,), {}, origin
+        )
+        assert result is not None
+        return result
+
+    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
+        if (
+            isinstance(other, _AsyncCopyDescriptorMethodType)
+            and self.method_name == other.method_name
+        ):
+            return self
+        return super().merge(other, var_name=var_name)
 
 
 class SliceType(CollectionType):

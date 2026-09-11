@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .base_search import normalize_autotune_seed_configs
+from .benchmark_provider import LocalBenchmarkProvider
 from .effort_profile import RANDOM_SEARCH_DEFAULTS
 from .finite_search import FiniteSearch
 
@@ -36,6 +37,7 @@ class RandomSearch(FiniteSearch):
         args: Sequence[object],
         count: int = RANDOM_SEARCH_DEFAULTS.count,
     ) -> None:
+        self.count = count
         config_gen = kernel.config_spec.create_config_generation(
             overrides=kernel.settings.autotune_config_overrides or None,
             advanced_controls_files=kernel.settings.autotune_search_acf or None,
@@ -50,6 +52,11 @@ class RandomSearch(FiniteSearch):
                 user_seed_configs=seed_configs,
             ),
         )
+        # ``config_gen`` above is a throwaway generator used only to build the
+        # random population; FiniteSearch created ``self.config_gen`` separately.
+        # Carry over the count of configs it rejected as InvalidConfig so the
+        # search-space logger reports them as explored-invalid.
+        self.config_gen.invalid_config_count += config_gen.invalid_config_count
 
     @classmethod
     def get_kwargs_from_profile(
@@ -59,3 +66,9 @@ class RandomSearch(FiniteSearch):
         return {
             "count": profile.random_search.count,
         }
+
+    def _algorithm_cache_policy(self) -> dict[str, object] | None:
+        if self._benchmark_provider_cls is not LocalBenchmarkProvider:
+            return None
+        # The generated configs are a stochastic realization, not policy.
+        return {"random_version": 1, "count": self.count}

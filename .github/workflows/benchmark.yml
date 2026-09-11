@@ -111,7 +111,7 @@ jobs:
 
           # On OSDC, route through the pypi-cache /whl proxy (deps stay reachable behind the egress firewall) and clear the cache index vars so it wins over the cache default; off OSDC PYPI_CACHE_WHL_URL is unset so we hit download.pytorch.org.
           PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
-          UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U "torch==2.11.*" --index-url "${PYTORCH_INDEX%/whl/*}/whl/${{ inputs.runtime-version }}"
+          UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U "torch==2.13.*" --index-url "${PYTORCH_INDEX%/whl/*}/whl/${{ inputs.runtime-version }}"
 
       - name: Install Helion
         run: |
@@ -174,14 +174,18 @@ jobs:
         run: |
           set -x
           source .venv/bin/activate
-          # Newer FLA allows gated backward on Hopper with Triton 3.7.1+;
-          # torch 2.12.1 provides that Triton version.
-          PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
-          UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U "torch==2.12.1" --index-url "${PYTORCH_INDEX%/whl/*}/whl/${{ inputs.runtime-version }}"
+          uv pip install pip
+          # PyTorch 2.13 provides Triton 3.7.1+, which enables gated backward
+          # on Hopper in newer FLA releases.
           uv pip install einops transformers
           uv pip install "git+https://github.com/fla-org/flash-linear-attention@6bd90692588c81fe102ee6e12ac70686359658a2" --no-deps
           python -c "from packaging.version import Version; import torch, triton; print('torch', torch.__version__, 'triton', triton.__version__); assert torch.cuda.is_available(); assert Version(triton.__version__) >= Version('3.7.1'), triton.__version__"
           python -c "import fla; print('fla', fla.__name__)"
+          # FlashKDA builds a CUDA extension: --no-build-isolation for the torch
+          # import in its setup.py, and FLASH_KDA_CUDA_ARCHS so the arch does not
+          # depend on a device being visible while installing.
+          FLASH_KDA_CUDA_ARCHS=all uv pip install "git+https://github.com/MoonshotAI/FlashKDA" --no-build-isolation --no-deps
+          python -c "import flash_kda; print('flash_kda', flash_kda.__name__)"
 
       - name: Run TritonBench Benchmark
         if: inputs.suite == 'tritonbench'
@@ -278,7 +282,11 @@ jobs:
           echo "Kernels: ${KERNELS:-all}"
           echo "=========================================="
 
-          ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 \
+          # AOTAutotuneCache takes each config from the checked-in
+          # examples/linear/_helion_aot_linear_attention_engine_cuda_sm*.py
+          # instead of autotuning.
+          env ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 \
+          HELION_AUTOTUNE_CACHE=AOTAutotuneCache \
           python -m benchmarks.run_linattn \
               "${KERNEL_FLAG[@]}" \
               --output "$TEST_REPORTS_DIR/helionbench.json" \

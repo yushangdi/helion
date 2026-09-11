@@ -16,6 +16,7 @@ Parameterized by:
 from __future__ import annotations
 
 from enum import Enum
+import functools
 from typing import Any
 from typing import Callable
 from typing import Literal
@@ -295,15 +296,140 @@ RCP_LN2 = 1.4426950408889634
 
 
 @helion.kernel()
+def l2norm_fwd_helion(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Unit-norm each row over the D axis, in fp32.
+    y[n, d] = x[n, d] / sqrt(sum_d x[n]^2 + eps)     # [N, D]"""
+    N, D = x.size()
+    y = torch.empty_like(x)
+    for tile_n in hl.tile(N):
+        xt = x[tile_n, :].to(torch.float32)
+        rstd = torch.rsqrt((xt * xt).sum(dim=-1, keepdim=True) + eps)
+        y[tile_n, :] = (xt * rstd).to(x.dtype)
+    return y
+
+
+@helion.kernel()
+def chunk_cumsum_gc_helion(
+    g: torch.Tensor,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
+    H: int = 1,
+    N: int = 1,
+    use_gate: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
+    has_bias: hl.constexpr = True,  # pyrefly: ignore[bad-function-definition]
+    use_lower_bound: hl.constexpr = True,  # pyrefly: ignore[bad-function-definition]
+) -> torch.Tensor:
+    """Per-chunk cumulative log-decay over the chunk (C) axis.
+        gc[i] = sum_{j <= i} g[j]        # [BHN, C, D], fp32
+    Computed as the tensor-core matmul gc = L @ g with L the [C, C]
+    lower-triangular ones matrix, instead of a strided scan over the C axis
+    (dim -2 of a [BH, N, C, D] tensor) whose steps stride by D. The bf16 g is
+    exactly representable in tf32, and the sum accumulates in fp32, so gc keeps
+    the same precision as an fp32 scan while reading g once through the MMA.
+
+    With use_gate=True, g arrives pre-activation and the gate is applied before the
+    sum, over rows flattened as [B, H, N]:
+        h  = (r // N) % H                # head of row r
+        gb = g + dt_bias[h]              # has_bias=True, else gb = g
+      - use_lower_bound=True (default):
+            g = lower_bound * sigmoid(exp(A_log[h]) * gb)
+      - use_lower_bound=False:
+            g = -exp(A_log[h]) * softplus(gb)"""
+    BHN = g.size(0)
+    C = hl.specialize(g.size(1))
+    D = g.size(2)
+    gc = torch.empty([BHN, C, D], dtype=torch.float32, device=g.device)
+    for tile_bhn, tile_d in hl.tile([BHN, D]):
+        idx = hl.arange(C)
+        ltri = (idx[:, None] >= idx[None, :]).to(torch.float32)  # [C, C] incl. diag
+        L = ltri[None, :, :].broadcast_to([tile_bhn, C, C])  # pyrefly: ignore[no-matching-overload]
+        gt = g[tile_bhn, :, tile_d].to(torch.float32)  # [b, C, d]
+        if use_gate:
+            h_idx = (tile_bhn.index // N) % H
+            a = torch.exp(A_log[h_idx].to(torch.float32))[:, None, None]  # pyrefly: ignore[unsupported-operation]
+            if has_bias:
+                gt = gt + dt_bias[h_idx, tile_d][:, None, :]  # pyrefly: ignore[unsupported-operation]
+            if use_lower_bound:
+                gt = lower_bound * torch.sigmoid(a * gt)  # pyrefly: ignore[unsupported-operation]
+            else:
+                sp = torch.clamp(gt, min=0.0) + torch.log1p(torch.exp(-torch.abs(gt)))
+                gt = -a * sp
+        gc[tile_bhn, :, tile_d] = hl.dot(L, gt)
+    return gc
+
+
+@helion.kernel()
+def chunk_cumsum_gc_varlen_helion(
+    g: torch.Tensor,
+    token_base: torch.Tensor,
+    valid_len: torch.Tensor,
+    gc: torch.Tensor,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
+    use_gate: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
+    has_bias: hl.constexpr = True,  # pyrefly: ignore[bad-function-definition]
+    use_lower_bound: hl.constexpr = True,  # pyrefly: ignore[bad-function-definition]
+) -> None:
+    """chunk_cumsum_gc_helion over a varlen batch, g read token-major.
+
+    Row r of the flat [H * NT] chunk axis addresses its own tokens, the four lines
+    every varlen kernel here opens with:
+        h     = r // NT                  # head
+        j     = r  % NT                  # chunk, over all sequences
+        rows  = token_base[j] + i        # its tokens, i in [0, C)
+        valid = i < valid_len[j]         # False past this sequence's end
+    so g is read where it lies, never copied into chunk-major order:
+        gt = g[rows, h] * valid          # [C, D] fp32, tail zeroed
+    With use_gate=True gt arrives pre-activation and the gate applies before the sum:
+      - use_lower_bound=True (default):
+            gt = lower_bound * sigmoid(exp(A_log[h]) * (gt + dt_bias[h]))
+      - use_lower_bound=False:
+            gt = -exp(A_log[h]) * softplus(gt + dt_bias[h])
+    The gate maps 0 to lower_bound * sigmoid(0) != 0, so the tail is masked again
+    after it, then the cumsum is the same triangular matmul as the dense kernel:
+        gt = gt * valid                  # [C, D]
+        gc[r] = L @ gt                   # [C, D], L the [C, C] lower-triangular ones
+    A zeroed tail holds the running sum flat, leaving the chunk total gc[C-1]
+    unchanged. Separate from the dense kernel because the chunk axis must be
+    block_size=1 for a scalar row, and hl.tile cannot sit inside a branch."""
+    NT = token_base.size(0)
+    C = hl.specialize(gc.size(1))
+    for tile_r, tile_d in hl.tile([gc.size(0), g.size(2)], block_size=[1, None]):
+        idx = hl.arange(C)
+        ltri = (idx[:, None] >= idx[None, :]).to(torch.float32)  # [C, C] incl. diag
+        j = tile_r.begin % NT
+        h = tile_r.begin // NT
+        valid = idx < valid_len[j]
+        gt = hl.load(g, [token_base[j] + idx, h, tile_d], extra_mask=valid[:, None]).to(
+            torch.float32
+        )  # [C, d]
+        gt = torch.where(valid[:, None], gt, 0.0)
+        if use_gate:
+            a = torch.exp(A_log[h].to(torch.float32))  # pyrefly: ignore[unsupported-operation]
+            if has_bias:
+                gt = gt + dt_bias[h : h + 1, tile_d]  # pyrefly: ignore[unsupported-operation]
+            if use_lower_bound:
+                gt = lower_bound * torch.sigmoid(a * gt)  # pyrefly: ignore[unsupported-operation]
+            else:
+                sp = torch.clamp(gt, min=0.0) + torch.log1p(torch.exp(-torch.abs(gt)))
+                gt = -a * sp
+            gt = torch.where(valid[:, None], gt, 0.0)
+        gc[tile_r.begin, :, tile_d] = hl.dot(ltri, gt)
+
+
+@helion.kernel()
 def chunk_fwd_h_diag_fused(
     k: torch.Tensor,
     v: torch.Tensor,
     g_last: torch.Tensor,
-    h0: torch.Tensor,
+    h0: torch.Tensor | None,
     gc: torch.Tensor | None = None,
     use_g: hl.constexpr = True,  # pyrefly: ignore[bad-function-definition]
     scalar_decay: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
     diag_anchored: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
+    has_h0: hl.constexpr = True,  # pyrefly: ignore[bad-function-definition]
 ) -> torch.Tensor:
     """Fused state accumulation over N chunks.
 
@@ -336,7 +462,10 @@ def chunk_fwd_h_diag_fused(
 
     for tile_bh, tile_d, tile_dv in hl.tile([BH, D, DV], block_size=[1, None, None]):
         idx = tile_bh.id
-        h_acc = h0[idx, tile_d, tile_dv].float()
+        if has_h0:
+            h_acc = h0[idx, tile_d, tile_dv].float()  # pyrefly: ignore[unsupported-operation]
+        else:
+            h_acc = hl.zeros([tile_d, tile_dv], dtype=torch.float32)
 
         for i_t in hl.grid(N):
             h_all[idx, i_t, tile_d, tile_dv] = h_acc.to(h_all.dtype)
@@ -376,6 +505,7 @@ def chunk_fwd_wy_delta_helion(
     beta: torch.Tensor,
     g_cs: torch.Tensor | None = None,
     Akk: torch.Tensor | None = None,
+    k_state_out: torch.Tensor | None = None,
     scalar_decay: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
     diag_anchored: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -398,6 +528,9 @@ def chunk_fwd_wy_delta_helion(
         mask); the w-key rides per-channel exp(gc):
             A = -beta * Akk
             w = T @ (beta * exp(gc) * k);  u = T @ (beta * v)
+        This path also writes the serial state pass's key operand, which shares
+        the k read and the per-channel gc:
+            k_state_out = k * exp(gc[C-1] - gc)     # [C, D]
     """
     BHN = k.size(0)
     C = hl.specialize(k.size(1))
@@ -415,24 +548,25 @@ def chunk_fwd_wy_delta_helion(
     for tile_bhn in hl.tile(BHN, block_size=1):
         beta_i = beta[tile_bhn, :].to(torch.float32)  # [1, C]
 
-        kk = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
-        for tile_d in hl.tile(D):
-            kt = k[tile_bhn, :, tile_d]
-            kk = hl.dot(kt, kt.transpose(-2, -1), acc=kk)
         idx = hl.arange(C)
         strict_lower = idx[:, None] > idx[None, :]
         if diag_anchored:
             # The anchored k-gram Akk already carries the per-channel decay and
-            # the strict-lower mask (kk above is unused on this path).
+            # the strict-lower mask; the in-kernel k @ k gram is compiled out.
             A = -(beta_i[:, :, None] * Akk[tile_bhn, :, :])  # pyrefly: ignore[unsupported-operation]
-        elif scalar_decay:
-            decay = g_cs[tile_bhn, :].to(  # pyrefly: ignore[unsupported-operation]
-                torch.float32
-            )  # [1, C]
-            L = torch.exp2((decay[:, :, None] - decay[:, None, :]) * RCP_LN2)
-            A = torch.where(strict_lower, -(beta_i[:, :, None] * kk * L), 0.0)
         else:
-            A = torch.where(strict_lower, -(beta_i[:, :, None] * kk), 0.0)
+            kk = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
+            for tile_kk in hl.tile(D):
+                kt_kk = k[tile_bhn, :, tile_kk]
+                kk = hl.dot(kt_kk, kt_kk.transpose(-2, -1), acc=kk)
+            if scalar_decay:
+                decay = g_cs[tile_bhn, :].to(  # pyrefly: ignore[unsupported-operation]
+                    torch.float32
+                )  # [1, C]
+                L = torch.exp2((decay[:, :, None] - decay[:, None, :]) * RCP_LN2)
+                A = torch.where(strict_lower, -(beta_i[:, :, None] * kk * L), 0.0)
+            else:
+                A = torch.where(strict_lower, -(beta_i[:, :, None] * kk), 0.0)
 
         eye = (idx[:, None] == idx[None, :]).to(torch.float32)
         eye = eye[None, :, :].broadcast_to([tile_bhn, C, C])  # pyrefly: ignore[no-matching-overload]
@@ -445,18 +579,120 @@ def chunk_fwd_wy_delta_helion(
         A_inv[tile_bhn, :, :] = T
 
         for tile_d in hl.tile(D):
-            kt = k[tile_bhn, :, tile_d].to(torch.float32) * beta_i[:, :, None]
+            raw_k = k[tile_bhn, :, tile_d].to(torch.float32)
+            kt = raw_k * beta_i[:, :, None]
             if scalar_decay:
                 kt = kt * torch.exp2(decay * RCP_LN2)[:, :, None]  # pyrefly: ignore[unbound-name]
             elif diag_anchored:
                 gc_d = g_cs[tile_bhn, :, tile_d].to(torch.float32)  # pyrefly: ignore[unsupported-operation]
                 kt = kt * torch.exp2(gc_d * RCP_LN2)
+                gc_last = g_cs[tile_bhn, C - 1, tile_d].to(torch.float32)  # pyrefly: ignore[unsupported-operation]
+                k_state_out[tile_bhn, :, tile_d] = (  # pyrefly: ignore[unsupported-operation]
+                    raw_k * torch.exp2((gc_last[:, None, :] - gc_d) * RCP_LN2)
+                ).to(k.dtype)
             w[tile_bhn, :, tile_d] = hl.dot(T, kt).to(w.dtype)
         for tile_dv in hl.tile(DV):
             vt = v[tile_bhn, :, tile_dv].to(torch.float32) * beta_i[:, :, None]
             u[tile_bhn, :, tile_dv] = hl.dot(T, vt).to(u.dtype)
 
     return w, u, A_inv
+
+
+@helion.kernel()
+def chunk_fwd_wy_delta_varlen_helion(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    g_cs: torch.Tensor,
+    Akk: torch.Tensor,
+    token_base: torch.Tensor,
+    valid_len: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    k_state_out: torch.Tensor,
+) -> None:
+    """chunk_fwd_wy_delta_helion's diag_anchored path over a varlen batch.
+
+    k, v and beta are read token-major ([T_total, H, D], [T_total, H, DV],
+    [T_total, H]); g_cs, Akk and every output are per-chunk and stay chunk-major
+    [H * NT, C, *]. Row r addresses its tokens as in chunk_cumsum_gc_varlen_helion:
+        beta_i = beta[rows, h] * valid                # [C] fp32, tail zeroed
+        k_i    = k[rows, h]    * valid                # [C, D]
+        v_i    = v[rows, h]    * valid                # [C, DV]
+    then the transform is the dense diag_anchored one, with the anchored k-gram Akk
+    already carrying the per-channel decay and the strict mask:
+        A   = -(beta_i * Akk)                         # [C, C] strict lower
+        T   = (I - A)^-1                              # log2(C) Neumann doublings
+        w   = T @ (beta_i * exp2(RCP_LN2 * gc) * k_i)         # [C, D]
+        u   = T @ (beta_i * v_i)                              # [C, DV]
+        k_state_out = k_i * exp2(RCP_LN2 * (gc[C-1] - gc))    # [C, D]
+    A zero beta_i row zeros that row of A, so T keeps an identity row there and w, u
+    and k_state_out are all zero on it: the tail contributes nothing downstream.
+
+    The dense kernel also returns T as A_inv for its backward; this path is forward
+    only, so T is not stored. With DV == D the value loop rides the key loop, so u is
+    written in the same pass as w and k_state_out."""
+    NT = token_base.size(0)
+    C = hl.specialize(g_cs.size(1))
+    D = k.size(2)
+    DV = v.size(2)
+    assert C & (C - 1) == 0, f"chunk size C must be a power of two, got {C}"
+    n_doublings = C.bit_length() - 1
+    fuse_v = D == DV
+
+    for tile_r in hl.tile(w.size(0), block_size=1):
+        j = tile_r.begin % NT
+        h = tile_r.begin // NT
+        base = token_base[j]
+        idx = hl.arange(C)
+        valid = idx < valid_len[j]
+
+        beta_i = torch.where(
+            valid, hl.load(beta, [base + idx, h], extra_mask=valid), 0.0
+        ).to(torch.float32)  # [C]
+
+        A = -(beta_i[:, None] * Akk[tile_r.begin, :, :])
+        eye = (idx[:, None] == idx[None, :]).to(torch.float32)
+        T = eye + A
+        Apow = A
+        for _ in range(n_doublings - 1):
+            Apow = hl.dot(Apow, Apow)
+            T = hl.dot(Apow, T, acc=T)
+
+        for tile_d in hl.tile(D):
+            raw_k = torch.where(
+                valid[:, None],
+                hl.load(k, [base + idx, h, tile_d], extra_mask=valid[:, None]),
+                0,
+            ).to(torch.float32)
+            gc_d = g_cs[tile_r.begin, :, tile_d].to(torch.float32)
+            gc_last = g_cs[tile_r.begin, C - 1, tile_d].to(torch.float32)
+            kt = raw_k * beta_i[:, None] * torch.exp2(gc_d * RCP_LN2)
+            k_state_out[tile_r.begin, :, tile_d] = (
+                raw_k * torch.exp2((gc_last[None, :] - gc_d) * RCP_LN2)
+            ).to(k.dtype)
+            w[tile_r.begin, :, tile_d] = hl.dot(T, kt).to(w.dtype)
+            if fuse_v:
+                vt = (
+                    torch.where(
+                        valid[:, None],
+                        hl.load(v, [base + idx, h, tile_d], extra_mask=valid[:, None]),
+                        0,
+                    ).to(torch.float32)
+                    * beta_i[:, None]
+                )
+                u[tile_r.begin, :, tile_d] = hl.dot(T, vt).to(u.dtype)
+        if not fuse_v:
+            for tile_dv in hl.tile(DV):
+                vt = (
+                    torch.where(
+                        valid[:, None],
+                        hl.load(v, [base + idx, h, tile_dv], extra_mask=valid[:, None]),
+                        0,
+                    ).to(torch.float32)
+                    * beta_i[:, None]
+                )
+                u[tile_r.begin, :, tile_dv] = hl.dot(T, vt).to(u.dtype)
 
 
 @helion.kernel()
@@ -469,6 +705,7 @@ def chunk_fwd_h_delta_helion(
     decay_last: torch.Tensor | None = None,
     scalar_decay: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
     diag_anchored: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
+    k_pre_scaled: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Serial state pass for the delta rule. Walk i = 0 -> N-1 carrying the state
     S; h_all[i] is the state entering chunk i. The chunk walk is serial; DV is
@@ -487,6 +724,8 @@ def chunk_fwd_h_delta_helion(
         per-channel over D and the key rides the per-channel anchored decay:
             S = exp(gc_last)[:, None] * S
                 + (k[i] * exp(gc_last[None, :] - gc[i])).T @ v_new[i]
+        With k_pre_scaled=True the key arrives with exp(gc_last - gc) already
+        applied, so this serial walk only decays the carry.
     """
     BH = k.size(0)
     N = k.size(1)
@@ -520,19 +759,88 @@ def chunk_fwd_h_delta_helion(
                 )
                 h_orig = h_orig * torch.exp2(dl * RCP_LN2)
             elif diag_anchored:
-                gc_i = g_cs[  # pyrefly: ignore[unsupported-operation]
-                    idx, i_t, :, :
-                ].float()  # [C, D]
                 gl = decay_last[  # pyrefly: ignore[unsupported-operation]
                     idx, i_t, :
                 ].float()  # [D]
-                k_i = (k_i.float() * torch.exp2((gl[None, :] - gc_i) * RCP_LN2)).to(
-                    k_i.dtype
-                )
+                if not k_pre_scaled:
+                    gc_i = g_cs[  # pyrefly: ignore[unsupported-operation]
+                        idx, i_t, :, :
+                    ].float()  # [C, D]
+                    k_i = (k_i.float() * torch.exp2((gl[None, :] - gc_i) * RCP_LN2)).to(
+                        k_i.dtype
+                    )
                 h_orig = h_orig * torch.exp2(gl * RCP_LN2)[:, None]
             h_acc = hl.dot(k_i.transpose(-2, -1), vnew_i.to(k_i.dtype), acc=h_orig)
 
     return h_all, v_new
+
+
+@helion.kernel()
+def chunk_fwd_h_delta_varlen_helion(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    h0: torch.Tensor,
+    decay_last: torch.Tensor,
+    chunk_offsets: torch.Tensor,
+    NT: int,
+    H: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """chunk_fwd_h_delta_helion's diag_anchored serial pass, walked per sequence.
+
+    Sequence n owns chunks chunk_offsets[n] : chunk_offsets[n + 1], a count that
+    differs per sequence, so the walk is one program per (head, sequence) and the
+    trip count is a tensor load. All operands are chunk-major, row h * NT + j, and k
+    arrives with the anchored per-channel decay already applied. With decay_last =
+    gc[C-1] the per-channel chunk total, in natural-log space:
+        S = h0[h, n]                                 # [D, DV]
+        for j in chunk_offsets[n] : chunk_offsets[n + 1]:
+            h_all[h, j] = S                          # state entering chunk j
+            v_new[h, j] = u[h, j] - w[h, j] @ S      # [C, DV] delta correction
+            S = exp(decay_last[h, j])[:, None] * S
+                + k[h, j].T @ v_new[h, j]            # [D, DV]
+        ht[h, n] = S                                 # this sequence's final state
+    computed as exp2(RCP_LN2 * x) == exp(x):
+            S = exp2(RCP_LN2 * decay_last[h, j])[:, None] * S + ...
+    Initializing S inside the per-sequence loop is the boundary reset: no path can
+    carry it across one. A ragged chunk's tail rows are zero, so they add nothing to
+    either matmul, and ht is the final state directly, with no host-side last-chunk
+    arithmetic.
+
+    DV leads the tile axes, so a chunk row's DV slices differ by 1 in the flat program
+    id where an (H * N)-major order separates them by H * N. Matches FLA's
+    grid=(cdiv(V, BV), N * HV)."""
+    D = k.size(2)
+    DV = u.size(2)
+    N = chunk_offsets.size(0) - 1
+    C = k.size(1)
+    HNT = k.size(0)
+
+    h_all = torch.empty([HNT, D, DV], dtype=k.dtype, device=k.device)
+    v_new = torch.empty([HNT, C, DV], dtype=k.dtype, device=u.device)
+    ht = torch.empty([H * N, D, DV], dtype=torch.float32, device=k.device)
+
+    for tile_dv, tile_hn in hl.tile([DV, H * N], block_size=[None, 1]):
+        hn = tile_hn.begin
+        n = hn % N
+        h_off = (hn // N) * NT  # first chunk row of this head
+        h_acc = h0[hn, :, tile_dv].float()  # [D, bv]
+
+        for tile_j in hl.tile(chunk_offsets[n], chunk_offsets[n + 1], block_size=1):
+            j = h_off + tile_j.begin
+            h_all[j, :, tile_dv] = h_acc.to(h_all.dtype)
+            w_j = w[j, :, :]  # [C, D]
+            u_j = u[j, :, tile_dv]  # [C, bv]
+            vnew_j = u_j.float() - hl.dot(w_j, h_acc.to(w_j.dtype)).float()
+            v_new[j, :, tile_dv] = vnew_j.to(v_new.dtype)
+            gl = decay_last[j, :].float()  # [D]
+            h_acc = h_acc * torch.exp2(gl * RCP_LN2)[:, None]
+            k_j = k[j, :, :]  # [C, D]
+            h_acc = hl.dot(k_j.transpose(-2, -1), vnew_j.to(k_j.dtype), acc=h_acc)
+
+        ht[hn, :, tile_dv] = h_acc
+
+    return h_all, v_new, ht
 
 
 @helion.kernel()
@@ -596,11 +904,14 @@ def chunk_bwd_dstate_delta_helion(
     g_cs: torch.Tensor | None = None,
     decay_last: torch.Tensor | None = None,
     scalar_decay: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
+    scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reverse state pass for the delta rule. Walk i = N-1 -> 0 carrying the
     reverse state dS; emits the full value grad dvni so the per-chunk pass need
     not recompute it. The chunk walk is serial; DV is split across programs (D
-    kept whole), so each holds a [D, tile_dv] slice of dS. Decay modes:
+    kept whole), so each holds a [D, tile_dv] slice of dS. The forward scales o,
+    so scale folds into the do_i load once; dvni/dS_future carry it to dqkw, which
+    scales only its own do load. Decay modes:
       - scalar_decay=False (default): no decay (delta_rule, g=0):
             dS_future[i] = dS
             attn   = causal(q_i @ k_i.T)                 # [C, C]  s <= t
@@ -630,7 +941,7 @@ def chunk_bwd_dstate_delta_helion(
             dS_future[idx, i, :, tile_dv] = dS.to(dS_future.dtype)
             q_i = q[idx, i, :, :]  # [C, D]
             k_i = k[idx, i, :, :]  # [C, D]
-            do_i = do[idx, i, :, tile_dv]  # [C, bv]
+            do_i = (do[idx, i, :, tile_dv].float() * scale).to(do.dtype)  # [C, bv]
 
             jdx = hl.arange(C)
             causal = jdx[:, None] >= jdx[None, :]
@@ -677,10 +988,13 @@ def chunk_bwd_dqkw_delta_helion(
     g_cs: torch.Tensor | None = None,
     decay_last: torch.Tensor | None = None,
     scalar_decay: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
+    scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Per-chunk parallel adjoint of the delta output and state carry. dattn sums
     over DV in its own loop up front (formed once); dW/dq/dk_as then tile over D
-    with an inner DV loop, reusing it. Decay modes:
+    with an inner DV loop, reusing it. scale folds into this kernel's own do loads
+    (dattn and the dq_cross term); dvni/dS_future already carry it from dstate and
+    are not re-scaled. Decay modes:
       - scalar_decay=False (default): no decay (delta_rule, g=0):
             dattn = causal(do @ v_new.T)               # [C, C]
             dW    = -dvni @ S.T                         # [C, D]  grad w.r.t. w
@@ -723,7 +1037,7 @@ def chunk_bwd_dqkw_delta_helion(
 
         dattn = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
         for tile_dv in hl.tile(DV):
-            do_dv = do[tile_bhn, :, tile_dv].to(hdt)
+            do_dv = (do[tile_bhn, :, tile_dv].to(torch.float32) * scale).to(hdt)
             vnew_h = v_new[tile_bhn, :, tile_dv].to(hdt)
             dattn = hl.dot(do_dv, vnew_h.transpose(-2, -1), acc=dattn)
         if scalar_decay:
@@ -741,7 +1055,9 @@ def chunk_bwd_dqkw_delta_helion(
             dk_state = hl.zeros([tile_bhn, C, tile_d], dtype=torch.float32)
             for tile_dv in hl.tile(DV):
                 S_h = h[tile_bhn, tile_d, tile_dv].to(hdt)  # [1, bd, dv]
-                do_dv = do[tile_bhn, :, tile_dv].to(hdt)  # [1, C, dv]
+                do_dv = (do[tile_bhn, :, tile_dv].to(torch.float32) * scale).to(
+                    hdt
+                )  # [1, C, dv]
                 dSf_dv = dS_future[tile_bhn, tile_d, tile_dv].to(hdt)  # [1, bd, dv]
                 dvni_h = dvni[tile_bhn, :, tile_dv].to(hdt)  # [1, C, dv]
                 vnew_h = v_new[tile_bhn, :, tile_dv].to(hdt)  # [1, C, dv]
@@ -941,13 +1257,15 @@ def chunk_bwd_o_kda_helion(
     scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Adjoint of the kda anchored output o = (q * exp(gc)) @ h + Aqk @ v_new,
-    with per-channel decay gc [BHN, C, D]:
-        dqg    = do @ h.T                       # [C, D]
+    with per-channel decay gc [BHN, C, D]. The forward scales o, so scale folds
+    into the do load once here and flows to every output (dh feeds the state
+    kernels; dAqk feeds gram2):
+        dqg    = (scale*do) @ h.T               # [C, D]
         dq_o   = dqg * exp(gc)                  # [C, D]
-        dgc_o  = dqg * (scale*q) * exp(gc)      # [C, D]  per-channel decay grad
-        dh     = (q * exp(gc)).T @ do           # [D, DV]
-        dAqk   = causal(do @ v_new.T)           # [C, C]  s <= t
-        dv_new = Aqk.T @ do                     # [C, DV]
+        dgc_o  = dqg * q * exp(gc)              # [C, D]  per-channel decay grad
+        dh     = (q * exp(gc)).T @ (scale*do)   # [D, DV]
+        dAqk   = causal((scale*do) @ v_new.T)   # [C, C]  s <= t
+        dv_new = Aqk.T @ (scale*do)             # [C, DV]
     The q/dgc half mirrors the GLA diag output backward; dAqk and dv_new are the
     delta-correction score/value grads."""
     BHN = q.size(0)
@@ -969,14 +1287,16 @@ def chunk_bwd_o_kda_helion(
         Atb = Aqk[tile_bhn, :, :].transpose(-2, -1).to(hdt)
         dA = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
         for tile_v in hl.tile(V):
-            dob = do[tile_bhn, :, tile_v].to(hdt)
+            dof32 = do[tile_bhn, :, tile_v].to(torch.float32)
+            dob = (dof32 * scale).to(hdt)
             vb = v_new[tile_bhn, :, tile_v].to(hdt)
             dA = dA + hl.dot(dob, vb.transpose(-2, -1))
-            dv_new[tile_bhn, :, tile_v] = hl.dot(Atb, dob)
+            # Aqk carries scale, so dv_new pairs it with the unscaled do.
+            dv_new[tile_bhn, :, tile_v] = hl.dot(Atb, dof32.to(hdt))
         dAqk[tile_bhn, :, :] = torch.where(incl, dA, 0.0)
 
         for tile_k in hl.tile(K):
-            qt = q[tile_bhn, :, tile_k].to(torch.float32) * scale
+            qt = q[tile_bhn, :, tile_k].to(torch.float32)
             gct = gc[tile_bhn, :, tile_k].to(torch.float32)
             egc = torch.exp2(gct * RCP_LN2)
             qg = (qt * egc).to(hdt)
@@ -984,7 +1304,7 @@ def chunk_bwd_o_kda_helion(
 
             dqg = hl.zeros([tile_bhn, C, tile_k], dtype=torch.float32)
             for tile_v in hl.tile(V):
-                dob = do[tile_bhn, :, tile_v].to(hdt)
+                dob = (do[tile_bhn, :, tile_v].to(torch.float32) * scale).to(hdt)
                 hb = h[tile_bhn, tile_k, tile_v].to(hdt)
                 dqg = hl.dot(dob, hb.transpose(-2, -1), acc=dqg)
                 dh[tile_bhn, tile_k, tile_v] = hl.dot(qgt_b, dob)
@@ -1380,8 +1700,8 @@ def chunk_bwd_dqk_helion(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g_cs: torch.Tensor,
-    g_last: torch.Tensor,
+    g_cs: torch.Tensor | None,
+    g_last: torch.Tensor | None,
     h: torch.Tensor,
     do: torch.Tensor,
     dh: torch.Tensor,
@@ -1426,10 +1746,10 @@ def chunk_bwd_dqk_helion(
         qt = q[tile_bhn, :, tile_d]
         kt = k[tile_bhn, :, tile_d]
         if use_g:
-            gc = g_cs[tile_bhn, :]
+            gc = g_cs[tile_bhn, :]  # pyrefly: ignore[unsupported-operation]
             decay_ij = torch.exp(gc[:, :, None] - gc[:, None, :])
             dA = dA_raw * decay_ij * causal
-            gl = g_last[tile_bhn]
+            gl = g_last[tile_bhn]  # pyrefly: ignore[unsupported-operation]
             exp_gc = torch.exp(gc)[:, :, None]
             exp_gl_minus_gc = torch.exp(gl[:, None] - gc)[:, :, None]
             # Decay the cross/state terms, then fold the add into the accumulator.
@@ -1572,7 +1892,7 @@ def chunk_bwd_dv_helion(
     q: torch.Tensor,
     k: torch.Tensor,
     k_state: torch.Tensor,
-    g_cs: torch.Tensor,
+    g_cs: torch.Tensor | None,
     do: torch.Tensor,
     dh: torch.Tensor,
     g_last: torch.Tensor | None = None,
@@ -1619,8 +1939,8 @@ def chunk_bwd_dv_helion(
                 attn = hl.dot(q[tile_bhn, :, tile_d], kt.transpose(-2, -1), acc=attn)
                 dv_acc = hl.dot(kt, dht.to(kt.dtype), acc=dv_acc)
             elif diag_anchored:
-                gct = g_cs[tile_bhn, :, tile_d].float()
-                gc_last = g_cs[tile_bhn, C - 1, tile_d].float()
+                gct = g_cs[tile_bhn, :, tile_d].float()  # pyrefly: ignore[unsupported-operation]
+                gc_last = g_cs[tile_bhn, C - 1, tile_d].float()  # pyrefly: ignore[unsupported-operation]
                 kg = (
                     kt.float() * torch.exp2((gc_last[:, None, :] - gct) * RCP_LN2)
                 ).to(kt.dtype)
@@ -1634,7 +1954,7 @@ def chunk_bwd_dv_helion(
         idx = hl.arange(C)
         causal = idx[:, None] >= idx[None, :]
         if scalar_decay:
-            gc = g_cs[tile_bhn, :].float()
+            gc = g_cs[tile_bhn, :].float()  # pyrefly: ignore[unsupported-operation]
             decay_ij = torch.exp2((gc[:, :, None] - gc[:, None, :]) * RCP_LN2)
             attn = torch.where(causal, attn * decay_ij * scale, 0.0)
             exp_dk = torch.exp2((g_last[tile_bhn].float()[:, None] - gc) * RCP_LN2)  # pyrefly: ignore[unsupported-operation]
@@ -1642,7 +1962,7 @@ def chunk_bwd_dv_helion(
         elif diag_anchored:
             attn = A[tile_bhn, :, :]  # pyrefly: ignore[unsupported-operation]
         elif use_g:
-            gc = g_cs[tile_bhn, :]
+            gc = g_cs[tile_bhn, :]  # pyrefly: ignore[unsupported-operation]
             decay_ij = torch.exp(gc[:, :, None] - gc[:, None, :])
             attn = torch.where(causal, attn * decay_ij, 0.0)
         else:
@@ -1669,56 +1989,297 @@ def chunk_fwd_A_diag_anchored_helion(
     build_kk: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Anchored intra-chunk score matrix. Rows split into BC_DIAG-row sub-blocks;
-    gc_n is gc at the sub-block's first row (the decay anchor):
+    gc_n is gc at the sub-block's first row (the decay anchor), and cols is the live
+    width 0 : (i + 1) * BC_DIAG the causal mask leaves nonzero:
         qg = q_blk * exp2(gc_blk - gc_n)        # [BC_DIAG, D]
-        kg = k     * exp2(gc_n   - gc)          # [C, D]
-        a  = (qg @ kg.T) * scale                # [BC_DIAG, C]
-        A[tile_row] = a * causal                # [BC_DIAG, C], keep t >= s
+        kg = k[cols] * exp2(gc_n - gc[cols])    # [cols, D]
+        a  = (qg @ kg.T) * scale                # [BC_DIAG, cols]
+        A[rows, cols] = a * causal              # keep t >= s
     Anchoring at gc_n bounds each exponent to BC_DIAG rows, so exp2 stays in range.
     With build_kk=True (kda) it also emits the strictly-lower k-rows Gram Akk,
-    kg_row = k_blk * exp2(gc_blk - gc_n), Akk[tile_row] = (kg_row @ kg.T) * strict,
+    kg_row = k_blk * exp2(gc_blk - gc_n), Akk[rows, cols] = (kg_row @ kg.T) * strict,
     sharing the anchored kg column operand; Akk feeds the WY/UT transform (fp32).
-    Akk is always returned (zeros when build_kk=False; callers ignore it)."""
+    Akk is always returned (zeros when build_kk=False; callers ignore it), and both
+    arrive zeroed so the columns past cols already hold what a full-width form would
+    store there.
+
+    The sub-blocks are written out, one per tier, each guarded on the chunk size:
+        tier 0:  rows  0..15,  cols  0..15      always
+        tier 1:  rows 16..31,  cols  0..31      C >= 2 * BC_DIAG
+        tier 2:  rows 32..47,  cols  0..47      C >= 3 * BC_DIAG
+        tier 3:  rows 48..63,  cols  0..63      C >= 4 * BC_DIAG
+    so C = 32 takes tiers 0-1 and C = 64 all four. Unrolled rather than tiled because
+    each width must be a literal: hl.arange rejects arithmetic on a specialized size.
+    FLA's KDA unrolls the same way in chunk_intra.py."""
     BHN = q.size(0)
     C = hl.specialize(q.size(1))
+    assert C in (2 * BC_DIAG, 4 * BC_DIAG), (
+        f"chunk size C must be {2 * BC_DIAG} or {4 * BC_DIAG}, got {C}"
+    )
 
-    A = torch.zeros([BHN, C, C], dtype=torch.float32, device=q.device)
-    Akk = torch.zeros([BHN, C, C], dtype=torch.float32, device=q.device)
+    A = torch.zeros([BHN, C, C], dtype=q.dtype, device=q.device)
+    Akk = torch.zeros([BHN, C, C], dtype=q.dtype, device=q.device)
 
     for tile_bhn in hl.tile(BHN, block_size=1):
-        kt = k[tile_bhn, :, :].float()
-        gct = gc[tile_bhn, :, :].float()
-        idx = hl.arange(C)
+        rows0 = 0 + hl.arange(16)
+        cols0 = hl.arange(16)
+        q0 = q[tile_bhn, rows0, :].float()
+        kc0 = k[tile_bhn, cols0, :].float()
+        g0 = gc[tile_bhn, rows0, :].float()
+        gcol0 = gc[tile_bhn, cols0, :].float()
+        n0 = gc[tile_bhn, 0, :].float()
+        e0 = torch.exp2((g0 - n0[:, None, :]) * RCP_LN2)
+        kgt0 = (kc0 * torch.exp2((n0[:, None, :] - gcol0) * RCP_LN2)).transpose(-2, -1)
+        a0 = hl.dot(q0 * e0, kgt0) * scale
+        causal0 = (rows0[:, None] >= cols0[None, :])[None, :, :]
+        A[tile_bhn, rows0, cols0] = a0 * causal0.to(a0.dtype)
+        if build_kk:
+            akk0 = hl.dot(k[tile_bhn, rows0, :].float() * e0, kgt0)
+            strict0 = (rows0[:, None] > cols0[None, :])[None, :, :]
+            Akk[tile_bhn, rows0, cols0] = akk0 * strict0.to(akk0.dtype)
 
-        for tile_row in hl.tile(C, block_size=BC_DIAG):
-            row_begin = tile_row.begin
-            row_end = row_begin + BC_DIAG
-            q_blk = q[tile_bhn, tile_row, :].float()
-            gc_blk = gc[tile_bhn, tile_row, :].float()
-            gc_n = gc[tile_bhn, row_begin, :].float()
-
-            in_range = (idx < row_end)[None, :]
-            erow = torch.exp2((gc_blk - gc_n[:, None, :]) * RCP_LN2)
-            qg = q_blk * erow
-            expo_k = torch.where(
-                in_range[:, :, None],
-                (gc_n[:, None, :] - gct) * RCP_LN2,
-                torch.zeros_like(gct),
+        if C >= 2 * BC_DIAG:
+            rows1 = 16 + hl.arange(16)
+            cols1 = hl.arange(32)
+            q1 = q[tile_bhn, rows1, :].float()
+            kc1 = k[tile_bhn, cols1, :].float()
+            g1 = gc[tile_bhn, rows1, :].float()
+            gcol1 = gc[tile_bhn, cols1, :].float()
+            n1 = gc[tile_bhn, 16, :].float()
+            e1 = torch.exp2((g1 - n1[:, None, :]) * RCP_LN2)
+            kgt1 = (kc1 * torch.exp2((n1[:, None, :] - gcol1) * RCP_LN2)).transpose(
+                -2, -1
             )
-            kg = kt * torch.exp2(expo_k)
-            kgt = kg.transpose(-2, -1)
-            a = hl.dot(qg, kgt) * scale
-
-            causal = tile_row.index[:, None] >= idx[None, :]
-            A[tile_bhn, tile_row, :] = a * causal[None, :, :].to(a.dtype)
-
+            a1 = hl.dot(q1 * e1, kgt1) * scale
+            causal1 = (rows1[:, None] >= cols1[None, :])[None, :, :]
+            A[tile_bhn, rows1, cols1] = a1 * causal1.to(a1.dtype)
             if build_kk:
-                kg_row = k[tile_bhn, tile_row, :].float() * erow
-                akk = hl.dot(kg_row, kgt)
-                strict = tile_row.index[:, None] > idx[None, :]
-                Akk[tile_bhn, tile_row, :] = akk * strict[None, :, :].to(akk.dtype)
+                akk1 = hl.dot(k[tile_bhn, rows1, :].float() * e1, kgt1)
+                strict1 = (rows1[:, None] > cols1[None, :])[None, :, :]
+                Akk[tile_bhn, rows1, cols1] = akk1 * strict1.to(akk1.dtype)
+
+        if C >= 3 * BC_DIAG:
+            rows2 = 32 + hl.arange(16)
+            cols2 = hl.arange(48)
+            q2 = q[tile_bhn, rows2, :].float()
+            kc2 = k[tile_bhn, cols2, :].float()
+            g2 = gc[tile_bhn, rows2, :].float()
+            gcol2 = gc[tile_bhn, cols2, :].float()
+            n2 = gc[tile_bhn, 32, :].float()
+            e2 = torch.exp2((g2 - n2[:, None, :]) * RCP_LN2)
+            kgt2 = (kc2 * torch.exp2((n2[:, None, :] - gcol2) * RCP_LN2)).transpose(
+                -2, -1
+            )
+            a2 = hl.dot(q2 * e2, kgt2) * scale
+            causal2 = (rows2[:, None] >= cols2[None, :])[None, :, :]
+            A[tile_bhn, rows2, cols2] = a2 * causal2.to(a2.dtype)
+            if build_kk:
+                akk2 = hl.dot(k[tile_bhn, rows2, :].float() * e2, kgt2)
+                strict2 = (rows2[:, None] > cols2[None, :])[None, :, :]
+                Akk[tile_bhn, rows2, cols2] = akk2 * strict2.to(akk2.dtype)
+
+        if C >= 4 * BC_DIAG:
+            rows3 = 48 + hl.arange(16)
+            cols3 = hl.arange(64)
+            q3 = q[tile_bhn, rows3, :].float()
+            kc3 = k[tile_bhn, cols3, :].float()
+            g3 = gc[tile_bhn, rows3, :].float()
+            gcol3 = gc[tile_bhn, cols3, :].float()
+            n3 = gc[tile_bhn, 48, :].float()
+            e3 = torch.exp2((g3 - n3[:, None, :]) * RCP_LN2)
+            kgt3 = (kc3 * torch.exp2((n3[:, None, :] - gcol3) * RCP_LN2)).transpose(
+                -2, -1
+            )
+            a3 = hl.dot(q3 * e3, kgt3) * scale
+            causal3 = (rows3[:, None] >= cols3[None, :])[None, :, :]
+            A[tile_bhn, rows3, cols3] = a3 * causal3.to(a3.dtype)
+            if build_kk:
+                akk3 = hl.dot(k[tile_bhn, rows3, :].float() * e3, kgt3)
+                strict3 = (rows3[:, None] > cols3[None, :])[None, :, :]
+                Akk[tile_bhn, rows3, cols3] = akk3 * strict3.to(akk3.dtype)
 
     return A, Akk
+
+
+@helion.kernel()
+def chunk_fwd_A_diag_anchored_varlen_helion(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    gc: torch.Tensor,
+    token_base: torch.Tensor,
+    valid_len: torch.Tensor,
+    A: torch.Tensor,
+    Akk: torch.Tensor,
+    scale: float,
+    l2norm_q: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
+) -> None:
+    """chunk_fwd_A_diag_anchored_helion over a varlen batch, q/k read token-major.
+
+    Row r addresses its tokens as in chunk_cumsum_gc_varlen_helion; gc, A and Akk
+    are per-chunk and stay chunk-major [H * NT, C, *]. Per BC_DIAG-row sub-block,
+    with gc_n = gc at the sub-block's first row (the decay anchor) and cols the live
+    width 0 : (i + 1) * BC_DIAG:
+        q_blk = q[rows_blk, h] * valid_blk             # [BC_DIAG, D], tail zeroed
+        k_col = k[rows_col, h] * valid_col             # [cols, D]
+        qg    = q_blk * exp2(RCP_LN2 * (gc_blk - gc_n))       # [BC_DIAG, D]
+        kg    = k_col * exp2(RCP_LN2 * (gc_n - gc[cols]))     # [cols, D]
+        A[blk]   = (qg @ kg.T) * scale * causal        # [BC_DIAG, cols], t >= s
+        Akk[blk] = (k_blk * exp2(RCP_LN2 * (gc_blk - gc_n))) @ kg.T * strict
+    Anchoring at gc_n bounds each exponent to BC_DIAG rows, so exp2 stays in range,
+    exactly as in the dense kernel. Both grams always build; kda is the only varlen
+    variant.
+
+    A zeroed k column gives kg[s] = 0, hence A[:, s] = 0, so no key from the next
+    sequence enters the gram; zeroed rows are masked again by the output store.
+
+    The sub-blocks are written out, one per tier, each guarded on the chunk size:
+        tier 0:  rows  0..15,  cols  0..15      always
+        tier 1:  rows 16..31,  cols  0..31      C >= 2 * BC_DIAG
+        tier 2:  rows 32..47,  cols  0..47      C >= 3 * BC_DIAG
+        tier 3:  rows 48..63,  cols  0..63      C >= 4 * BC_DIAG
+    so C = 32 takes tiers 0-1 and C = 64 all four; the caller rejects any other C.
+    cols is the width the causal mask leaves nonzero, so both matmuls span
+    BC_DIAG * (1 + 2 + ... + NC) = C * (NC + 1) / 2 columns instead of NC * C, and
+    the caller's zeroed A and Akk already hold what the full-width form would store
+    past it.
+    Unrolled rather than tiled because each width must be a literal: hl.arange
+    rejects arithmetic on a specialized size. FLA's KDA unrolls the same way in
+    chunk_intra.py, on the same NC >= 3 / NC >= 4 guards."""
+    NT = token_base.size(0)
+    C = hl.specialize(gc.size(1))
+    D = hl.specialize(gc.size(2))
+    for tile_r in hl.tile(A.size(0), block_size=1):
+        r = tile_r.begin
+        j = r % NT
+        h = r // NT
+        base = token_base[j]
+        vlen = valid_len[j]
+        dcols = hl.arange(D)
+
+        # Sub-block 0: its live columns are its own rows, so the row operands serve
+        # as the column operands and k is read once.
+        rows0 = hl.arange(16)
+        cols0 = hl.arange(16)
+        m0 = rows0 < vlen
+        q0 = torch.where(
+            m0[:, None],
+            hl.load(q, [base + rows0, h, dcols], extra_mask=m0[:, None]),
+            0,
+        ).float()  # [BC_DIAG, D]
+        if l2norm_q:
+            q0 = q0 * torch.rsqrt((q0 * q0).sum(dim=-1, keepdim=True) + 1e-6)
+        k0 = torch.where(
+            m0[:, None],
+            hl.load(k, [base + rows0, h, dcols], extra_mask=m0[:, None]),
+            0,
+        ).float()
+        g0 = gc[r, rows0, :].float()
+        n0 = gc[r, 0, :].float()
+        e0 = torch.exp2((g0 - n0[None, :]) * RCP_LN2)
+        kgt0 = (k0 * torch.exp2((n0[None, :] - g0) * RCP_LN2)).transpose(-2, -1)
+        a0 = hl.dot(q0 * e0, kgt0) * scale
+        A[r, rows0, cols0] = a0 * (rows0[:, None] >= cols0[None, :]).to(a0.dtype)
+        akk0 = hl.dot(k0 * e0, kgt0)
+        Akk[r, rows0, cols0] = akk0 * (rows0[:, None] > cols0[None, :]).to(akk0.dtype)
+
+        if C >= 2 * BC_DIAG:
+            rows1 = 16 + hl.arange(16)
+            cols1 = hl.arange(32)
+            m1 = rows1 < vlen
+            mc1 = cols1 < vlen
+            q1 = torch.where(
+                m1[:, None],
+                hl.load(q, [base + rows1, h, dcols], extra_mask=m1[:, None]),
+                0,
+            ).float()
+            if l2norm_q:
+                q1 = q1 * torch.rsqrt((q1 * q1).sum(dim=-1, keepdim=True) + 1e-6)
+            k1 = torch.where(
+                m1[:, None],
+                hl.load(k, [base + rows1, h, dcols], extra_mask=m1[:, None]),
+                0,
+            ).float()
+            kc1 = torch.where(
+                mc1[:, None],
+                hl.load(k, [base + cols1, h, dcols], extra_mask=mc1[:, None]),
+                0,
+            ).float()
+            n1 = gc[r, 16, :].float()
+            e1 = torch.exp2((gc[r, rows1, :].float() - n1[None, :]) * RCP_LN2)
+            ec1 = torch.exp2((n1[None, :] - gc[r, cols1, :].float()) * RCP_LN2)
+            kgt1 = (kc1 * ec1).transpose(-2, -1)
+            a1 = hl.dot(q1 * e1, kgt1) * scale
+            A[r, rows1, cols1] = a1 * (rows1[:, None] >= cols1[None, :]).to(a1.dtype)
+            akk1 = hl.dot(k1 * e1, kgt1)
+            Akk[r, rows1, cols1] = akk1 * (rows1[:, None] > cols1[None, :]).to(
+                akk1.dtype
+            )
+
+        if C >= 3 * BC_DIAG:
+            rows2 = 32 + hl.arange(16)
+            cols2 = hl.arange(48)
+            m2 = rows2 < vlen
+            mc2 = cols2 < vlen
+            q2 = torch.where(
+                m2[:, None],
+                hl.load(q, [base + rows2, h, dcols], extra_mask=m2[:, None]),
+                0,
+            ).float()
+            if l2norm_q:
+                q2 = q2 * torch.rsqrt((q2 * q2).sum(dim=-1, keepdim=True) + 1e-6)
+            k2 = torch.where(
+                m2[:, None],
+                hl.load(k, [base + rows2, h, dcols], extra_mask=m2[:, None]),
+                0,
+            ).float()
+            kc2 = torch.where(
+                mc2[:, None],
+                hl.load(k, [base + cols2, h, dcols], extra_mask=mc2[:, None]),
+                0,
+            ).float()
+            n2 = gc[r, 32, :].float()
+            e2 = torch.exp2((gc[r, rows2, :].float() - n2[None, :]) * RCP_LN2)
+            ec2 = torch.exp2((n2[None, :] - gc[r, cols2, :].float()) * RCP_LN2)
+            kgt2 = (kc2 * ec2).transpose(-2, -1)
+            a2 = hl.dot(q2 * e2, kgt2) * scale
+            A[r, rows2, cols2] = a2 * (rows2[:, None] >= cols2[None, :]).to(a2.dtype)
+            akk2 = hl.dot(k2 * e2, kgt2)
+            Akk[r, rows2, cols2] = akk2 * (rows2[:, None] > cols2[None, :]).to(
+                akk2.dtype
+            )
+
+        if C >= 4 * BC_DIAG:
+            rows3 = 48 + hl.arange(16)
+            cols3 = hl.arange(64)
+            m3 = rows3 < vlen
+            mc3 = cols3 < vlen
+            q3 = torch.where(
+                m3[:, None],
+                hl.load(q, [base + rows3, h, dcols], extra_mask=m3[:, None]),
+                0,
+            ).float()
+            if l2norm_q:
+                q3 = q3 * torch.rsqrt((q3 * q3).sum(dim=-1, keepdim=True) + 1e-6)
+            k3 = torch.where(
+                m3[:, None],
+                hl.load(k, [base + rows3, h, dcols], extra_mask=m3[:, None]),
+                0,
+            ).float()
+            kc3 = torch.where(
+                mc3[:, None],
+                hl.load(k, [base + cols3, h, dcols], extra_mask=mc3[:, None]),
+                0,
+            ).float()
+            n3 = gc[r, 48, :].float()
+            e3 = torch.exp2((gc[r, rows3, :].float() - n3[None, :]) * RCP_LN2)
+            ec3 = torch.exp2((n3[None, :] - gc[r, cols3, :].float()) * RCP_LN2)
+            kgt3 = (kc3 * ec3).transpose(-2, -1)
+            a3 = hl.dot(q3 * e3, kgt3) * scale
+            A[r, rows3, cols3] = a3 * (rows3[:, None] >= cols3[None, :]).to(a3.dtype)
+            akk3 = hl.dot(k3 * e3, kgt3)
+            Akk[r, rows3, cols3] = akk3 * (rows3[:, None] > cols3[None, :]).to(
+                akk3.dtype
+            )
 
 
 @helion.kernel()
@@ -1761,6 +2322,73 @@ def chunk_fwd_o_diag_anchored_helion(
     return out
 
 
+@helion.kernel()
+def chunk_fwd_o_diag_anchored_varlen_helion(
+    q: torch.Tensor,
+    v: torch.Tensor,
+    gc: torch.Tensor,
+    h: torch.Tensor,
+    A: torch.Tensor,
+    token_base: torch.Tensor,
+    valid_len: torch.Tensor,
+    out: torch.Tensor,
+    scale: float,
+    l2norm_q: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
+) -> None:
+    """chunk_fwd_o_diag_anchored_helion over a varlen batch, q read and out written
+    token-major.
+
+    Row r addresses its tokens as in chunk_cumsum_gc_varlen_helion; v (the corrected
+    v_new), gc, h and A are per-chunk and stay chunk-major. A is the pre-masked
+    anchored score matrix, so the output is the dense one:
+        q_i     = q[rows, h] * valid                 # [C, D], tail zeroed
+        qg      = q_i * exp2(RCP_LN2 * gc)           # [C, D]
+        o_cross = (qg @ h) * scale                   # [C, DV] state term
+        o_intra = A @ v                              # [C, DV] intra-chunk term
+        out[rows, h] = o_cross + o_intra   where valid    # [C, DV]
+    Storing under valid is what protects the boundary: a row past a sequence's end is
+    never written, so it cannot overwrite the next sequence's first tokens. That makes
+    the write the inverse of the token-major reads, with no scatter pass.
+
+    A chunk owns one program and takes D and DV whole, so the body has no loop over
+    either; a DV loop would re-read q, gc and A per iteration."""
+    NT = token_base.size(0)
+    C = hl.specialize(gc.size(1))
+    D = hl.specialize(q.size(2))
+    DV = hl.specialize(out.size(2))
+
+    for tile_r in hl.tile(A.size(0), block_size=1):
+        j = tile_r.begin % NT
+        head = tile_r.begin // NT
+        base = token_base[j]
+        idx = hl.arange(C)
+        valid = idx < valid_len[j]
+        dcols = hl.arange(D)
+        vcols = hl.arange(DV)
+
+        qt = torch.where(
+            valid[:, None],
+            hl.load(q, [base + idx, head, dcols], extra_mask=valid[:, None]),
+            0,
+        ).float()  # [C, D]
+        if l2norm_q:
+            qt = qt * torch.rsqrt((qt * qt).sum(dim=-1, keepdim=True) + 1e-6)
+        gct = gc[tile_r.begin, :, :]
+        qg = (qt * torch.exp2(gct * RCP_LN2)).to(q.dtype)
+        ht = h[tile_r.begin, :, :]
+        o_cross = hl.dot(qg, ht.to(qg.dtype)) * scale
+
+        vt = v[tile_r.begin, :, :]
+        At = A[tile_r.begin, :, :]
+        o_intra = hl.dot(At.to(vt.dtype), vt)
+        hl.store(
+            out,
+            [base + idx, head, vcols],
+            (o_cross + o_intra).to(out.dtype),
+            extra_mask=valid[:, None],
+        )
+
+
 # Autograd integration
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -1779,6 +2407,9 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
         initial_state: torch.Tensor | None,
         return_final_state: bool,
         scale: float = 1.0,
+        A_log: torch.Tensor | None = None,
+        dt_bias: torch.Tensor | None = None,
+        lower_bound: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         tensors = [q, k, v]
         ctx.has_g = g is not None
@@ -1811,6 +2442,10 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
                 g=g,
                 initial_state=initial_state,
                 return_final_state=return_final_state,
+                scale=scale,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                lower_bound=lower_bound,
             )
             ctx.h_all = h_all
             ctx.v_new_all = v_new_all
@@ -1848,6 +2483,9 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
         None,
         None,
         None,
+        None,
+        None,
+        None,
     ]:
         tensors = ctx.saved_tensors
         q, k, v = tensors[:3]
@@ -1875,7 +2513,7 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
                 scale=ctx.scale,
                 needs_dg=ctx.needs_input_grad[3],
             )
-            return dq, dk, dv, dg, None, None, None, None, None, None
+            return dq, dk, dv, dg, None, None, None, None, None, None, None, None, None
 
         A_inv = ctx.A_inv
         w_wy = ctx.w_wy
@@ -1896,8 +2534,9 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
                 v_new_all=v_new_all,
                 A_inv=A_inv,
                 w_wy=w_wy,
+                scale=ctx.scale,
             )
-            return dq, dk, dv, dg, dbeta, None, None, None, None, None
+            return dq, dk, dv, dg, dbeta, None, None, None, None, None, None, None, None
 
         dq, dk, dv, dg, dbeta, da = _helion_chunked_bwd_delta(
             q,
@@ -1912,8 +2551,9 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
             A_inv=A_inv,
             w_wy=w_wy,
             g=g,
+            scale=ctx.scale,
         )
-        return dq, dk, dv, dg, dbeta, da, None, None, None, None
+        return dq, dk, dv, dg, dbeta, da, None, None, None, None, None, None, None
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1973,8 +2613,11 @@ def _helion_chunked_fwd(
         # No-decay path: the in-kernel decay ops are skipped and compiled out via use_g=False.
         k_state_4d = k.reshape(BH, N, C, D)
         v_flat = v.reshape(BH, N, C, DV)
-        state = _init_state(initial_state, BH, D, DV, q)
-        h_all = chunk_fwd_h_diag_fused(k_state_4d, v_flat, None, state, use_g=False)
+        has_h0 = initial_state is not None
+        state = _init_state(initial_state, BH, D, DV, q) if has_h0 else None
+        h_all = chunk_fwd_h_diag_fused(
+            k_state_4d, v_flat, None, state, use_g=False, has_h0=has_h0
+        )
 
         qf = q.reshape(BHN, C, D)
         kf = k.reshape(BHN, C, D)
@@ -1994,15 +2637,15 @@ def _helion_chunked_fwd(
 
     if scalar_decay:
         # Scalar decay path.
-        gc = g.float().reshape(BH, N, C)
-        g_cs = gc.cumsum(-1)  # [BH, N, C]
+        g_cs = g.reshape(BH, N, C).cumsum(-1, dtype=torch.float32)  # [BH, N, C]
         g_last = g_cs[:, :, -1]  # [BH, N]
 
         k_4d = k.reshape(BH, N, C, D)
         v_flat = v.reshape(BH, N, C, DV)
-        state = _init_state(initial_state, BH, D, DV, q)
+        has_h0 = initial_state is not None
+        state = _init_state(initial_state, BH, D, DV, q) if has_h0 else None
         h_all = chunk_fwd_h_diag_fused(
-            k_4d, v_flat, g_last, state, gc=g_cs, scalar_decay=True
+            k_4d, v_flat, g_last, state, gc=g_cs, scalar_decay=True, has_h0=has_h0
         )
 
         # Output kernel: pass raw q, k with g_cs for decay; scale folds in here.
@@ -2036,8 +2679,8 @@ def _helion_chunked_fwd(
         return o.reshape(B, H, T, DV), h_all, final_state
 
     # Diagonal decay path.
-    gc4 = g.reshape(BH, N, C, D).float().cumsum(-2)
-    gc = gc4.reshape(BHN, C, D)
+    gc = chunk_cumsum_gc_helion(g.reshape(BHN, C, D))
+    gc4 = gc.reshape(BH, N, C, D)
 
     k_4d = k.reshape(BH, N, C, D)
     v_4d = v.reshape(BH, N, C, DV)
@@ -2079,6 +2722,10 @@ def _helion_chunked_fwd_delta(
     g: torch.Tensor | None = None,
     initial_state: torch.Tensor | None = None,
     return_final_state: bool = False,
+    scale: float = 1.0,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -2117,9 +2764,19 @@ def _helion_chunked_fwd_delta(
         decay_last = g_cs[:, :, -1]
         g_cs_flat = g_cs.reshape(BHN, C)
     elif diag_anchored:
-        g_cs = g.float().reshape(BH, N, C, D).cumsum(-2)
+        g_cs_flat = chunk_cumsum_gc_helion(
+            g.reshape(BHN, C, D),
+            A_log,
+            dt_bias,
+            lower_bound,
+            H,
+            N,
+            use_gate=A_log is not None,
+            has_bias=dt_bias is not None,
+            use_lower_bound=lower_bound is not None,
+        )
+        g_cs = g_cs_flat.reshape(BH, N, C, D)
         decay_last = g_cs[:, :, -1, :]
-        g_cs_flat = g_cs.reshape(BHN, C, D)
 
     a_use = a if a is not None else k
     qf = q.reshape(BHN, C, D)
@@ -2133,25 +2790,30 @@ def _helion_chunked_fwd_delta(
     Aqk = Akk = None
     if diag_anchored:
         Aqk, Akk = chunk_fwd_A_diag_anchored_helion(
-            qf, kf, g_cs_flat, 1.0, build_kk=True
+            qf, kf, g_cs_flat, scale, build_kk=True
         )
 
+    # The anchored key the serial state pass consumes shares the WY transform's
+    # k read and per-channel decay, so the WY kernel emits it.
+    k_state_flat = torch.empty_like(kf) if diag_anchored else None
     w, u, A_inv = chunk_fwd_wy_delta_helion(
         af,
         vf,
         bf,
         g_cs_flat,
         Akk,
+        k_state_flat,
         scalar_decay=scalar_decay,
         diag_anchored=diag_anchored,
     )
 
     k4 = k.reshape(BH, N, C, D)
+    k_state4 = k_state_flat.reshape(BH, N, C, D) if k_state_flat is not None else k4
     w4 = w.reshape(BH, N, C, D)
     u4 = u.reshape(BH, N, C, DV)
     state = _init_state(initial_state, BH, D, DV, q).to(k.dtype)
     h_all, v_new_all = chunk_fwd_h_delta_helion(
-        k4,
+        k_state4,
         w4,
         u4,
         state,
@@ -2159,6 +2821,7 @@ def _helion_chunked_fwd_delta(
         decay_last,
         scalar_decay=scalar_decay,
         diag_anchored=diag_anchored,
+        k_pre_scaled=diag_anchored,
     )
 
     hf = h_all.reshape(BHN, D, DV)
@@ -2166,9 +2829,16 @@ def _helion_chunked_fwd_delta(
 
     if diag_anchored:
         # o = (q * exp2(gc)) @ h + Aqk @ v_new (anchored, per-channel decay).
-        o = chunk_fwd_o_diag_anchored_helion(qf, vnewf, g_cs_flat, hf, Aqk, 1.0)
+        # Aqk already carries scale; the kernel applies scale to the q@h cross-term.
+        o = chunk_fwd_o_diag_anchored_helion(qf, vnewf, g_cs_flat, hf, Aqk, scale)
     else:
-        o = chunk_fwd_o_helion(qf, kf, vnewf, g_cs_flat, hf, use_g=scalar_decay)
+        o = chunk_fwd_o_helion(
+            qf, kf, vnewf, g_cs_flat, hf, use_g=scalar_decay, scale=scale
+        )
+
+    if diag_anchored:
+        # Attach cached data to h_all for the backward to use.
+        h_all._kda_bwd_cache = (g_cs_flat, Aqk, Akk)  # pyrefly: ignore
 
     final_state = None
     if return_final_state:
@@ -2205,6 +2875,154 @@ def _helion_chunked_fwd_delta(
     return o.reshape(B, H, T, DV), h_all, v_new_all, A_inv, w, final_state
 
 
+@functools.lru_cache(maxsize=4)
+def _kda_varlen_chunk_tables(
+    cu_seqlens: torch.Tensor,
+    C: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Place every chunk: sequence n owns chunk_offsets[n] : chunk_offsets[n + 1], and
+    chunk j of it starts at token_base[j] with valid_len[j] rows of its own.
+        lens          = diff(cu_seqlens)                    # [N]
+        chunk_offsets = pad(cumsum(ceil(lens / C)), 1, 0)   # [N + 1]
+        token_base[j] = cu_seqlens[n] + i * C               # [NT], i within seq n
+        valid_len[j]  = min(lens[n] - i * C, C)             # [NT], rows in 1..C
+
+    Every table is a pure function of cu_seqlens and C, so a caller that reuses one
+    cu_seqlens across forwards, as a stack of layers does, builds them once. NT comes
+    from int(chunk_offsets[-1]), a device-to-host sync, so rebuilding them per call
+    also drains the launch queue between forwards.
+
+    Keyed by identity, which is what a tensor hashes as, so refilling one cu_seqlens
+    in place returns that tensor's first tables: a new batch needs a new tensor, not
+    an edited one. Comparing values instead would need the same device-to-host sync
+    this exists to skip. FLA holds its own varlen tables under the same rule, in
+    fla.utils.tensor_cache.
+    """
+    N = cu_seqlens.numel() - 1
+    device = cu_seqlens.device
+    lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    chunk_offsets = torch.nn.functional.pad(((lens + C - 1) // C).cumsum(0), (1, 0))
+    counts = chunk_offsets[1:] - chunk_offsets[:-1]
+    seq_id = torch.repeat_interleave(torch.arange(N, device=device), counts)
+    NT = int(chunk_offsets[-1])
+    local = torch.arange(NT, device=device) - chunk_offsets[seq_id]
+    token_base = cu_seqlens[seq_id] + local * C
+    valid_len = (lens[seq_id] - local * C).clamp(max=C)
+    return chunk_offsets, token_base, valid_len, NT
+
+
+def _helion_chunked_fwd_kda_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    C: int,
+    cu_seqlens: torch.Tensor,
+    initial_state: torch.Tensor | None = None,
+    return_final_state: bool = False,
+    scale: float = 1.0,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
+    l2norm_q: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """KDA forward over a varlen batch (cu_seqlens), forward only.
+
+    Inputs are token-major [T_total, H, *] with cu_seqlens [N+1] marking the
+    boundaries. The host tables place every chunk, and the five kernels mirror the
+    dense diag_anchored pipeline:
+        chunk_offsets [N+1], token_base [NT], valid_len [NT]
+        NT = sum(ceil(len_n / C))            # total chunks, ragged
+        gc            = cumsum_gc_varlen(g)              # [H*NT, C, D] fp32
+        Aqk, Akk      = A_diag_anchored_varlen(q, k, gc) # [H*NT, C, C]
+        w, u, k_state = wy_delta_varlen(k, v, beta, gc, Akk)
+        h_all, v_new, ht = h_delta_varlen(k_state, w, u, h0, gc[C-1], chunk_offsets)
+        o             = o_diag_anchored_varlen(q, v_new, gc, h_all, Aqk)
+
+    q/k/v/g/beta are never copied: each kernel reads them where they lie and zeros
+    the rows past a sequence's end. Only the intermediates above are materialized, as
+    the dense path materializes its own. The state pass walks one sequence at a time,
+    so the recurrence resets at every boundary and ht is the final state per sequence
+    with no host-side last-chunk arithmetic. The output kernel stores token-major
+    under the same mask, so there is no scatter pass.
+
+    T_total < C is padded up to C, since a chunk addresses C rows and the store needs
+    them in bounds; valid_len still marks only the real tokens, so the padding reads
+    as zero and o is returned at the true T_total.
+    """
+    T_total, H, D = q.shape
+    if T_total < C:
+        extra = C - T_total
+        pad = lambda x: torch.cat([x, x.new_zeros(extra, *x.shape[1:])])  # noqa: E731
+        q, k, v, g, beta = pad(q), pad(k), pad(v), pad(g), pad(beta)
+    DV = v.shape[-1]
+    N = cu_seqlens.numel() - 1
+
+    chunk_offsets, token_base, valid_len, NT = _kda_varlen_chunk_tables(cu_seqlens, C)
+
+    HNT = H * NT
+    g_cs = torch.empty(HNT, C, D, dtype=torch.float32, device=q.device)
+    chunk_cumsum_gc_varlen_helion(
+        g,
+        token_base,
+        valid_len,
+        g_cs,
+        A_log,
+        dt_bias,
+        lower_bound,
+        use_gate=A_log is not None,
+        has_bias=dt_bias is not None,
+        use_lower_bound=lower_bound is not None,
+    )
+    decay_last = g_cs[:, C - 1, :]
+
+    Aqk = torch.zeros(HNT, C, C, dtype=q.dtype, device=q.device)
+    Akk = torch.zeros(HNT, C, C, dtype=q.dtype, device=q.device)
+    chunk_fwd_A_diag_anchored_varlen_helion(
+        q, k, g_cs, token_base, valid_len, Aqk, Akk, scale, l2norm_q=l2norm_q
+    )
+
+    w = torch.empty(HNT, C, D, dtype=k.dtype, device=k.device)
+    u = torch.empty(HNT, C, DV, dtype=v.dtype, device=v.device)
+    k_state = torch.empty(HNT, C, D, dtype=k.dtype, device=k.device)
+    chunk_fwd_wy_delta_varlen_helion(
+        k, v, beta, g_cs, Akk, token_base, valid_len, w, u, k_state
+    )
+
+    # The chunk operands are head-major (row h * NT + j), so the state pass indexes
+    # its own [H * N] axis the same way: row h * N + n. initial_state arrives in
+    # FLA's [N, H, D, DV] order, hence the transpose in and back out.
+    if initial_state is not None:
+        h0 = (
+            initial_state.reshape(N, H, D, DV)
+            .transpose(0, 1)
+            .reshape(H * N, D, DV)
+            .float()
+            .contiguous()
+        )
+    else:
+        h0 = q.new_zeros(H * N, D, DV, dtype=torch.float32)
+
+    h_all, v_new, ht = chunk_fwd_h_delta_varlen_helion(
+        k_state, w, u, h0, decay_last, chunk_offsets, NT, H
+    )
+
+    # Sized from the padded q so the masked store stays in bounds, then sliced back
+    # to the real token count on return.
+    o = q.new_zeros(q.size(0), H, DV)
+    chunk_fwd_o_diag_anchored_varlen_helion(
+        q, v_new, g_cs, h_all, Aqk, token_base, valid_len, o, scale, l2norm_q=l2norm_q
+    )
+    o = o[:T_total]
+
+    final_state = None
+    if return_final_state:
+        final_state = ht.reshape(H, N, D, DV).transpose(0, 1).contiguous()
+
+    return o, final_state
+
+
 def _helion_chunked_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2239,8 +3057,6 @@ def _helion_chunked_bwd(
             q_4d, do_flat, None, dstate, use_g=False, scale=scale
         )
 
-        g_csf2 = q.new_zeros(BHN, C, dtype=torch.float32)
-        g_lastf2 = q.new_zeros(BHN, dtype=torch.float32)
         dhf2 = dh_all.reshape(BHN, D, DV)
         qb = q.reshape(BHN, C, D)
         kb = k.reshape(BHN, C, D)
@@ -2249,10 +3065,10 @@ def _helion_chunked_bwd(
         hb = h_all.reshape(BHN, D, DV)
 
         dq_raw, dk_raw = chunk_bwd_dqk_helion(
-            qb, kb, vb, g_csf2, g_lastf2, hb, dob, dhf2, use_g=False, scale=scale
+            qb, kb, vb, None, None, hb, dob, dhf2, use_g=False, scale=scale
         )
         dv_raw = chunk_bwd_dv_helion(
-            qb, kb, kb, g_csf2, dob, dhf2, use_g=False, scale=scale
+            qb, kb, kb, None, dob, dhf2, use_g=False, scale=scale
         )
 
         return (
@@ -2273,8 +3089,7 @@ def _helion_chunked_bwd(
         if bwd_cache is not None:
             g_cs, g_last_scalar, g_last_4d = bwd_cache
         else:
-            gc = g.float().reshape(BH, N, C)
-            g_cs = gc.cumsum(-1)
+            g_cs = g.reshape(BH, N, C).cumsum(-1, dtype=torch.float32)
             g_last_scalar = g_cs[:, :, -1]
             g_last_4d = g_last_scalar.unsqueeze(-1).expand(-1, -1, D)
 
@@ -2403,6 +3218,7 @@ def _helion_chunked_bwd_delta(
     A_inv: torch.Tensor,
     w_wy: torch.Tensor,
     g: torch.Tensor | None = None,
+    scale: float = 1.0,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor | None,
@@ -2411,7 +3227,7 @@ def _helion_chunked_bwd_delta(
     torch.Tensor,
     torch.Tensor | None,
 ]:
-    """DeltaNet / Gated DeltaNet backward (beta correction), q pre-scaled.
+    """DeltaNet / Gated DeltaNet backward (beta correction), q unscaled.
 
     Both share the same four kernels, reusing the saved triangular inverse
     A_inv = T; scalar decay (g.dim() == 3) folds in via scalar_decay=True:
@@ -2450,8 +3266,11 @@ def _helion_chunked_bwd_delta(
     do4 = grad_output.reshape(BH, N, C, DV)
 
     dh0 = q.new_zeros(BH, D, DV, dtype=k.dtype)
+    # do enters the backward through two independent kernels (dstate and dqkw);
+    # each scales its own do load once. dstate's outputs dS_future/dvni already
+    # carry scale, so dqkw must scale only its direct do load, not those.
     dS_future, dvni4 = chunk_bwd_dstate_delta_helion(
-        q4, a4, w4, do4, dh0, g_cs, decay_last, scalar_decay=scalar_decay
+        q4, a4, w4, do4, dh0, g_cs, decay_last, scalar_decay=scalar_decay, scale=scale
     )
 
     qf = q.reshape(BHN, C, D)
@@ -2475,6 +3294,7 @@ def _helion_chunked_bwd_delta(
         g_cs_flat,
         decay_lastf,
         scalar_decay=scalar_decay,
+        scale=scale,
     )
 
     dL, dv, dbeta, d_ba, dg_wy = chunk_bwd_wy_dL_delta_helion(
@@ -2517,8 +3337,9 @@ def _helion_chunked_bwd_kda(
     v_new_all: torch.Tensor,
     A_inv: torch.Tensor,
     w_wy: torch.Tensor,
+    scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """KDA backward (beta correction + diagonal decay), q pre-scaled.
+    """KDA backward (beta correction + diagonal decay), q unscaled.
 
     Chains the kda backward kernels, reusing the saved Tinv (A_inv), w, h_all,
     v_new from the forward and recomputing the anchored grams Aqk/Akk:
@@ -2534,11 +3355,6 @@ def _helion_chunked_bwd_kda(
     BH = B * H
     BHN = BH * N
 
-    # Cumulative per-chunk log-decay: the state kernels (fed gc4) and the WY /
-    # output / gram kernels (fed g_cs_flat) all expect the cumsum, not raw g.
-    gc4 = g.float().reshape(BH, N, C, D).cumsum(-2)
-    g_cs_flat = gc4.reshape(BHN, C, D)
-
     qf = q.reshape(BHN, C, D)
     kf = k.reshape(BHN, C, D)
     vf = v.reshape(BHN, C, DV)
@@ -2548,11 +3364,21 @@ def _helion_chunked_bwd_kda(
     Tinv = A_inv
     dof = grad_output.reshape(BHN, C, DV)
 
-    # Recompute the anchored grams (cheap; needed for dv_new/dAqk and dbeta/gram2).
-    Aqk, Akk = chunk_fwd_A_diag_anchored_helion(qf, kf, g_cs_flat, 1.0, build_kk=True)
+    # Reuse the forward's cached cumsum and anchored grams when available.
+    bwd_cache = getattr(h_all, "_kda_bwd_cache", None)
+    if bwd_cache is not None:
+        g_cs_flat, Aqk, Akk = bwd_cache
+    else:
+        g_cs_flat = chunk_cumsum_gc_helion(g.reshape(BHN, C, D))
+        Aqk, Akk = chunk_fwd_A_diag_anchored_helion(
+            qf, kf, g_cs_flat, scale, build_kk=True
+        )
+    gc4 = g_cs_flat.reshape(BH, N, C, D)
 
+    # scale folds into the do load here; dh/dAqk/dv_new carry it downstream, so the
+    # state kernels and gram2 (fed dAqk/dAkk) stay at 1.0 to avoid double-counting.
     dq_o, dgc_o, dh, dAqk, dv_new = chunk_bwd_o_kda_helion(
-        qf, vnf, hf, Aqk, g_cs_flat, dof, 1.0
+        qf, vnf, hf, Aqk, g_cs_flat, dof, scale
     )
 
     k4 = k.reshape(BH, N, C, D)
@@ -2612,6 +3438,9 @@ def chunked_linear_attn(
     return_final_state: Literal[False] = ...,
     head_first: bool = ...,
     scale: float = ...,
+    A_log: torch.Tensor | None = ...,
+    dt_bias: torch.Tensor | None = ...,
+    lower_bound: float | None = ...,
 ) -> torch.Tensor: ...
 
 
@@ -2628,6 +3457,9 @@ def chunked_linear_attn(
     return_final_state: Literal[True] = ...,
     head_first: bool = ...,
     scale: float = ...,
+    A_log: torch.Tensor | None = ...,
+    dt_bias: torch.Tensor | None = ...,
+    lower_bound: float | None = ...,
 ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
@@ -2643,6 +3475,9 @@ def chunked_linear_attn(
     return_final_state: bool = False,
     head_first: bool = True,
     scale: float = 1.0,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Public entry point for chunked linear attention. g=None means no decay.
 
@@ -2688,7 +3523,19 @@ def chunked_linear_attn(
             a = torch.nn.functional.pad(a, [0, 0, 0, pad])
 
     o, final_state = ChunkedLinearAttnFn.apply(
-        q, k, v, g, beta, a, C, initial_state, return_final_state, scale
+        q,
+        k,
+        v,
+        g,
+        beta,
+        a,
+        C,
+        initial_state,
+        return_final_state,
+        scale,
+        A_log,
+        dt_bias,
+        lower_bound,
     )
 
     if pad > 0:
@@ -2784,11 +3631,12 @@ def helion_chunk_simple_gla(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     assert g is not None
     return chunked_linear_attn(
-        q * scale,
+        q,
         k,
         v,
         g,
         C=C,
+        scale=scale,
         initial_state=initial_state,
         return_final_state=return_final_state,
     )
@@ -2808,11 +3656,12 @@ def helion_chunk_retention(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     assert g is not None
     return chunked_linear_attn(
-        q * scale,
+        q,
         k,
         v,
         g,
         C=C,
+        scale=scale,
         initial_state=initial_state,
         return_final_state=return_final_state,
     )
@@ -2857,12 +3706,13 @@ def helion_chunk_delta_rule(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     assert beta is not None
     return chunked_linear_attn(
-        q * scale,
+        q,
         k,
         v,
         None,
         beta=beta,
         C=C,
+        scale=scale,
         initial_state=initial_state,
         return_final_state=return_final_state,
     )
@@ -2883,12 +3733,13 @@ def helion_chunk_gated_delta_rule(
     assert g is not None
     assert beta is not None
     return chunked_linear_attn(
-        q * scale,
+        q,
         k,
         v,
         g,
         beta=beta,
         C=C,
+        scale=scale,
         initial_state=initial_state,
         return_final_state=return_final_state,
     )
@@ -2905,19 +3756,151 @@ def helion_chunk_kda(
     scale: float = 1.0,
     initial_state: torch.Tensor | None = None,
     return_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    use_gate_in_kernel: bool = False,
+    use_beta_sigmoid_in_kernel: bool = False,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    state_v_first: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """KDA, optionally applying the model's input transforms on the way in.
+
+    All three flags default off, meaning the caller has already transformed its
+    inputs. Turning one on moves that transform into the kernels:
+      - use_qk_l2norm_in_kernel=True: q, k arrive raw, normed per head over D:
+            q = q / ||q||,  k = k / ||k||
+      - use_gate_in_kernel=True: g arrives pre-activation, A_log [H] required,
+        dt_bias [H, D] and lower_bound optional:
+            g = lower_bound * sigmoid(exp(A_log) * (g + dt_bias))   lower_bound set
+            g = -exp(A_log) * softplus(g + dt_bias)                 otherwise
+      - use_beta_sigmoid_in_kernel=True: beta arrives as logits:
+            beta = sigmoid(beta)
+    None of the three transforms has a backward, so a flag set on an input with
+    requires_grad=True raises NotImplementedError.
+
+    cu_seqlens [N+1] switches to a variable-length batch. Inputs are then
+    token-major [1, T_total, H, D], the layout FLA, vLLM and FlashKDA all use for
+    a varlen batch, rather than the head-first layout of the dense path: sequence n
+    spans tokens cu_seqlens[n] : cu_seqlens[n+1] and the recurrence restarts at
+    each boundary. The output matches its inputs, [1, T_total, H, DV], and
+    initial_state / the returned final state are [N, H, D, DV], one per sequence.
+    This path is forward only.
+
+    state_v_first holds the state as [N, H, DV, D] instead of [N, H, D, DV], matching
+    what vLLM and FlashKDA use; the flag name is FLA's. It applies to initial_state
+    and the returned final state alike, so a returned state feeds straight back in.
+    """
     assert g is not None
     assert beta is not None
-    return chunked_linear_attn(
-        q * scale,
+    any_flag = (
+        use_qk_l2norm_in_kernel or use_gate_in_kernel or use_beta_sigmoid_in_kernel
+    )
+    needs_grad = any(
+        t is not None and t.requires_grad for t in (q, k, v, g, beta, initial_state)
+    )
+    if any_flag and needs_grad:
+        raise NotImplementedError(
+            "the in-kernel KDA preamble is forward-only; call with the flags off "
+            "and transform the inputs outside the kernel to keep gradients"
+        )
+
+    if state_v_first and initial_state is not None:
+        initial_state = initial_state.transpose(-2, -1).contiguous()
+
+    fuse_q_l2norm = use_qk_l2norm_in_kernel and cu_seqlens is not None
+    if use_qk_l2norm_in_kernel:
+        norm = lambda t: l2norm_fwd_helion(t.reshape(-1, t.size(-1))).view_as(t)  # noqa: E731
+        k = norm(k)
+        if not fuse_q_l2norm:
+            q = norm(q)
+    if use_beta_sigmoid_in_kernel:
+        beta = torch.sigmoid(beta)
+    if use_gate_in_kernel:
+        assert A_log is not None
+    else:
+        A_log = None
+        dt_bias = None
+        lower_bound = None
+
+    if cu_seqlens is not None:
+        if q.size(0) != 1:
+            raise ValueError(
+                f"The batch size is expected to be 1 rather than {q.size(0)} when "
+                "using `cu_seqlens`. Please flatten variable-length inputs before "
+                "processing."
+            )
+        if needs_grad:
+            raise NotImplementedError(
+                "the cu_seqlens path is forward-only; pass a dense batch "
+                "to keep gradients"
+            )
+        # chunk_fwd_A_diag_anchored_varlen_helion asserts the same bound; this raises
+        # the caller-facing error before a kernel trace does.
+        if C not in (2 * BC_DIAG, 4 * BC_DIAG):
+            raise ValueError(
+                f"chunk size C must be {2 * BC_DIAG} or {4 * BC_DIAG} for KDA, got {C}"
+            )
+        # Every kernel indexes tokens through cu_seqlens, so a vector that does not
+        # partition [0, T_total) reads the wrong rows rather than failing: an end
+        # below T_total leaves that much of the output at its zero initialization.
+        if int(cu_seqlens[-1]) != q.size(1):
+            raise ValueError(
+                f"cu_seqlens must end at T_total={q.size(1)}, got {int(cu_seqlens[-1])}"
+            )
+        if int(cu_seqlens[0]) != 0 or not bool(
+            (cu_seqlens[1:] > cu_seqlens[:-1]).all()
+        ):
+            raise ValueError("cu_seqlens must start at 0 and strictly increase")
+        # Grouped-query: give every query head its own key/value head, matching what
+        # chunked_linear_attn does for the dense path.
+        H_kv = k.size(2)
+        if H_kv < q.size(2):
+            assert q.size(2) % H_kv == 0
+            n_rep = q.size(2) // H_kv
+            k = k.repeat_interleave(n_rep, dim=2)
+            v = v.repeat_interleave(n_rep, dim=2)
+        o, final_state = _helion_chunked_fwd_kda_varlen(
+            q[0],
+            k[0],
+            v[0],
+            g[0],
+            beta[0],
+            C,
+            cu_seqlens,
+            initial_state=initial_state,
+            return_final_state=return_final_state,
+            scale=scale,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
+            l2norm_q=fuse_q_l2norm,
+        )
+        o = o.unsqueeze(0)
+        if return_final_state:
+            assert final_state is not None
+            return o, final_state.transpose(-2, -1) if state_v_first else final_state
+        return o
+
+    out = chunked_linear_attn(
+        q,
         k,
         v,
         g,
         beta=beta,
         C=C,
+        scale=scale,
         initial_state=initial_state,
         return_final_state=return_final_state,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
     )
+    if return_final_state and state_v_first:
+        o, final_state = out
+        return o, final_state.transpose(-2, -1)
+    return out
 
 
 def helion_chunk_mamba2_ssd(

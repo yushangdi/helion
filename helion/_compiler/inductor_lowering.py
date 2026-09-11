@@ -125,6 +125,11 @@ def prepare_node_lowering(
         node.meta["lowering"] = APIFuncLowering(api)
         return
 
+    backend_lowering = CompileEnvironment.current().backend.pre_inductor_lowering(node)
+    if backend_lowering is not None:
+        node.meta["lowering"] = backend_lowering
+        return
+
     if node.target in aten_lowering_dispatch:
         if node.target in {
             torch.ops.aten.argmax.default,
@@ -389,7 +394,13 @@ class InductorLowering(Lowering):
             if isinstance(fake_val := n.meta["val"], torch.Tensor):
                 # Don't expand scalars (0-D tensors) - let Triton handle broadcasting naturally
                 # Expanding scalars with [None, None] creates incorrect broadcast shapes
-                if fake_val.ndim < ndim and fake_val.ndim > 0:
+                # The expands_broadcast_dims() check lets FlyDSL skip the
+                # Triton-style [None, :] expand its per-thread vectors don't need.
+                if (
+                    fake_val.ndim < ndim
+                    and fake_val.ndim > 0
+                    and CompileEnvironment.current().backend.expands_broadcast_dims()
+                ):
                     expand = tile_strategy.broadcast_expand_dims(
                         tuple(fake_val.shape), output_shape
                     )
@@ -485,19 +496,35 @@ class FakeGraphLowering(GraphLowering):
 
 class PointwiseLowering(InductorLowering):
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
+        return self.codegen_from_input_asts(ctx, node, self.input_asts(ctx, node))
+
+    def codegen_from_input_asts(
+        self,
+        ctx: LoweringContext,
+        node: torch.fx.Node,
+        input_asts: list[ast.AST],
+    ) -> object:
+        """Lower this pointwise node with explicitly supplied tensor values."""
         # Validate broadcasting of tile block dimensions to catch shape mismatches
         self._check_block_broadcast_compatibility(ctx, node)
-        with self.install_kernel_handlers(ctx, node):
+        assert len(input_asts) == len(self.input_names)
+        with install_inductor_kernel_handlers(
+            ctx.cg, dict(zip(self.input_names, input_asts, strict=True))
+        ):
             indices = [
                 sympy.Symbol(f"i{n}") for n in range(len(self.buffer.data.ranges))
             ]
             output_name = _unpack_opsvalue(self.buffer.data.inner_fn(indices))
             result = expr_from_string(output_name)
 
-        return self._reshape_for_size1_reduction(ctx, node, result)
+        return self._reshape_for_size1_reduction(ctx, node, result, input_asts)
 
     def _reshape_for_size1_reduction(
-        self, ctx: LoweringContext, node: torch.fx.Node, result: ast.AST
+        self,
+        ctx: LoweringContext,
+        node: torch.fx.Node,
+        result: ast.AST,
+        input_asts: list[ast.AST] | None = None,
     ) -> ast.AST:
         # When Inductor converts a size-1 reduction to a Pointwise op, the
         # buffer has fewer ranges than the inputs.  This happens when the
@@ -515,7 +542,9 @@ class PointwiseLowering(InductorLowering):
             # Cute lowers one element per thread, so synthetic size-1 view dims
             # (from unsqueeze/keepdim paths rewritten to pointwise) must collapse
             # back to the underlying scalar expression.
-            inputs = self.input_asts(ctx, node)
+            inputs = (
+                input_asts if input_asts is not None else self.input_asts(ctx, node)
+            )
             if len(inputs) == 1:
                 return inputs[0]
 
@@ -923,6 +952,7 @@ class ReductionLowering(InductorLowering):
 
             strategy = BlockReductionStrategy(state, self.block_index)
 
+        env.backend.validate_reduction_input(strategy.block_index, repr_input)
         result_ast = strategy.codegen_reduction(
             state,
             output_name,
@@ -1076,6 +1106,13 @@ class GenerateASTFromInductor(DefaultHandler):
         backend = CompileEnvironment.current().backend
         return backend.cast_ast(x, target_dtype)
 
+    def _cast_scalar_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
+        # Cast a bare scalar (e.g. lifted from an index expr). Backends whose
+        # cast syntax needs a runtime object override cast_scalar_ast; the base
+        # default uses cast_ast.
+        backend = CompileEnvironment.current().backend
+        return backend.cast_scalar_ast(x, target_dtype)
+
     def _to_ast(self, x: object) -> ast.AST:
         if isinstance(x, ast.AST):
             return x
@@ -1183,8 +1220,13 @@ class GenerateASTFromInductor(DefaultHandler):
     def rsqrt(self, x: object) -> str:  # type: ignore[override]
         backend_name = CompileEnvironment.current().backend_name
         if backend_name == "cute":
+            suffix = (
+                ", fastmath=True"
+                if CompileEnvironment.current().settings.fast_math
+                else ""
+            )
             return self._lift(
-                expr_from_string("cute.math.rsqrt({x})", x=self._to_ast(x))
+                expr_from_string(f"cute.math.rsqrt({{x}}{suffix})", x=self._to_ast(x))
             )
         if backend_name == "pallas":
             return self._lift(expr_from_string("lax.rsqrt({x})", x=self._to_ast(x)))
@@ -1194,6 +1236,46 @@ class GenerateASTFromInductor(DefaultHandler):
             # Some backend op handlers do not implement rsqrt directly.
             # Fall back to reciprocal(sqrt(x)) so lowering remains backend-agnostic.
             return self.reciprocal(self.sqrt(x))
+
+    def neg(self, x: object) -> str:  # type: ignore[override]
+        if CompileEnvironment.current().backend_name != "cute":
+            return self._default("neg", (x,), {})
+        return self._lift(expr_from_string("-({x})", x=self._to_ast(x)))
+
+    def abs(self, x: object) -> str:  # type: ignore[override]
+        if CompileEnvironment.current().backend_name != "cute":
+            return self._default("abs", (x,), {})
+        return self._lift(expr_from_string("abs({x})", x=self._to_ast(x)))
+
+    def maximum(self, a: object, b: object) -> str:  # type: ignore[override]
+        if CompileEnvironment.current().backend_name != "cute":
+            return self._default("maximum", (a, b), {})
+        dtype = self._expected_tensor_dtype()
+        if dtype is not None:
+            a = self._create_cast_expr(a, dtype)
+            b = self._create_cast_expr(b, dtype)
+        return self._lift(
+            expr_from_string(
+                "cute.math.max({a}, {b}, propagate_nan=True)",
+                a=self._to_ast(a),
+                b=self._to_ast(b),
+            )
+        )
+
+    def minimum(self, a: object, b: object) -> str:  # type: ignore[override]
+        if CompileEnvironment.current().backend_name != "cute":
+            return self._default("minimum", (a, b), {})
+        dtype = self._expected_tensor_dtype()
+        if dtype is not None:
+            a = self._create_cast_expr(a, dtype)
+            b = self._create_cast_expr(b, dtype)
+        return self._lift(
+            expr_from_string(
+                "cute.math.min({a}, {b}, propagate_nan=True)",
+                a=self._to_ast(a),
+                b=self._to_ast(b),
+            )
+        )
 
     def mul(self, a: object, b: object) -> str:  # type: ignore[override]
         # Triton promotes scalar*tensor results to float32, deviating from
@@ -1239,7 +1321,7 @@ class GenerateASTFromInductor(DefaultHandler):
         if name in self.cg.device_function._constexpr_args:
             return name
 
-        return self._lift(self._create_cast_expr(expr_from_string(name), dtype))
+        return self._lift(self._cast_scalar_ast(expr_from_string(name), dtype))
 
 
 def _unpack_opsvalue(value: object) -> str:
@@ -1419,6 +1501,25 @@ class GraphInterpreter(LoweringContext, Interpreter):
                 V.set_current_node(n),
             ):
                 try:
+                    cute_state = self.cg.device_function.cute_state
+                    if cute_state.has_tcgen05_fragment_epilogue_plan:
+                        if cute_state.is_deferred_tcgen05_fragment_epilogue_node(n):
+                            n.meta["codegen"] = _DEFERRED_TCGEN05_FRAGMENT_EPILOGUE
+                            return _DEFERRED_TCGEN05_FRAGMENT_EPILOGUE
+                        if (
+                            any(
+                                self.env.get(input_node)
+                                is _DEFERRED_TCGEN05_FRAGMENT_EPILOGUE
+                                for input_node in n.all_input_nodes
+                            )
+                            and cute_state.tcgen05_fragment_epilogue_plan_for_store(n)
+                            is None
+                        ):
+                            raise exc.BackendUnsupported(
+                                "cute",
+                                "deferred tcgen05 fragment epilogue escaped its "
+                                "committed store",
+                            )
                     lowering: Lowering = n.meta["lowering"]
                     result = lowering.codegen(self, n)
                     n.meta["codegen"] = result
@@ -1473,6 +1574,13 @@ class GraphInterpreter(LoweringContext, Interpreter):
                         f"Error in codegen for node {n.name} ({n.target}): {e}"
                     ) from e
         return super().run_node(n)
+
+
+_DEFERRED_TCGEN05_FRAGMENT_EPILOGUE = object()
+
+
+def is_deferred_tcgen05_fragment_epilogue(value: object) -> bool:
+    return value is _DEFERRED_TCGEN05_FRAGMENT_EPILOGUE
 
 
 def codegen_call_with_graph(

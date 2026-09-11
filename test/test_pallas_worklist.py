@@ -44,17 +44,17 @@ from helion.runtime.settings import is_pallas_interpret
 if _get_backend() == "pallas" and is_pallas_interpret():
     pytest.skip(
         "compact worklist is TPU-only: JAX interpret mode does not support "
-        "pl.Element block specs",
+        "dynamic pl.BoundedSlice sizes",
         allow_module_level=True,
     )
 
 try:
-    import jax  # noqa: F401
+    import jax
     import jax.numpy as jnp
     import numpy as np
 
-    from helion.runtime.compact_worklist import flatten_worklist
-    from helion.runtime.compact_worklist import packed_upper_bound
+    from helion.runtime.pallas.compact_worklist import flatten_worklist
+    from helion.runtime.pallas.compact_worklist import packed_upper_bound
 
     HAS_JAX = True
 except ImportError:  # pragma: no cover - jax optional
@@ -409,6 +409,96 @@ def _fully_jagged_kernel(q, k, v, q_offsets, kv_offsets):
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def _aliased_ordered_load_kernel(q, backing, q_offsets, kv_offsets):
+    """Read two differently sized views of one allocation in the ordered loop."""
+    H = hl.specialize(q.size(1))
+    D = hl.specialize(q.size(2))
+    short = backing[:7]
+    long = backing[:15]
+    out = torch.empty_like(q)
+    for seq_idx in hl.grid(q_offsets.size(0) - 1):
+        q_start = q_offsets[seq_idx]
+        q_end = q_offsets[seq_idx + 1]
+        kv_start = kv_offsets[seq_idx]
+        kv_end = kv_offsets[seq_idx + 1]
+        for tile_q in hl.tile(q_start, q_end):
+            q_blk = q[tile_q, :, :].transpose(0, 1)
+            acc = hl.zeros([H, tile_q, D], dtype=torch.float32)
+            for tile_kv in hl.tile(kv_start, kv_end):
+                short_blk = short[tile_kv, :, :].transpose(0, 1)
+                long_blk = long[tile_kv, :, :].transpose(0, 1)
+                short_scores = torch.bmm(q_blk, short_blk.transpose(-2, -1))
+                long_scores = torch.bmm(q_blk, long_blk.transpose(-2, -1))
+                acc = acc + torch.bmm(short_scores.to(short.dtype), short_blk)
+                acc = acc + torch.bmm(long_scores.to(long.dtype), long_blk)
+            out[tile_q, :, :] = acc.transpose(0, 1).to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def _causal_jagged_kernel(q, k, v, offsets):
+    H = hl.specialize(q.size(1))
+    D = hl.specialize(q.size(2))
+    num_sequences = offsets.size(0) - 1
+    out = torch.empty_like(q)
+    for seq_idx in hl.grid(num_sequences):
+        q_start = offsets[seq_idx]
+        q_end = offsets[seq_idx + 1]
+        k_start = offsets[seq_idx]
+        k_end = offsets[seq_idx + 1]
+        for tile_q in hl.tile(q_start, q_end):
+            q_blk = q[tile_q, :, :].transpose(0, 1)
+            acc = hl.zeros([H, tile_q, D], dtype=torch.float32)
+            for tile_k in hl.tile(k_start, min(k_end, tile_q.end)):
+                k_blk = k[tile_k, :, :].transpose(0, 1)
+                v_blk = v[tile_k, :, :].transpose(0, 1)
+                scores = torch.bmm(q_blk, k_blk.transpose(-2, -1))
+                causal = tile_k.index[None, None, :] <= tile_q.index[None, :, None]
+                scores = torch.where(causal, scores, 0.0)
+                acc = torch.baddbmm(acc, scores.to(v.dtype), v_blk)
+            out[tile_q, :, :] = acc.transpose(0, 1).to(out.dtype)
+    return out
+
+
+# Sliding-window causal attention: each query attends to the keys in a fixed
+# span before it, so the ordered loop's begin also depends on the enclosing
+# tile.  The kernel below spells the span as a literal in both its bound and
+# its mask, since a module global would be read at runtime by the body while
+# the bound baked a value.  This copy is for the reference and the assertions;
+# test_sliding_window_preserves_source_range pins it to the kernel's literal.
+_SLIDING_WINDOW = 16
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def _sliding_window_jagged_kernel(q, k, v, offsets):
+    H = hl.specialize(q.size(1))
+    D = hl.specialize(q.size(2))
+    num_sequences = offsets.size(0) - 1
+    out = torch.empty_like(q)
+    for seq_idx in hl.grid(num_sequences):
+        q_start = offsets[seq_idx]
+        q_end = offsets[seq_idx + 1]
+        k_start = offsets[seq_idx]
+        k_end = offsets[seq_idx + 1]
+        for tile_q in hl.tile(q_start, q_end):
+            q_blk = q[tile_q, :, :].transpose(0, 1)
+            acc = hl.zeros([H, tile_q, D], dtype=torch.float32)
+            for tile_k in hl.tile(
+                max(k_start, tile_q.begin - 16),
+                min(k_end, tile_q.end),
+            ):
+                k_blk = k[tile_k, :, :].transpose(0, 1)
+                v_blk = v[tile_k, :, :].transpose(0, 1)
+                scores = torch.bmm(q_blk, k_blk.transpose(-2, -1))
+                delta = tile_q.index[None, :, None] - tile_k.index[None, None, :]
+                keep = (delta >= 0) & (delta <= 16)
+                scores = torch.where(keep, scores, 0.0)
+                acc = torch.baddbmm(acc, scores.to(v.dtype), v_blk)
+            out[tile_q, :, :] = acc.transpose(0, 1).to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def _flash_prep_kernel(q, k, v, q_offsets, kv_offsets):
     """Jagged flash attention: a max reduction (amax) whose padded scores must be -inf,
     so its softmax mask fill is -inf (not the prep cache's 0)."""
@@ -471,6 +561,21 @@ def _add_kernel(x, y):
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def _nested_tile_no_grid_kernel(x, y):
+    """Nested ``hl.tile(..., block_size=)`` + ``hl.tile(mb_cta.begin, mb_cta.end)``,
+    no ``hl.grid``. Mirrors ``examples/rms_norm.py::rms_norm_bwd``: the config
+    space offers ``pallas_worklist_grouping`` because the nest is jagged-shaped,
+    but ``detect_compact_worklist_plan`` can't recognise it (needs ``hl.grid``).
+    Used to guard against a raise past the autotuner's skip path."""
+    out = torch.empty_like(x)
+    m_block = hl.register_block_size(x.size(0))
+    for mb_cta in hl.tile(x.size(0), block_size=m_block):
+        for mb in hl.tile(mb_cta.begin, mb_cta.end):
+            out[mb, :] = x[mb, :] + y[mb, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def _noprep_ordered_kernel(q, k, q_offsets):
     """Jagged ordered reduction whose reused operand (k) has NO transpose prep:
     k is summed over each ordered tile, never head-major transposed.  It can still
@@ -510,6 +615,43 @@ def _unpacked_ordered_kernel(q, k, v, q_offsets, kv_offsets):
                 v_blk = v[tile_kv, :, :].transpose(0, 1)
                 scores = torch.bmm(q_blk, k_blk.transpose(-2, -1))
                 acc = acc + torch.bmm(scores.to(v.dtype), v_blk)
+            out[tile_q, :, :] = acc.transpose(0, 1).to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def _nested_ordered_load_kernel(q, k, offsets):
+    """Ordered input loaded both directly and inside nested control flow."""
+    out = torch.empty_like(q)
+    for seq_idx in hl.grid(offsets.size(0) - 1):
+        start = offsets[seq_idx]
+        end = offsets[seq_idx + 1]
+        for tile_q in hl.tile(start, end):
+            acc = q[tile_q, :, :].transpose(0, 1).to(torch.float32)
+            for tile_kv in hl.tile(start, end):
+                k_blk = k[tile_kv, :, :].transpose(0, 1)
+                acc = acc + k_blk.sum(dim=1, keepdim=True).to(torch.float32)
+                if end > start:
+                    nested = k[tile_kv, :, :]
+                    acc = acc + nested.sum(dim=0).unsqueeze(1).to(torch.float32)
+            out[tile_q, :, :] = acc.transpose(0, 1).to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def _offset_ordered_load_kernel(q, k, offsets):
+    """Ordered input with both tiled and tile-relative scalar loads."""
+    out = torch.empty_like(q)
+    for seq_idx in hl.grid(offsets.size(0) - 1):
+        start = offsets[seq_idx]
+        end = offsets[seq_idx + 1]
+        for tile_q in hl.tile(start, end):
+            acc = q[tile_q, :, :].transpose(0, 1).to(torch.float32)
+            for tile_kv in hl.tile(start, end):
+                k_blk = k[tile_kv, :, :].transpose(0, 1)
+                acc = acc + k_blk.sum(dim=1, keepdim=True).to(torch.float32)
+                edge = k[tile_kv.begin + 7, :, :]
+                acc = acc + edge[:, None, :].to(torch.float32)
             out[tile_q, :, :] = acc.transpose(0, 1).to(out.dtype)
     return out
 
@@ -636,6 +778,234 @@ class TestDetectAndGating(unittest.TestCase):
         with bk.env:
             return detect_compact_worklist_plan(bk.host_function)
 
+    def test_dependent_bound_grammar(self):
+        """The AST recognizer accepts exactly the two clamped-end forms.
+
+        The traced-SymInt recognizer for kernels without a worklist plan
+        (``tracing_ops._dependent_tile_end_expr``) must accept the same forms;
+        it is covered end-to-end by the dense tests in test_pallas.py.
+        """
+        from helion._compiler.pallas.compact_worklist import _ordered_source_end
+
+        for accepted in (
+            "tile_q.end",
+            "hl.tile_end(tile_q)",
+            "min(offsets[seq_idx + 1], tile_q.end)",
+            "builtins.min(offsets[seq_idx + 1], hl.tile_end(tile_q))",
+            "min(hl.tile_end(tile_q), offsets[seq_idx + 1])",
+        ):
+            with self.subTest(accepted=accepted):
+                source_end, clamped = _ordered_source_end(
+                    _expr("offsets[seq_idx]"),
+                    _expr(accepted),
+                    "tile_q",
+                    _expr("offsets[seq_idx]"),
+                    _expr("offsets[seq_idx + 1]"),
+                )
+                self.assertTrue(clamped)
+                # Either form yields the full source end, never the clamped one.
+                self.assertEqual(ast.unparse(source_end), "offsets[seq_idx + 1]")
+
+        for unsupported in (
+            "foo.tile_end(tile_q)",
+            "foo.min(offsets[seq_idx + 1], tile_q.end)",
+            # A different tile's edge is not the enclosing compact tile.
+            "min(offsets[seq_idx + 1], tile_k.end)",
+            # A begin edge is the sliding-window form, matched separately.
+            "max(offsets[seq_idx], tile_q.begin)",
+        ):
+            with self.subTest(unsupported=unsupported):
+                source_end, clamped = _ordered_source_end(
+                    _expr("offsets[seq_idx]"),
+                    _expr(unsupported),
+                    "tile_q",
+                    _expr("offsets[seq_idx]"),
+                    _expr("offsets[seq_idx + 1]"),
+                )
+                self.assertFalse(clamped)
+                self.assertEqual(ast.unparse(source_end), unsupported)
+
+    def test_sliding_window_begin_grammar(self):
+        """The begin recognizer accepts exactly ``max(src, tile.begin - W)``."""
+        from helion._compiler.pallas.compact_worklist import _ordered_source_begin
+
+        for accepted, window in (
+            ("max(offsets[seq_idx], tile_q.begin - 16)", 16),
+            ("max(tile_q.begin - 16, offsets[seq_idx])", 16),
+            ("builtins.max(offsets[seq_idx], hl.tile_begin(tile_q) - 4)", 4),
+            # A bare begin is the degenerate zero-lookback window.
+            ("max(offsets[seq_idx], tile_q.begin)", 0),
+        ):
+            with self.subTest(accepted=accepted):
+                source_begin, got = _ordered_source_begin(_expr(accepted), "tile_q")
+                self.assertEqual(got, window)
+                self.assertEqual(ast.unparse(source_begin), "offsets[seq_idx]")
+
+        for unsupported in (
+            # An ordinary source bound.
+            "offsets[seq_idx]",
+            # min() is the end form, not a lookback.
+            "min(offsets[seq_idx], tile_q.begin - 16)",
+            # A different tile's edge.
+            "max(offsets[seq_idx], tile_k.begin - 16)",
+            # Adding to the edge is a lookahead, which the clamp cannot express.
+            "max(offsets[seq_idx], tile_q.begin + 16)",
+            # Neither operand is an edge.
+            "max(offsets[seq_idx], 0)",
+        ):
+            with self.subTest(unsupported=unsupported):
+                source_begin, got = _ordered_source_begin(_expr(unsupported), "tile_q")
+                self.assertIsNone(got)
+                self.assertEqual(ast.unparse(source_begin), unsupported)
+
+        # A non-literal lookback is clearly an attempted window, so it is named
+        # rather than left to the generic host-bound error.  A module global in
+        # particular is read at runtime by the kernel body, so baking it into
+        # the iteration bound would let a rebind mask keys the loop never
+        # visits.
+        for rejected in (
+            "max(offsets[seq_idx], tile_q.begin - WINDOW)",
+            "max(offsets[seq_idx], tile_q.begin - w * 2)",
+            # A negative literal parses as a unary minus, not a Constant.
+            "max(offsets[seq_idx], tile_q.begin - -4)",
+        ):
+            with (
+                self.subTest(rejected=rejected),
+                self.assertRaisesRegex(exc.InvalidConfig, "integer literal"),
+            ):
+                _ordered_source_begin(_expr(rejected), "tile_q")
+
+    def test_sliding_window_accepts_a_kernel_local_window(self):
+        """A name bound inside the kernel is the workaround the error names.
+
+        Prologue assignments are inlined before the begin is matched, so the
+        literal reaches the bound and the body sees the same value -- unlike a
+        module global, which the body would read at runtime.  Function level
+        and grid body both work; the window sits at function level here since
+        that is the more natural place to write it.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def kernel(q, k, v, offsets):
+            H = hl.specialize(q.size(1))
+            D = hl.specialize(q.size(2))
+            window = 12
+            out = torch.empty_like(q)
+            for seq_idx in hl.grid(offsets.size(0) - 1):
+                start = offsets[seq_idx]
+                end = offsets[seq_idx + 1]
+                for tile_q in hl.tile(start, end):
+                    q_blk = q[tile_q, :, :].transpose(0, 1)
+                    acc = hl.zeros([H, tile_q, D], dtype=torch.float32)
+                    for tile_k in hl.tile(
+                        max(start, tile_q.begin - window), min(end, tile_q.end)
+                    ):
+                        k_blk = k[tile_k, :, :].transpose(0, 1)
+                        v_blk = v[tile_k, :, :].transpose(0, 1)
+                        scores = torch.bmm(q_blk, k_blk.transpose(-2, -1))
+                        delta = (
+                            tile_q.index[None, :, None] - tile_k.index[None, None, :]
+                        )
+                        keep = (delta >= 0) & (delta <= window)
+                        scores = torch.where(keep, scores, 0.0)
+                        acc = torch.baddbmm(acc, scores.to(v.dtype), v_blk)
+                    out[tile_q, :, :] = acc.transpose(0, 1).to(out.dtype)
+            return out
+
+        offsets = _offsets([12, 20, 5, 30])
+        length = int(offsets[-1])
+        args = (
+            torch.randn(length, 4, 128),
+            torch.randn(length, 4, 128),
+            torch.randn(length, 4, 128),
+            offsets,
+        )
+        bound = kernel.bind(args)
+        assert bound.host_function is not None
+        with bound.env:
+            plan = detect_compact_worklist_plan(bound.host_function)
+        self.assertEqual(plan.ordered_begin_window, 12)
+        code = bound.to_triton_code(_worklist_config([8, 8]))
+        self.assertIn("q_begin_ref[_wid] - 12", code)
+        # No launcher-passed copy of the window: nothing can drift from it.
+        self.assertNotIn("_source_module", code)
+
+    def test_function_level_name_does_not_shadow_a_loop_coordinate(self):
+        """A pre-loop name a loop rebinds must not be inlined into its bounds.
+
+        Function-level assignments reach the compact bounds so a window width
+        can live there, but the owner coordinate is bound by the grid loop:
+        inlining the pre-loop value would rewrite offsets[seq_idx] to
+        offsets[0] and give every owner the same range.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def kernel(q, k, v, offsets):
+            H = hl.specialize(q.size(1))
+            D = hl.specialize(q.size(2))
+            out = torch.empty_like(q)
+            seq_idx = 0
+            for seq_idx in hl.grid(offsets.size(0) - 1):
+                start = offsets[seq_idx]
+                end = offsets[seq_idx + 1]
+                for tile_q in hl.tile(start, end):
+                    q_blk = q[tile_q, :, :].transpose(0, 1)
+                    acc = hl.zeros([H, tile_q, D], dtype=torch.float32)
+                    for tile_k in hl.tile(start, end):
+                        k_blk = k[tile_k, :, :].transpose(0, 1)
+                        v_blk = v[tile_k, :, :].transpose(0, 1)
+                        scores = torch.bmm(q_blk, k_blk.transpose(-2, -1))
+                        acc = torch.baddbmm(acc, scores.to(v.dtype), v_blk)
+                    out[tile_q, :, :] = acc.transpose(0, 1).to(out.dtype)
+            return out
+
+        offsets = _offsets([12, 20, 5])
+        length = int(offsets[-1])
+        args = (
+            torch.randn(length, 4, 128),
+            torch.randn(length, 4, 128),
+            torch.randn(length, 4, 128),
+            offsets,
+        )
+        bound = kernel.bind(args)
+        assert bound.host_function is not None
+        with bound.env:
+            plan = detect_compact_worklist_plan(bound.host_function)
+        compact = plan.compact_axis
+        self.assertEqual(ast.unparse(compact.base), "offsets[seq_idx]")
+        self.assertEqual(
+            ast.unparse(compact.length),
+            "offsets[seq_idx + 1] - offsets[seq_idx]",
+        )
+        # Still the packed-offsets idiom, which the shadowed form would lose.
+        self.assertEqual(compact.packed_offset_arg, "offsets")
+
+    def test_direct_tile_end_requires_matching_begins(self):
+        from helion._compiler.pallas.compact_worklist import _ordered_source_end
+
+        # A bare tile.end names no source end, so it can only stand in for the
+        # compact tile's own range when the two begins agree.
+        with self.assertRaisesRegex(exc.InvalidConfig, "begins to match"):
+            _ordered_source_end(
+                _expr("kv_offsets[seq_idx]"),
+                _expr("tile_q.end"),
+                "tile_q",
+                _expr("q_offsets[seq_idx]"),
+                _expr("q_offsets[seq_idx + 1]"),
+            )
+
+        # The min form renders both sides from what the kernel wrote, so
+        # mismatched begins are fine there.
+        source_end, clamped = _ordered_source_end(
+            _expr("kv_offsets[seq_idx]"),
+            _expr("min(kv_offsets[seq_idx + 1], tile_q.end)"),
+            "tile_q",
+            _expr("q_offsets[seq_idx]"),
+            _expr("q_offsets[seq_idx + 1]"),
+        )
+        self.assertTrue(clamped)
+        self.assertEqual(ast.unparse(source_end), "kv_offsets[seq_idx + 1]")
+
     def _fully_jagged_plan(self):
         qo = _offsets([16, 16, 16, 16])
         lq = int(qo[-1])
@@ -732,6 +1102,109 @@ class TestDetectAndGating(unittest.TestCase):
         self.assertNotIn("pallas_loop_type", fields)
         self.assertNotIn("pallas_worklist_grouping", fields)
 
+    def test_clean_region_is_not_an_autotuner_field(self):
+        offsets = _offsets([16, 16, 16, 16])
+        length = int(offsets[-1])
+        spec = _fully_jagged_kernel.bind(
+            (
+                torch.randn(length, 2, 8),
+                torch.randn(length, 2, 8),
+                torch.randn(length, 2, 8),
+                offsets,
+                offsets,
+            )
+        ).env.config_spec
+        self.assertFalse(spec.supports_config_key("pallas_clean_region"))
+        self.assertNotIn("pallas_clean_region", spec._flat_fields())
+
+    def test_clean_region_rejects_non_extent_masks(self):
+        from helion._compiler.pallas.tracing_ops import _clean_region_predicate
+        from helion._compiler.tile_strategy import LoopDimInfo
+
+        graph = torch.fx.Graph()
+        plan = types.SimpleNamespace(compact_axis=types.SimpleNamespace(block_id=1))
+        compact_info = LoopDimInfo()
+        state = types.SimpleNamespace(
+            codegen=types.SimpleNamespace(
+                active_device_loops={
+                    1: [types.SimpleNamespace(block_id_to_info={1: compact_info})]
+                }
+            )
+        )
+        env = types.SimpleNamespace(
+            compact_worklist_plan=plan,
+            is_jagged_tile=lambda block_id: block_id == 2,
+        )
+        with (
+            patch(
+                "helion._compiler.compile_environment.CompileEnvironment.current",
+                return_value=env,
+            ),
+            patch(
+                "helion._compiler.pallas.tracing_ops._is_compact_ordered_inner_loop",
+                return_value=True,
+            ),
+        ):
+            self.assertIsNone(
+                _clean_region_predicate(
+                    state, graph, [2], ["0"], ["8"], ["8"], ["8"], {}
+                )
+            )
+
+            env.is_jagged_tile = lambda _block_id: False
+            compact_info.mask_has_lower_bound = True
+            with (
+                patch(
+                    "helion._compiler.pallas.tracing_ops._clean_region_body_is_replay_safe",
+                    return_value=True,
+                ),
+                patch(
+                    "helion._compiler.pallas.tracing_ops._graph_uses_tile_mask",
+                    return_value=True,
+                ),
+            ):
+                self.assertIsNone(
+                    _clean_region_predicate(
+                        state, graph, [2], ["0"], ["8"], ["8"], ["8"], {}
+                    )
+                )
+
+    def test_clean_region_rejects_distributed_body_replay(self):
+        from helion._compiler.pallas.tracing_ops import (
+            _clean_region_body_is_replay_safe,
+        )
+        from helion.language.distributed_ops import remote_barrier
+
+        graph = torch.fx.Graph()
+        graph.call_function(remote_barrier, args=(0,))
+        self.assertFalse(
+            _clean_region_body_is_replay_safe(types.SimpleNamespace(), graph)
+        )
+
+    def test_grouping_downgrades_on_kernel_without_hl_grid(self):
+        """`pallas_worklist_grouping` is offered for any nested-tile kernel,
+        but ``detect_compact_worklist_plan`` needs an ``hl.grid`` owner. When
+        the kernel uses ``hl.tile(x, block_size=...)`` as the outer loop
+        instead, compiling with ``grouping in (1, 2)`` must silently
+        downgrade to no-op — not raise past the autotuner's skip path."""
+        bk = _nested_tile_no_grid_kernel.bind(
+            (torch.randn(128, 64), torch.randn(128, 64))
+        )
+        fields = bk.env.config_spec._flat_fields()
+        self.assertIn("pallas_worklist_grouping", fields)
+        # Must not raise: compile a config that would have hit
+        # `detect_compact_worklist_plan`'s InvalidConfig raise.
+        for grouping in (1, 2):
+            with self.subTest(grouping=grouping):
+                bk.compile_config(
+                    helion.Config(
+                        block_sizes=[128, 32],
+                        pallas_loop_type="unroll",
+                        pallas_worklist_grouping=grouping,
+                    ),
+                    allow_print=False,
+                )
+
 
 @onlyBackends(["pallas"])
 @unittest.skipUnless(HAS_JAX, "jax not available")
@@ -749,7 +1222,10 @@ class TestWorklistRender(unittest.TestCase):
         src, offset_params = render_build_worklist(
             plan, block_expr=str(self.BLOCK), upper_expr=str(upper)
         )
-        namespace: dict = {}
+        # The rendered builder now calls a module-level ``flatten_worklist``
+        # (provided by the backend's embedded-helper inlining in real generated
+        # modules) rather than importing it inline, so supply it here.
+        namespace: dict = {"flatten_worklist": flatten_worklist}
         exec(compile(src, "<build_worklist>", "exec"), namespace)
         builder = namespace["_build_worklist"]
         return src, offset_params, builder(*offset_arrays)
@@ -881,7 +1357,10 @@ class TestBuilderDistinctTensors(unittest.TestCase):
         self.assertEqual(offset_params, ["lo", "hi"])
         self.assertIn("jnp.arange(lo.shape[0]", src)
 
-        namespace: dict = {}
+        # The rendered builder now calls a module-level ``flatten_worklist``
+        # (supplied by the backend's embedded-helper inlining in real modules)
+        # rather than importing it inline, so provide it here.
+        namespace: dict = {"flatten_worklist": flatten_worklist}
         exec(compile(src, "<bw>", "exec"), namespace)
         meta = namespace["_build_worklist"](
             jnp.asarray(lo.numpy()), jnp.asarray(hi.numpy())
@@ -1064,13 +1543,36 @@ class TestWorklistConfig(unittest.TestCase):
         # builder kwargs; there is no separate launcher name.
         self.assertIn("_compact_build_worklist=_build_worklist", code)
         self.assertIn("def _build_worklist(", code)
+        # Regular output imports ``flatten_worklist`` from helion (the builder calls
+        # it as a module-level name); the dependency-free path embeds it instead.
+        self.assertIn(
+            "from helion.runtime.pallas.compact_worklist import flatten_worklist", code
+        )
+        ast.parse(code)
+        # Dependency-free output embeds the helper source at module scope (no helion
+        # import), so the standalone is self-contained, and it still parses.
+        free = bound.to_code(
+            _worklist_config([8]),
+            options=helion.OutputCodeOptions(allow_helion_deps=False),
+        )
+        self.assertIn("def flatten_worklist(", free)
+        self.assertNotIn("from helion.runtime.pallas.compact_worklist import", free)
+        self.assertNotIn("import helion", free)
+        ast.parse(free)
         # Offsets arg index is non-empty (q_offsets feeds the builder).
         self.assertRegex(code, r"_compact_offset_arg_indices=\[\d")
         self.assertIn("_compact_num_scalar_prefetch=3", code)
         self.assertIn("_wid = pl.program_id(0)", code)
         self.assertIn("work_seq_ref[_wid]", code)
 
-    def test_unsupported_kernel_raises(self):
+    def test_unsupported_kernel_downgrades(self):
+        """A kernel with no owner ``hl.grid`` can't build a compact-worklist
+        plan, but ``pallas_worklist_grouping`` is an independent autotune knob
+        that may still be set on it. Compiling with grouping in (1, 2) must
+        downgrade to a no-op — the generated code contains no compact-worklist
+        builder — rather than raising ``InvalidConfig`` past the autotuner's
+        skip path (which would fail the whole sweep step)."""
+
         def fn(x, y):
             out = torch.empty_like(x)
             for tile in hl.tile(out.size()):
@@ -1081,8 +1583,10 @@ class TestWorklistConfig(unittest.TestCase):
         args = (torch.randn(64, 64), torch.randn(64, 64))
         bound = kernel.bind(args)
         for grouping in (1, 2):
-            with self.subTest(grouping=grouping), self.assertRaises(exc.InvalidConfig):
-                bound.to_triton_code(_worklist_config([16, 16], grouping=grouping))
+            with self.subTest(grouping=grouping):
+                code = bound.to_code(_worklist_config([16, 16], grouping=grouping))
+                self.assertNotIn("_compact_build_worklist=", code)
+                self.assertNotIn("def _build_worklist(", code)
 
     def test_invalid_worklist_grouping_raises(self):
         args = (torch.randn(64, 64), torch.randn(64, 64))
@@ -1148,17 +1652,133 @@ class TestWorklistLoopDispatch(unittest.TestCase):
             kvo,
         )
 
-    def test_unroll_uses_resident_fori(self):
+    @staticmethod
+    def _causal_jagged_args():
+        offsets = _offsets([12, 20, 5, 30])
+        length = int(offsets[-1])
+        return (
+            torch.randn(length, 4, 128),
+            torch.randn(length, 4, 128),
+            torch.randn(length, 4, 128),
+            offsets,
+        )
+
+    def test_dependent_tile_end_preserves_source_range(self):
+        args = self._causal_jagged_args()
+        bound = _causal_jagged_kernel.bind(args)
+        assert bound.host_function is not None
+        with bound.env:
+            plan = detect_compact_worklist_plan(bound.host_function)
+        self.assertTrue(plan.ordered_end_clamped_to_compact)
+        ordered = plan.ordered_axis
+        assert ordered is not None
+        self.assertEqual(
+            ast.unparse(ordered.length),
+            "offsets[seq_idx + 1] - offsets[seq_idx]",
+        )
+
+    def test_sliding_window_preserves_source_range(self):
+        args = self._causal_jagged_args()
+        bound = _sliding_window_jagged_kernel.bind(args)
+        assert bound.host_function is not None
+        with bound.env:
+            plan = detect_compact_worklist_plan(bound.host_function)
+        self.assertEqual(plan.ordered_begin_window, _SLIDING_WINDOW)
+        self.assertTrue(plan.ordered_end_clamped_to_compact)
+        ordered = plan.ordered_axis
+        assert ordered is not None
+        # Both clamps narrow only the compute range; the resident window and
+        # its refills still cover the whole source range.
+        self.assertEqual(ast.unparse(ordered.base), "offsets[seq_idx]")
+        self.assertEqual(
+            ast.unparse(ordered.length),
+            "offsets[seq_idx + 1] - offsets[seq_idx]",
+        )
+
+    def test_sliding_window_composes_with_loop_types_and_grouping(self):
+        args = self._causal_jagged_args()
+        window_begin = (
+            f"jnp.maximum(k_begin_ref[_wid], q_begin_ref[_wid] - {_SLIDING_WINDOW})"
+        )
+        compute_end = (
+            "jnp.minimum(k_begin_ref[_wid] + k_len_ref[_wid], "
+            "q_begin_ref[_wid] + q_extent_ref[_wid])"
+        )
+        for grouping in (1, 2):
+            for loop_type, marker in (
+                ("unroll", "def _dynamic_unroll_body"),
+                ("fori_loop", "jax.lax.fori_loop"),
+                ("emit_pipeline", "pltpu.emit_pipeline"),
+            ):
+                with self.subTest(grouping=grouping, loop_type=loop_type):
+                    code = _sliding_window_jagged_kernel.bind(args).to_triton_code(
+                        _worklist_config([8, 8], grouping=grouping, loop_type=loop_type)
+                    )
+                    self.assertIn(marker, code)
+                    self.assertIn(window_begin, code)
+                    self.assertIn(compute_end, code)
+                    if loop_type == "unroll":
+                        # Resident reads stay window-relative off the source
+                        # start, so a begin past that start needs no rebasing.
+                        self.assertIn("pl.ds(offset_2 - k_begin_ref[_wid]", code)
+
+    def test_dependent_tile_end_composes_with_loop_types_and_grouping(self):
+        args = self._causal_jagged_args()
+        for grouping in (1, 2):
+            for loop_type, marker in (
+                ("unroll", "def _dynamic_unroll_body"),
+                ("fori_loop", "jax.lax.fori_loop"),
+                ("emit_pipeline", "pltpu.emit_pipeline"),
+            ):
+                with self.subTest(grouping=grouping, loop_type=loop_type):
+                    code = _causal_jagged_kernel.bind(args).to_triton_code(
+                        _worklist_config([8, 8], grouping=grouping, loop_type=loop_type)
+                    )
+                    self.assertIn(marker, code)
+                    self.assertIn(
+                        "jnp.minimum(k_begin_ref[_wid] + k_len_ref[_wid], "
+                        "q_begin_ref[_wid] + q_extent_ref[_wid])",
+                        code,
+                    )
+                    if loop_type == "unroll":
+                        self.assertNotIn("pltpu.make_async_copy", code)
+                        self.assertNotIn("dma_semaphore", code)
+                        self.assertNotIn("scratch_0", code)
+
+    def test_unroll_uses_resident_value_carry(self):
         code = _fully_jagged_kernel.bind(self._fully_jagged_args()).to_triton_code(
             _worklist_config([8, 8])
         )
 
-        # A flattened unroll reduction lowers via the resident-cache fori path,
-        # reuses the unified launcher, and keeps q/out in aligned windows. The
-        # transpose-cache structure is covered by TestResidentPrepHoistCodegen.
+        # A flattened unroll reduction uses a dynamic value-carried resident
+        # loop, reuses the unified launcher, and keeps q/out in aligned windows.
+        # The transpose-cache structure is covered by TestResidentPrepHoistCodegen.
+        self.assertIn("def _dynamic_unroll_body", code)
         self.assertIn("lax.fori_loop", code)
         self.assertNotIn("pltpu.emit_pipeline(", code)
+        self.assertNotIn("scratch_0", code)
         self.assertIn("_compact_aligned_arg_indices=", code)
+
+    def test_pre_broadcast_dropped_when_loop_type_cannot_apply_it(self):
+        """The transform widens loop-carried VMEM scratch, which only the
+        streaming lowerings allocate.  Pinning the flag off for "unroll" keeps
+        both settings from autotuning as two configs that generate one kernel.
+        """
+        spec = _fully_jagged_kernel.bind(self._fully_jagged_args()).env.config_spec
+        for loop_type, retained in (
+            ("unroll", False),
+            ("fori_loop", True),
+            ("emit_pipeline", True),
+        ):
+            with self.subTest(loop_type=loop_type):
+                config: dict[str, object] = {
+                    "block_sizes": [8, 8],
+                    "pallas_loop_type": loop_type,
+                    "pallas_worklist_grouping": 1,
+                    "pallas_pre_broadcast": True,
+                }
+                spec.normalize(config)
+                self.assertEqual("pallas_pre_broadcast" in config, retained)
 
     def test_grouping_two_emits_static_compact_variants(self):
         qo = _offsets([12, 20, 5, 30])
@@ -1215,6 +1835,124 @@ class TestWorklistLoopDispatch(unittest.TestCase):
         self.assertNotIn("_rc_prep_refill", code)
         self.assertIn("_compact_ordered_aligned_arg_indices=[]", code)
         self.assertIn("_compact_ordered_window=0", code)
+
+    def test_emit_pipeline_clamps_deferred_mask_kv_loads(self):
+        """Packed streamed KV loads with a proven downstream zero-select mask
+        can clamp to the backing tensor instead of padding it host-side.
+
+        A full-block ``pl.ds`` at a data-dependent offset can run off the end of
+        the last tile, and the fallback for that is ``_ds_pad_dims`` ->
+        ``torch.nn.functional.pad``, i.e. a full copy of every streamed operand
+        on every launch.  Letting the index map choose the SIZE removes the copy;
+        the existing deferred-mask pass proves that the potentially stale tail
+        reaches ``where(mask, value, 0)`` before use.
+        """
+        code = _fully_jagged_kernel.bind(self._fully_jagged_args()).to_triton_code(
+            _worklist_config([8, 8], loop_type="emit_pipeline")
+        )
+
+        self.assertIn("pltpu.emit_pipeline(", code)
+        self.assertIn("pl.BoundedSlice", code)
+        # The streamed inner-loop load clamps its own extent ...
+        self.assertIn("jnp.clip(", code)
+        # ... so the k/v operands no longer need a padded host-side copy.
+        self.assertNotIn("_ds_pad_dims=", code)
+
+    def test_emit_pipeline_masks_packed_bound_beyond_tensor_extent(self):
+        q_offsets = _offsets([8])
+        kv_offsets = _offsets([17])
+        code = _fully_jagged_kernel.bind(
+            (
+                torch.randn(8, 2, 128),
+                torch.randn(7, 2, 128),
+                torch.randn(7, 2, 128),
+                q_offsets,
+                kv_offsets,
+            )
+        ).to_triton_code(
+            _worklist_config([8, 8], loop_type="emit_pipeline", grouping=2)
+        )
+
+        # Keep the short-DMA fast path, but retain a physical extent mask in the
+        # masked branch and require that bound before entering the clean branch.
+        self.assertNotIn("_ds_pad_dims=", code)
+        self.assertIn("jnp.clip(7 -", code)
+        self.assertIn("jnp.minimum(", code)
+        self.assertRegex(code, r"indices_\d+ < 7")
+        self.assertRegex(code, r"_region_clean.*<= 7")
+
+    def test_emit_pipeline_scopes_physical_masks_to_each_alias(self):
+        q = torch.randn(8, 2, 128)
+        backing = torch.randn(15, 2, 128)
+        code = _aliased_ordered_load_kernel.bind(
+            (q, backing, _offsets([8]), _offsets([17]))
+        ).to_triton_code(
+            _worklist_config([8, 8], loop_type="emit_pipeline", grouping=1)
+        )
+
+        mask_lines = [line for line in code.splitlines() if "= jnp.where" in line]
+        short_masks = [line for line in mask_lines if ", short_blk" in line]
+        long_masks = [line for line in mask_lines if ", long_blk" in line]
+        self.assertTrue(short_masks)
+        self.assertTrue(long_masks)
+        for line in short_masks:
+            self.assertIn("< 7", line)
+            self.assertNotIn("< 15", line)
+        for line in long_masks:
+            self.assertIn("< 15", line)
+            self.assertNotIn("< 7", line)
+
+    def test_emit_pipeline_clamp_fails_closed_for_other_accesses(self):
+        offsets = _offsets([12, 20, 5, 30])
+        length = int(offsets[-1])
+        args = (
+            torch.randn(length, 4, 128),
+            torch.randn(length, 4, 128),
+            offsets,
+        )
+        for kernel in (_nested_ordered_load_kernel, _offset_ordered_load_kernel):
+            with self.subTest(kernel=kernel.fn.__name__):
+                code = kernel.bind(args).to_triton_code(
+                    _worklist_config([8, 8], loop_type="emit_pipeline")
+                )
+                self.assertIn("_ds_pad_dims=[(2, 0, 8, 7)]", code)
+                if kernel is _nested_ordered_load_kernel:
+                    self.assertIn("lax.cond", code)
+                    self.assertNotIn("_region_clean", code)
+
+    def test_clean_region_splits_off_the_masked_tail(self):
+        """A proven candidate automatically emits a guarded body pair whose
+        clean branch has the bounds masks of both tiled axes dropped."""
+        config = helion.Config(
+            block_sizes=[8, 8],
+            pallas_loop_type="emit_pipeline",
+            pallas_worklist_grouping=2,
+        )
+        bound = _fully_jagged_kernel.bind(self._fully_jagged_args())
+        code = bound.to_triton_code(config)
+
+        self.assertIn("_region_clean", code)
+        self.assertIn("pl.when(_region_clean)", code)
+        self.assertIn("pl.when(jnp.logical_not(_region_clean))", code)
+
+    def test_clean_region_covers_mask_fill_and_inverted_nesting(self):
+        q, k, v, q_offsets, kv_offsets = self._fully_jagged_args()
+        cases = (
+            (_flash_prep_kernel, (q, k, v, q_offsets, kv_offsets), True),
+            (
+                _kv_owned_jagged_kernel,
+                (q, torch.randn_like(q), torch.randn_like(k), q_offsets, kv_offsets),
+                False,
+            ),
+        )
+        for kernel, args, has_negative_infinity_fill in cases:
+            with self.subTest(kernel=kernel.fn.__name__):
+                code = kernel.bind(args).to_triton_code(
+                    _worklist_config([8, 8], loop_type="emit_pipeline", grouping=2)
+                )
+                self.assertIn("pltpu.emit_pipeline(", code)
+                self.assertIn("_region_clean", code)
+                self.assertEqual("float('-inf')" in code, has_negative_infinity_fill)
 
     def test_default_loop_type_streams_with_fori(self):
         code = _fully_jagged_kernel.bind(self._fully_jagged_args()).to_triton_code(
@@ -1299,6 +2037,49 @@ def _eager_fully_jagged(q, k, v, qo, kvo):
             acc = torch.zeros_like(qb)
         out[a:b] = acc.transpose(0, 1)
     return out
+
+
+def _eager_causal_jagged(q, k, v, offsets):
+    out = torch.empty_like(q)
+    for s in range(len(offsets) - 1):
+        begin, end = int(offsets[s]), int(offsets[s + 1])
+        qb = q[begin:end].transpose(0, 1)
+        kb = k[begin:end].transpose(0, 1)
+        vb = v[begin:end].transpose(0, 1)
+        scores = torch.bmm(qb, kb.transpose(-2, -1))
+        out[begin:end] = torch.bmm(torch.tril(scores), vb).transpose(0, 1)
+    return out
+
+
+def _eager_sliding_window_jagged(q, k, v, offsets, window=_SLIDING_WINDOW):
+    out = torch.empty_like(q)
+    for s in range(len(offsets) - 1):
+        begin, end = int(offsets[s]), int(offsets[s + 1])
+        qb = q[begin:end].transpose(0, 1)
+        kb = k[begin:end].transpose(0, 1)
+        vb = v[begin:end].transpose(0, 1)
+        scores = torch.bmm(qb, kb.transpose(-2, -1))
+        idx = torch.arange(end - begin)
+        delta = idx[:, None] - idx[None, :]
+        keep = (delta >= 0) & (delta <= window)
+        kept = torch.where(keep, scores, torch.zeros_like(scores))
+        out[begin:end] = torch.bmm(kept, vb).transpose(0, 1)
+    return out
+
+
+def _exact_causal_jagged_inputs(offsets, num_heads, head_dim):
+    length = int(offsets[-1])
+    q = torch.ones(length, num_heads, head_dim, dtype=torch.float32)
+    k = torch.zeros_like(q)
+    v = torch.zeros_like(q)
+    tokens = torch.arange(length)
+    heads = torch.arange(num_heads)
+    features = tokens.remainder(head_dim)
+    k[tokens[:, None], heads[None, :], features[:, None]] = 1.0
+    v[tokens[:, None], heads[None, :], features[:, None]] = (
+        (tokens[:, None] + 1) * (heads[None, :] + 1)
+    ).to(torch.float32)
+    return q.to(DEVICE), k.to(DEVICE), v.to(DEVICE)
 
 
 @onlyBackends(["pallas"])
@@ -1457,6 +2238,83 @@ class TestWorklistNumerics(unittest.TestCase):
                 )
                 torch.testing.assert_close(out.cpu(), ref, rtol=2e-2, atol=2e-2)
 
+    def test_causal_dependent_tile_end_matches_eager(self):
+        H, D, block = 2, 128, 8
+        offsets = _offsets([20])
+        q, k, v = _exact_causal_jagged_inputs(offsets, H, D)
+        ref = _eager_causal_jagged(q.cpu(), k.cpu(), v.cpu(), offsets)
+        for grouping in (1, 2):
+            with self.subTest(grouping=grouping):
+                _, out = code_and_output(
+                    _causal_jagged_kernel,
+                    (q, k, v, offsets.to(DEVICE)),
+                    **_worklist_config(
+                        [block, block], loop_type="unroll", grouping=grouping
+                    ),
+                )
+                torch.testing.assert_close(out.cpu(), ref, rtol=0, atol=0)
+
+    def test_sliding_window_matches_eager(self):
+        H, D, block = 2, 128, 8
+        # Longer than the window, so tiles exist that the lookback excludes
+        # entirely -- the case a plain causal clamp would still visit.  Two
+        # sequences so the second rebases off a nonzero resident-window start.
+        offsets = _offsets([40, 24])
+        q, k, v = _exact_causal_jagged_inputs(offsets, H, D)
+        ref = _eager_sliding_window_jagged(q.cpu(), k.cpu(), v.cpu(), offsets)
+        for grouping in (1, 2):
+            with self.subTest(grouping=grouping):
+                _, out = code_and_output(
+                    _sliding_window_jagged_kernel,
+                    (q, k, v, offsets.to(DEVICE)),
+                    **_worklist_config(
+                        [block, block], loop_type="unroll", grouping=grouping
+                    ),
+                )
+                torch.testing.assert_close(out.cpu(), ref, rtol=0, atol=0)
+
+    @skipIfPallasInterpret(
+        "dynamic worklist streaming is validated on real TPU, not Pallas interpret"
+    )
+    def test_sliding_window_streaming_matches_eager(self):
+        H, D, block = 2, 128, 8
+        offsets = _offsets([40, 13])
+        q, k, v = _exact_causal_jagged_inputs(offsets, H, D)
+        ref = _eager_sliding_window_jagged(q.cpu(), k.cpu(), v.cpu(), offsets)
+        for grouping in (1, 2):
+            for loop_type in ("fori_loop", "emit_pipeline"):
+                with self.subTest(grouping=grouping, loop_type=loop_type):
+                    _, out = code_and_output(
+                        _sliding_window_jagged_kernel,
+                        (q, k, v, offsets.to(DEVICE)),
+                        **_worklist_config(
+                            [block, block], loop_type=loop_type, grouping=grouping
+                        ),
+                    )
+                    torch.testing.assert_close(out.cpu(), ref, rtol=0, atol=0)
+
+    @skipIfPallasInterpret(
+        "dynamic worklist streaming is validated on real TPU, not Pallas interpret"
+    )
+    def test_causal_dependent_tile_end_streaming_matches_eager(self):
+        H, D, block = 2, 128, 8
+        offsets = _offsets([20, 13])
+        q, k, v = _exact_causal_jagged_inputs(offsets, H, D)
+        ref = _eager_causal_jagged(q.cpu(), k.cpu(), v.cpu(), offsets)
+        for grouping in (1, 2):
+            for loop_type in ("fori_loop", "emit_pipeline"):
+                with self.subTest(grouping=grouping, loop_type=loop_type):
+                    _, out = code_and_output(
+                        _causal_jagged_kernel,
+                        (q, k, v, offsets.to(DEVICE)),
+                        **_worklist_config(
+                            [block, block],
+                            loop_type=loop_type,
+                            grouping=grouping,
+                        ),
+                    )
+                    torch.testing.assert_close(out.cpu(), ref, rtol=0, atol=0)
+
     def test_dense_kv_empty_batch_zero_grid(self):
         # total_q == 0 => num_work == 0 => dynamic grid=(0,).  End-to-end guard
         # that the empty-batch launch returns an empty output (Mosaic tolerates
@@ -1546,6 +2404,200 @@ class TestWorklistNumerics(unittest.TestCase):
                 torch.testing.assert_close(out.cpu(), ref, rtol=2e-2, atol=2e-2)
 
     @skipIfPallasInterpret(
+        "dynamic worklist streaming is validated on real TPU, not Pallas interpret"
+    )
+    def test_unpacked_ordered_exact_size_uses_zero_oob_rows(self):
+        H, D, block = 2, 128, 8
+        q_offsets = _offsets([9, 7])
+        kv_offsets = _offsets([9, 7])
+        length = int(q_offsets[-1])
+        torch.manual_seed(0)
+        q = torch.randn(length, H, D, device=DEVICE, dtype=torch.bfloat16)
+        k = torch.randn(length, H, D, device=DEVICE, dtype=torch.bfloat16)
+        v = torch.randn(length, H, D, device=DEVICE, dtype=torch.bfloat16)
+
+        padded_k = torch.nn.functional.pad(k.cpu(), (0, 0, 0, 0, 0, 1))
+        padded_v = torch.nn.functional.pad(v.cpu(), (0, 0, 0, 0, 0, 1))
+        ref = torch.empty_like(q.cpu())
+        for seq_idx in range(len(q_offsets) - 1):
+            q_start, q_end = int(q_offsets[seq_idx]), int(q_offsets[seq_idx + 1])
+            kv_start = int(kv_offsets[seq_idx])
+            kv_end = int(kv_offsets[seq_idx + 1]) + 1
+            q_blk = q.cpu()[q_start:q_end].transpose(0, 1)
+            k_blk = padded_k[kv_start:kv_end].transpose(0, 1)
+            v_blk = padded_v[kv_start:kv_end].transpose(0, 1)
+            scores = torch.bmm(q_blk, k_blk.transpose(-2, -1))
+            ref[q_start:q_end] = torch.bmm(scores, v_blk).transpose(0, 1)
+
+        _, out = code_and_output(
+            _unpacked_ordered_kernel,
+            (q, k, v, q_offsets.to(DEVICE), kv_offsets.to(DEVICE)),
+            **_worklist_config([block, block], loop_type="emit_pipeline", grouping=1),
+        )
+        torch.testing.assert_close(out.cpu(), ref, rtol=2e-2, atol=2e-2)
+
+    @skipIfPallasInterpret(
+        "dynamic worklist streaming is validated on real TPU, not Pallas interpret"
+    )
+    def test_packed_ordered_oversized_bound_uses_zero_oob_rows(self):
+        H, D, block = 2, 128, 8
+        q_offsets = _offsets([8])
+        kv_offsets = _offsets([17])
+        torch.manual_seed(2)
+        q = torch.randn(8, H, D, device=DEVICE, dtype=torch.bfloat16)
+        k = torch.randn(7, H, D, device=DEVICE, dtype=torch.bfloat16)
+        v = torch.randn(7, H, D, device=DEVICE, dtype=torch.bfloat16)
+
+        padded_k = torch.nn.functional.pad(k.cpu(), (0, 0, 0, 0, 0, 10))
+        padded_v = torch.nn.functional.pad(v.cpu(), (0, 0, 0, 0, 0, 10))
+        q_blk = q.cpu().transpose(0, 1)
+        k_blk = padded_k.transpose(0, 1)
+        v_blk = padded_v.transpose(0, 1)
+        scores = torch.bmm(q_blk, k_blk.transpose(-2, -1))
+        ref = torch.bmm(scores.to(v_blk.dtype), v_blk).transpose(0, 1)
+
+        code, out = code_and_output(
+            _fully_jagged_kernel,
+            (q, k, v, q_offsets.to(DEVICE), kv_offsets.to(DEVICE)),
+            **_worklist_config([block, block], loop_type="emit_pipeline", grouping=2),
+        )
+        self.assertRegex(code, r"indices_\d+ < 7")
+        torch.testing.assert_close(out.cpu(), ref, rtol=2e-2, atol=2e-2)
+
+    @skipIfPallasInterpret(
+        "dynamic worklist streaming is validated on real TPU, not Pallas interpret"
+    )
+    def test_differing_size_read_aliases_keep_own_physical_bounds(self):
+        H, D, block = 2, 128, 8
+        q = torch.ones(8, H, D, device=DEVICE, dtype=torch.bfloat16)
+        backing_cpu = torch.zeros(15, H, D, dtype=torch.bfloat16)
+        # This row belongs only to the longer view. If its physical mask is
+        # contaminated by the shorter alias's extent, the output becomes zero.
+        backing_cpu[7] = 1
+        backing = backing_cpu.to(DEVICE)
+
+        _, out = code_and_output(
+            _aliased_ordered_load_kernel,
+            (q, backing, _offsets([8]).to(DEVICE), _offsets([17]).to(DEVICE)),
+            **_worklist_config([block, block], loop_type="emit_pipeline", grouping=1),
+        )
+        torch.testing.assert_close(out.cpu(), torch.full_like(q.cpu(), D))
+
+    @skipIfPallasInterpret(
+        "dynamic worklist streaming is validated on real TPU, not Pallas interpret"
+    )
+    def test_clean_region_flash_and_inverted_nesting_match_eager(self):
+        H, D, block = 2, 128, 8
+        q_offsets = _offsets([16, 7])
+        kv_offsets = _offsets([16, 9])
+        lq, lkv = int(q_offsets[-1]), int(kv_offsets[-1])
+        torch.manual_seed(1)
+        q = torch.randn(lq, H, D, device=DEVICE, dtype=torch.bfloat16)
+        k = torch.randn(lkv, H, D, device=DEVICE, dtype=torch.bfloat16)
+        v = torch.randn(lkv, H, D, device=DEVICE, dtype=torch.bfloat16)
+        grad = torch.randn_like(q)
+        template = torch.randn_like(k)
+        config = _worklist_config([block, block], loop_type="emit_pipeline", grouping=2)
+
+        q_cpu, k_cpu, v_cpu = q.cpu(), k.cpu(), v.cpu()
+        flash_ref = torch.empty_like(q_cpu)
+        inverted_ref = torch.empty_like(k_cpu)
+        for seq_idx in range(len(q_offsets) - 1):
+            q_start, q_end = int(q_offsets[seq_idx]), int(q_offsets[seq_idx + 1])
+            kv_start = int(kv_offsets[seq_idx])
+            kv_end = int(kv_offsets[seq_idx + 1])
+            q_blk = q_cpu[q_start:q_end].transpose(0, 1)
+            k_blk = k_cpu[kv_start:kv_end].transpose(0, 1)
+            v_blk = v_cpu[kv_start:kv_end].transpose(0, 1)
+            scores = torch.bmm(q_blk, k_blk.transpose(-2, -1)).float()
+            probabilities = torch.softmax(scores, dim=-1).to(v_cpu.dtype)
+            flash_ref[q_start:q_end] = torch.bmm(probabilities, v_blk).transpose(0, 1)
+
+            contribution = (
+                q_cpu[q_start:q_end].transpose(0, 1)
+                + grad.cpu()[q_start:q_end].transpose(0, 1)
+            ).sum(dim=1, keepdim=True)
+            inverted_ref[kv_start:kv_end] = (
+                template.cpu()[kv_start:kv_end].transpose(0, 1).float()
+                + contribution.float()
+            ).transpose(0, 1)
+
+        flash_code, flash_out = code_and_output(
+            _flash_prep_kernel,
+            (q, k, v, q_offsets.to(DEVICE), kv_offsets.to(DEVICE)),
+            **config,
+        )
+        inverted_code, inverted_out = code_and_output(
+            _kv_owned_jagged_kernel,
+            (
+                q,
+                grad,
+                template,
+                q_offsets.to(DEVICE),
+                kv_offsets.to(DEVICE),
+            ),
+            **config,
+        )
+        self.assertIn("_region_clean", flash_code)
+        self.assertIn("_region_clean", inverted_code)
+        torch.testing.assert_close(flash_out.cpu(), flash_ref, rtol=3e-2, atol=3e-2)
+        torch.testing.assert_close(
+            inverted_out.cpu(), inverted_ref, rtol=2e-2, atol=2e-2
+        )
+
+    @skipIfPallasInterpret(
+        "the zero-row resident DMA path is validated on real TPU, not "
+        "Pallas interpret mode"
+    )
+    def test_fully_jagged_all_empty_kv_matches_zero(self):
+        """Positive Q with globally empty K/V exercises the dummy resident row."""
+        H, D, block = 2, 16, 16
+        qo = _offsets([10, 23, 7, 40])
+        kvo = _offsets([0, 0, 0, 0])
+        lq = int(qo[-1])
+        torch.manual_seed(0)
+        q = torch.randn(lq, H, D, device=DEVICE, dtype=torch.bfloat16)
+        k = torch.empty(0, H, D, device=DEVICE, dtype=torch.bfloat16)
+        v = torch.empty(0, H, D, device=DEVICE, dtype=torch.bfloat16)
+
+        _, out = code_and_output(
+            _fully_jagged_kernel,
+            (q, k, v, qo.to(DEVICE), kvo.to(DEVICE)),
+            **_worklist_config([block, block], loop_type="unroll"),
+        )
+
+        torch.testing.assert_close(out, torch.zeros_like(q), rtol=0, atol=0)
+
+    @skipIfPallasInterpret(
+        "the resident-cache ordered KV path is validated on real TPU, not "
+        "Pallas interpret mode"
+    )
+    def test_grouped_fast_math_mask_elision_matches_eager(self):
+        H, D, block = 2, 16, 16
+        qo = _offsets([10, 23, 7, 40])
+        kvo = _offsets([16, 5, 0, 33])
+        lq, lkv = int(qo[-1]), int(kvo[-1])
+        torch.manual_seed(0)
+        q = torch.randn(lq, H, D, device=DEVICE, dtype=torch.bfloat16)
+        k = torch.randn(lkv, H, D, device=DEVICE, dtype=torch.bfloat16)
+        v = torch.randn(lkv, H, D, device=DEVICE, dtype=torch.bfloat16)
+        ref = _eager_fully_jagged(q.cpu(), k.cpu(), v.cpu(), qo, kvo)
+        kernel = helion.kernel(
+            _fully_jagged_kernel.fn,
+            backend="pallas",
+            static_shapes=True,
+            fast_math=True,
+        )
+
+        code, out = code_and_output(
+            kernel,
+            (q, k, v, qo.to(DEVICE), kvo.to(DEVICE)),
+            **_worklist_config([block, block], loop_type="unroll", grouping=2),
+        )
+        self.assertEqual(code.count("lax.dot_general(scores"), 2)
+        torch.testing.assert_close(out.cpu(), ref, rtol=2e-2, atol=2e-2)
+
+    @skipIfPallasInterpret(
         "the resident-cache ordered KV path is validated on real TPU, not "
         "Pallas interpret mode"
     )
@@ -1589,10 +2641,8 @@ class TestWorklistJaxExport(unittest.TestCase):
     eager result.
     """
 
-    def test_jax_fn_under_jit_matches_eager(self):
-        import jax
-        import jax.numpy as jnp
-
+    def test_jax_fn_under_x64_jit_matches_eager(self) -> None:
+        """A compact worklist kernel runs under an outer x64 JIT."""
         B, H, KV, D, block = 8, 2, 16, 16, 16
         qo = _offsets([10, 23, 7, 40, 0, 16, 33, 5])
         lq = int(qo[-1])
@@ -1606,7 +2656,11 @@ class TestWorklistJaxExport(unittest.TestCase):
             static_shapes=True,
             backend="pallas",
         )
-        out = jax.block_until_ready(jax.jit(kernel.jax_fn)(q, k, v, qod))
+        # Regression: an outer x64 JIT around a compact worklist kernel whose
+        # nested pl.kernel has a dynamic grid bound.
+        with jax.enable_x64(True):
+            out = jax.block_until_ready(jax.jit(kernel.jax_fn)(q, k, v, qod))
+            self.assertTrue(jax.config.jax_enable_x64)
         # jnp reference (dense-KV GDPA) at the kernel's bf16 precision -- stays in
         # JAX, no torch round-trip.
         bounds = qo.tolist()
@@ -1636,9 +2690,11 @@ class TestResidentCacheWindowGuard(unittest.TestCase):
     def _setup(self):
         from jax.experimental.pallas import tpu as pltpu
 
-        from helion.runtime import _compact_raise_if_range_exceeds_window
-        from helion.runtime import _get_vmem_limit_bytes
-        from helion.runtime import compact_ordered_physical_window
+        from helion.runtime.pallas.launcher import (
+            _compact_raise_if_range_exceeds_window,
+        )
+        from helion.runtime.pallas.launcher import _get_vmem_limit_bytes
+        from helion.runtime.pallas.launcher import compact_ordered_physical_window
 
         # Two ordered operands (K/V) large enough that C is VMEM-bound, not
         # clamped to the leading dim (so a source CAN exceed C).
@@ -1647,7 +2703,7 @@ class TestResidentCacheWindowGuard(unittest.TestCase):
         operands = [((total, 4, 128), 2), ((total, 4, 128), 2)]
         c = compact_ordered_physical_window(
             operands,
-            _get_vmem_limit_bytes(pltpu),
+            _get_vmem_limit_bytes(pltpu, False),
             128,
             prep_operands=operands,
         )
@@ -1718,14 +2774,14 @@ class TestOrderedWindowBudget(unittest.TestCase):
     """Resident-cache VMEM budget capacity and derived physical window sizing."""
 
     def _budget(self, operands, vmem=64 * 1024 * 1024, *, prep_operands):
-        from helion.runtime import compact_ordered_budget_capacity
+        from helion.runtime.pallas.launcher import compact_ordered_budget_capacity
 
         return compact_ordered_budget_capacity(
             operands, vmem, prep_operands=prep_operands
         )
 
     def _physical(self, operands, block, vmem=64 * 1024 * 1024, *, prep_operands):
-        from helion.runtime import compact_ordered_physical_window
+        from helion.runtime.pallas.launcher import compact_ordered_physical_window
 
         return compact_ordered_physical_window(
             operands, vmem, block, prep_operands=prep_operands
@@ -1794,8 +2850,12 @@ class TestResidentPrepHoistCodegen(unittest.TestCase):
         )
         self.assertIn("_rc_prep_refill", code)
         self.assertIn("jnp.maximum(_wid - 1, 0)", code)
-        self.assertIn("_rc_num_ordered_tiles", code)
         self.assertIn("_rc_full_ordered_tiles", code)
+        self.assertIn(
+            "_rc_full_ordered_tiles < (kv_len_ref[_wid] + _BLOCK_SIZE_2 - 1) "
+            "// _BLOCK_SIZE_2",
+            code,
+        )
         self.assertNotIn("_rc_full_nkv", code)
         self.assertIn("kv_len_ref[_wid]", code)
         refill_guard = next(
@@ -1830,6 +2890,17 @@ class TestResidentPrepHoistCodegen(unittest.TestCase):
             kvo,
         )
 
+    def _fast_math_resident_code(self, grouping: int) -> str:
+        kernel = helion.kernel(
+            _fully_jagged_kernel.fn,
+            backend="pallas",
+            static_shapes=True,
+            fast_math=True,
+        )
+        return kernel.bind(self._resident_args()).to_triton_code(
+            _worklist_config([8, 8], grouping=grouping)
+        )
+
     def test_resident_prep_zero_fill_load_mask_elided_from_reduction(self):
         # The prep-hoisted resident K load reads a zero-filled cache (the refill writes
         # tail_fill_value=0 once), so its per-tile fill-0 mask is redundant and dropped.
@@ -1840,7 +2911,7 @@ class TestResidentPrepHoistCodegen(unittest.TestCase):
         code = _fully_jagged_kernel.bind(self._resident_args()).to_triton_code(
             _worklist_config([8, 8])
         )
-        body = code[code.index("def _fori_body_0") :]
+        body = code[code.index("def _dynamic_unroll_body") :]
         dot = re.search(r"dot_general\(\w+, (permute_\d+),", body)
         self.assertIsNotNone(dot, "q@kᵀ dot should read a permute operand")
         pvar = dot.group(1)
@@ -1852,12 +2923,42 @@ class TestResidentPrepHoistCodegen(unittest.TestCase):
         self.assertRegex(body, rf"\b{src} = \w+_prep\[")
         self.assertNotRegex(body, rf"\b{src} = jnp\.where")
 
+    def test_fast_math_elides_zero_score_masks_for_both_groupings(self):
+        for grouping in (1, 2):
+            with self.subTest(grouping=grouping):
+                code = self._fast_math_resident_code(grouping)
+                score_masks = [
+                    line
+                    for line in code.splitlines()
+                    if "jnp.where" in line and ", scores" in line
+                ]
+                self.assertEqual(score_masks, [])
+                self.assertEqual(code.count("lax.dot_general(scores"), grouping)
+
+    def test_strict_math_keeps_zero_score_mask(self):
+        code = _fully_jagged_kernel.bind(self._resident_args()).to_triton_code(
+            _worklist_config([8, 8])
+        )
+        score_masks = [
+            line
+            for line in code.splitlines()
+            if "jnp.where" in line and ", scores" in line
+        ]
+        self.assertEqual(len(score_masks), 1)
+        self.assertNotIn("lax.dot_general(scores", code)
+
     def test_flash_resident_prep_keeps_softmax_neg_inf_mask(self):
         # Flash's fill-0 K/V load masks elide (prep cache zeroed), but the amax
         # reduction's softmax mask fills -inf (!= the cache's 0 tail) and is downstream
         # of the dot, so it is preserved.  Assert the score mask specifically: a
         # jnp.where whose fill is a -inf full (not merely the m_i init's -inf full).
-        code = _flash_prep_kernel.bind(self._resident_args()).to_triton_code(
+        kernel = helion.kernel(
+            _flash_prep_kernel.fn,
+            backend="pallas",
+            static_shapes=True,
+            fast_math=True,
+        )
+        code = kernel.bind(self._resident_args()).to_triton_code(
             _worklist_config([8, 8])
         )
         self.assertIn("_rc_prep_refill", code)  # prep cache installed
@@ -2035,7 +3136,9 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
         lq = int(qo[-1])
         args = (torch.randn(lq, 4, 128), torch.randn(lq, 4, 128), qo)
         with (
-            patch("helion.runtime._get_vmem_limit_bytes", return_value=1),
+            patch(
+                "helion.runtime.pallas.launcher._get_vmem_limit_bytes", return_value=1
+            ),
             self.assertRaisesRegex(
                 exc.InvalidConfig, "VMEM budget cannot hold one ordered block"
             ),
@@ -2081,8 +3184,8 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
         lq, lkv = int(qo[-1]), int(kvo[-1])
         args = (
             torch.randn(lq, 4, 128),
-            torch.randn(lkv + 8, 4, 128),  # slack so k_end+1 reads stay in range
-            torch.randn(lkv + 8, 4, 128),
+            torch.randn(lkv, 4, 128),
+            torch.randn(lkv, 4, 128),
             qo,
             kvo,
         )
@@ -2096,6 +3199,10 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
         self.assertIn("_compact_ordered_offset_arg_index=-1", code)
         self.assertIn("_compact_active_mask_arg_index=-1", code)
         self.assertIn("_compact_ordered_window=0", code)
+        # The logical end can exceed the backing K/V extent, so shortening the
+        # DMA would leave a lane that the loop mask considers valid stale.
+        self.assertIn("_ds_pad_dims=[(3, 0, 128, 127), (4, 0, 128, 127)]", code)
+        self.assertNotIn("jnp.clip(50 -", code)
 
     def test_unpacked_ordered_bound_rejects_resident_unroll(self):
         qo = _offsets([12, 20, 5, 30])
@@ -2227,6 +3334,145 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
 
         self.assertEqual(ordered_resident_bound_arg(plan("kvo")), "kvo")
         self.assertIsNone(ordered_resident_bound_arg(plan(None)))
+
+
+@onlyBackends(["pallas"])
+class TestCompactWindowSpec(unittest.TestCase):
+    """The BlockSpec a compact-worklist window is built from.
+
+    The window must clamp its own transfer: a compact/jagged tensor is normally
+    allocated with exactly ``sum(lengths)`` rows, so a fixed full-window
+    transfer reads past the end on the last window of the final range.
+    """
+
+    def _spec(self, rows=200, window=256, start=0):
+        import jax.numpy as jnp
+
+        from helion.runtime.pallas.launcher import _compact_window_block_spec
+
+        t = torch.zeros(rows, 2, 8)
+        starts = jnp.asarray([start], jnp.int32)
+        return _compact_window_block_spec(t, window, 0, (starts,)), rows, window
+
+    def test_window_is_a_self_clamping_bounded_slice(self):
+        """A BoundedSlice block dim lets the index map pick the transfer size,
+        which is what an Element window cannot express."""
+        from jax.experimental import pallas as pl
+
+        spec, _rows, window = self._spec()
+        self.assertIsInstance(spec.block_shape[0], pl.BoundedSlice)
+        self.assertEqual(spec.block_shape[0].block_size, window)
+        # Trailing dims ride along whole.
+        self.assertEqual(tuple(spec.block_shape[1:]), (2, 8))
+
+    def test_transfer_never_leaves_the_tensor(self):
+        """start + size <= rows for every start, including a start past the end.
+
+        Worklist entries past ``num_work`` are padded with a repeated owner but
+        an unbounded group offset, so they can record a start beyond the tensor;
+        the slice has to stay legal for those too.
+        """
+        rows, window = 200, 256
+        for start in (0, 1, rows - window // 2, rows - 1, rows, rows + 10_000):
+            with self.subTest(start=start):
+                spec, _, _ = self._spec(rows=rows, window=window, start=start)
+                sliced = spec.index_map(0)[0]
+                lo = int(sliced.start)
+                size = int(sliced.size)
+                self.assertGreaterEqual(lo, 0)
+                self.assertGreaterEqual(size, 1)
+                self.assertLessEqual(lo + size, rows)
+
+    def test_one_row_operand_slices_that_row(self):
+        """An empty resident operand is padded to one dummy row, so the window
+        has an in-bounds row to slice: ``ds(0, 1)`` rather than ``ds(0, 0)``.
+
+        The row is never read -- an operand is only empty when every ordered
+        range is empty, so the reduction is zero-trip.
+        """
+        spec, _rows, _window = self._spec(rows=1, window=256, start=0)
+        sliced = spec.index_map(0)[0]
+        self.assertEqual(int(sliced.start), 0)
+        self.assertEqual(int(sliced.size), 1)
+
+    def test_zero_row_operand_keeps_a_one_block_window(self):
+        """A zero-row operand must still admit a window.
+
+        Returning 0 would make the resident decision inactive, and
+        ``pallas_loop_type='unroll'`` rejects that outright, so a legal
+        all-empty ordered reduction would stop compiling.
+        """
+        from helion.runtime.pallas.launcher import compact_ordered_physical_window
+
+        vmem = 64 * 1024 * 1024
+        self.assertEqual(
+            compact_ordered_physical_window(
+                [((0, 2, 8), 2)], vmem, 128, prep_operands=[]
+            ),
+            128,
+        )
+
+    def test_full_window_when_it_fits(self):
+        """A window wholly inside the tensor transfers all of it -- the clamp
+        must not shrink transfers that were already in bounds."""
+        spec, _rows, window = self._spec(rows=4096, window=256, start=1000)
+        sliced = spec.index_map(0)[0]
+        self.assertEqual(int(sliced.start), 1000)
+        self.assertEqual(int(sliced.size), window)
+
+
+@onlyBackends(["pallas"])
+class TestZeroRowResidentPadding(unittest.TestCase):
+    """A resident operand with no rows gets exactly one dummy row.
+
+    Positive Q with all-empty KV is a legal zero-trip ordered reduction, but the
+    resident window is opened regardless, so an operand with zero rows would
+    leave it with no in-bounds row to slice.
+    """
+
+    def _pad_dims_and_resident(self, kvlens, block=128):
+        import ast as _ast
+        import re as _re
+
+        qo = _offsets([300, 100])
+        ko = _offsets(kvlens)
+        lq, lk = int(qo[-1]), int(ko[-1])
+        bk = _fully_jagged_kernel.bind(
+            (
+                torch.randn(lq, 2, 8),
+                torch.randn(lk, 2, 8),
+                torch.randn(lk, 2, 8),
+                qo,
+                ko,
+            )
+        )
+        code = bk.to_triton_code(_worklist_config([block, block]))
+
+        def grab(name, default=None):
+            match = _re.search(rf"{name}=(\[[^\]]*\]|\d+)", code)
+            if match is None:
+                return default
+            return _ast.literal_eval(match.group(1))
+
+        return (
+            grab("_ds_pad_dims", []),
+            grab("_compact_ordered_aligned_arg_indices", []),
+        )
+
+    def test_zero_row_kv_pads_one_row_per_resident_operand(self):
+        pad_dims, resident = self._pad_dims_and_resident([0, 0])
+        self.assertTrue(resident, "expected an active resident window for zero-row KV")
+        for arg in resident:
+            # block_size 1 makes the pad formula reduce to extra_pad: one row.
+            self.assertIn((arg, 0, 1, 1), pad_dims)
+
+    def test_non_empty_kv_pads_nothing(self):
+        """The dummy row must be confined to the degenerate case: padding a real
+        operand would copy the whole tensor."""
+        pad_dims, resident = self._pad_dims_and_resident([256, 128])
+        self.assertTrue(resident, "expected an active resident window")
+        for arg in resident:
+            self.assertNotIn((arg, 0, 1, 1), pad_dims)
 
 
 if __name__ == "__main__":

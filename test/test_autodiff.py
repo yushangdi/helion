@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import locale
 import operator
+import os
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -12,7 +14,13 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import skipIfMTIA
 from helion._testing import skipIfNotTriton
+from helion._testing import skipIfRocm
 from helion._testing import skipIfXPU
+from helion.autotuner.effort_profile import _PROFILES
+from helion.autotuner.effort_profile import AutotuneEffortProfile
+from helion.autotuner.effort_profile import DifferentialEvolutionConfig
+from helion.autotuner.effort_profile import PatternSearchConfig
+from helion.autotuner.effort_profile import RandomSearchConfig
 import helion.language as hl
 
 # Triton writes its generated launcher source with the process locale encoding;
@@ -62,7 +70,10 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             grad_shape = shape
         grad_out = torch.randn(*grad_shape, device=DEVICE, dtype=torch.float32)
 
-        kernel_fn.settings.autotune_effort = autotune_effort
+        # Pin the forward call to "none": ``autotune_effort`` targets the
+        # backward kernel (helion.experimental.backward applies it itself), and
+        # imported example kernels would otherwise autotune here.
+        kernel_fn.settings.autotune_effort = "none"
         kernel_fn(*[inp.clone() for inp in inputs])
         result = helion.experimental.backward(
             kernel_fn,
@@ -1156,6 +1167,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             grad_shape=(64, 1),
         )
 
+    @skipIfRocm("backward autotuning times out on ROCm")
     def test_backward_autotune(self):
         @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -1164,14 +1176,33 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
                 out[tile] = torch.sin(x[tile]) * y[tile]
             return out
 
-        self._check_backward(
-            kernel,
-            lambda x, y: torch.sin(x) * y,
-            2,
-            shape=(64, 32),
-            autotune=True,
-            autotune_effort="quick",
+        # The test only needs to prove the backward kernel goes through a real
+        # autotune pass; the stock "quick" profile takes ~30s, so shrink it.
+        tiny_pattern_search = PatternSearchConfig(
+            initial_population=2, copies=1, max_generations=0
         )
+        tiny_profile = AutotuneEffortProfile(
+            pattern_search=tiny_pattern_search,
+            lfbo_pattern_search=tiny_pattern_search,
+            differential_evolution=DifferentialEvolutionConfig(
+                population_size=4, max_generations=1
+            ),
+            random_search=RandomSearchConfig(count=4),
+            rebenchmark_threshold=0.9,  # <1.0 disables the rebenchmark pass
+        )
+        with (
+            patch.dict(_PROFILES, {"quick": tiny_profile}),
+            # Pin the seed so the two-config population is reproducible.
+            patch.dict(os.environ, {"HELION_AUTOTUNE_RANDOM_SEED": "123"}),
+        ):
+            self._check_backward(
+                kernel,
+                lambda x, y: torch.sin(x) * y,
+                2,
+                shape=(64, 32),
+                autotune=True,
+                autotune_effort="quick",
+            )
 
     def test_example_bmm(self):
         from examples.bmm import bmm
@@ -1188,7 +1219,9 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             ],
             grad_shape=(B, M, N),
             rtol=1e-2,
-            atol=1e-2,
+            # A10G TF32 reduction order can leave an isolated gradient element
+            # just above 1e-2 absolute error.
+            atol=2e-2,
         )
 
     def test_example_bmm_square(self):

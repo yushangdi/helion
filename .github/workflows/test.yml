@@ -99,23 +99,14 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
+          restore-cache: true
+          # Pull requests can consume caches published by main/release pushes,
+          # but should not occupy accelerator runners uploading new archives.
+          save-cache: ${{ github.event_name == 'push' }}
 
       - name: Create virtual environment
         run: |
           uv venv --python ${{ matrix.python-version }}
-
-      - name: Get current month
-        id: date
-        run: echo "month=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
-
-      - name: Cache dependencies
-        id: cache
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cache/uv
-            ~/.venv
-          key: ${{ matrix.python-version }}-${{ matrix.runtime-version }}-${{ matrix.pytorch-version }}-${{ matrix.backend }}-${{ hashFiles('.github/workflows/test.yml') }}-${{ steps.date.outputs.month }}
 
       # TPU installs its (pinned) torch via the install-pytorch-for-torchtpu composite
       # action below; every other runtime installs torch here.
@@ -134,7 +125,18 @@ jobs:
             # Default to nightly
             # On OSDC, route nightly through the pypi-cache /whl proxy (deps stay reachable behind the egress firewall) and clear the cache index vars so it wins over the cache default; off OSDC PYPI_CACHE_WHL_URL is unset so we hit download.pytorch.org.
             PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
-            UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U --pre torch --index-url "${PYTORCH_INDEX%/whl/*}/whl/nightly/${{ matrix.runtime-version }}"
+            NIGHTLY_INDEX="${PYTORCH_INDEX%/whl/*}/whl/nightly/${{ matrix.runtime-version }}"
+            UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U --pre torch --index-url "$NIGHTLY_INDEX"
+            if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
+              # Current NVSHMEM wheels no longer contain libnvshmem_device.bc, which
+              # PyTorch's Triton API still requires. Keep Torch's ABI-matched host
+              # library and install only the older wheel's device bitcode separately.
+              NVSHMEM_DEVICE_ROOT="$RUNNER_TEMP/nvshmem-device"
+              UV_DEFAULT_INDEX= UV_INDEX= uv pip install --target "$NVSHMEM_DEVICE_ROOT" --no-deps nvidia-nvshmem-cu13==3.4.5 --index-url "$NIGHTLY_INDEX"
+              NVSHMEM_LIB_DIR="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')/nvidia/nvshmem/lib"
+              cp "$NVSHMEM_DEVICE_ROOT/nvidia/nvshmem/lib/libnvshmem_device.bc" "$NVSHMEM_LIB_DIR/"
+              python -c "from torch.distributed._symmetric_memory._nvshmem_triton import NvshmemLibFinder; print(f'NVSHMEM device library: {NvshmemLibFinder.find_device_library()}')"
+            fi
           fi
 
       - name: Install PyTorch (CPU nightly, pinned for TorchTPU)
@@ -166,11 +168,6 @@ jobs:
           git -C triton checkout ${{ matrix.triton-pin }}
           cd triton/
           uv pip install -r python/requirements.txt
-          # Disable proton on XPU: proton's NVIDIA sources (CuptiApi.cpp, NvtxApi.cpp)
-          # require CUDA headers that are not present on Intel XPU runners.
-          if [ "${{ matrix.alias }}" == "xpu" ]; then
-            export TRITON_BUILD_PROTON=OFF
-          fi
           MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
           cd /tmp/$USER
           rm -rf triton/
@@ -205,7 +202,7 @@ jobs:
         if: matrix.alias == 'pallas-interpret'
         run: |
           source .venv/bin/activate
-          uv pip install 'jax==0.10.1' 'jaxlib==0.10.1' 'absl-py'
+          uv pip install 'jax==0.11.1' 'jaxlib==0.11.1' 'absl-py'
 
       - name: Install CUTLASS CuTe DSL
         if: matrix.backend == 'cute'
@@ -279,10 +276,9 @@ jobs:
 
       - name: Run Tests
         run: |
-          set -o pipefail
+          set -e -o pipefail
           source .venv/bin/activate
           uv pip install pytest-xdist
-          uv pip install pytest-rerunfailures
           # Conditionally enable ref-eager and golden-accept/dtype-assert test modes
           if [[ "${{ matrix.dtype-asserts }}" == "true" ]]; then export HELION_DEBUG_DTYPE_ASSERTS=1; fi
           if [[ "${{ matrix.expecttest-accept }}" == "true" ]]; then export EXPECTTEST_ACCEPT=1; fi
@@ -290,6 +286,9 @@ jobs:
           if [[ "${{ matrix.backend }}" == "tileir" ]]; then export ENABLE_TILE=1; fi
           if [[ "${{ matrix.alias }}" == "pallas-interpret" ]]; then export HELION_PALLAS_INTERPRET=1; fi
           export HELION_BACKEND=${{ matrix.backend }}
+          # Enable numerical reproducibility in MKL. Otherwise results from the
+          # reference implementation can be non-deterministic.
+          export MKL_CBWR=AVX2
           # Disable TorchTPU build cache to prevent running out of disk space.
           export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=disabled
           # -rf: print failed tests
@@ -298,7 +297,11 @@ jobs:
           if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
             TEST_PATH="test/test_examples_dist.py"
             EXTRA_FLAGS="-rs"
-          elif [[ "${{ matrix.alias }}" == "tpu" || "${{ matrix.alias }}" == "pallas-interpret" || "$HELION_BACKEND" == "metal" ]]; then
+          elif [[ "${{ matrix.alias }}" == "tpu" ]]; then
+            TEST_PATH="."
+            EXTRA_FLAGS="--ignore=test/test_examples_dist.py --ignore=test/test_remote_copy.py"
+            PARALLEL=""
+          elif [[ "${{ matrix.alias }}" == "pallas-interpret" || "$HELION_BACKEND" == "metal" ]]; then
             TEST_PATH="."
             EXTRA_FLAGS="--ignore=test/test_examples_dist.py"
             PARALLEL=""
@@ -329,10 +332,21 @@ jobs:
             # worker gets killed mid-compile. Give it headroom.
             TIMEOUT=180
           fi
-          pytest $PARALLEL -rf --timeout=$TIMEOUT --reruns=2 --timeout-method=thread $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
+          pytest $PARALLEL -rf --timeout=$TIMEOUT --timeout-method=thread $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
+          # JAX and TorchTPU initialize the TPU runtime differently. Run the
+          # physical remote-copy suites in fresh, sequential pytest processes.
+          if [[ "${{ matrix.alias }}" == "tpu" ]]; then
+            pytest -rf --timeout=$TIMEOUT --timeout-method=thread test/test_remote_copy.py::TestRemoteCopyJaxRuntime
+            HELION_TEST_TORCH_TPU_MULTIPROCESS=1 pytest -rf --timeout=$TIMEOUT --timeout-method=thread test/test_remote_copy.py::TestRemoteCopyTorchTpuRuntime
+          fi
+          # Each remote-copy test launches one process per GPU, so run this class
+          # serially rather than assigning its tests to concurrent xdist workers.
+          if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
+            pytest -rf --timeout=$TIMEOUT --timeout-method=thread $EXTRA_FLAGS test/test_remote_copy.py::TestRemoteCopyGPU | tee >(eval $SKIP_CHECK)
+          fi
 
   test-notebooks:
-    name: test-notebooks-cu130-py3.12-pytorch-2.9-a10g
+    name: test-notebooks-cu130-py3.12-pytorch-2.13-a10g
 
     container:
       image: nvidia/cuda:13.1.0-devel-ubuntu24.04
@@ -358,6 +372,8 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
+          restore-cache: true
+          save-cache: ${{ github.event_name == 'push' }}
 
       - name: Create virtual environment
         run: |
@@ -367,19 +383,6 @@ jobs:
         run: |
           source .venv/bin/activate
           uv pip install pip
-
-      - name: Get current month
-        id: date
-        run: echo "month=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
-
-      - name: Cache dependencies
-        id: cache
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cache/uv
-            ~/.venv
-          key: notebooks-3.12-cu130-${{ hashFiles('.github/workflows/test.yml') }}-${{ steps.date.outputs.month }}
 
       - name: Install notebook execution tools
         run: |

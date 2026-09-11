@@ -14,7 +14,6 @@ import re
 import tempfile
 from typing import TYPE_CHECKING
 from typing import Any
-from typing import Callable
 from typing import Sequence
 
 import sympy
@@ -26,6 +25,7 @@ from ..backend import _active_loop_block_ids
 from ..backend import _attention_flash_gate_enabled
 from ..backend import _attention_flash_supported
 from ..backend import _attention_softmax_pattern_head_dim
+from ..backend import _grouped_rank3_specialized_mma_plan
 from ..backend import _kernel_specialized_mma_impl
 from ..backend import _kernel_specialized_mma_plan
 from ..backend import _largest_divisor_at_most
@@ -119,7 +119,71 @@ def _detect_mma_loop(
     return False
 
 
-def _detect_specialized_mma_loop(
+def _specialized_mma_root_thread_layout(
+    root_block_ids: Sequence[int], config: Config
+) -> tuple[int, int, int, int] | None:
+    from ..compile_environment import CompileEnvironment
+
+    if len(root_block_ids) != 2:
+        return None
+    env = CompileEnvironment.current()
+    root_block_sizes: list[int] = []
+    root_thread_counts: list[int] = []
+    root_thread_auto: list[bool] = []
+    for block_id in root_block_ids:
+        block_size = env.block_sizes[block_id].from_config(config)
+        if not isinstance(block_size, int):
+            return None
+        root_block_sizes.append(block_size)
+        threads = env.config_spec.num_threads.config_get(
+            config.num_threads, block_id, 0
+        )
+        root_thread_counts.append(threads if threads > 0 else block_size)
+        root_thread_auto.append(threads == 0)
+    if functools.reduce(operator.mul, root_thread_counts, 1) > 1024:
+        for idx in (1, 0):
+            if not root_thread_auto[idx]:
+                continue
+            other_threads = root_thread_counts[1 - idx]
+            next_threads = _largest_divisor_at_most(
+                root_block_sizes[idx], max(1024 // max(other_threads, 1), 1)
+            )
+            root_thread_counts[idx] = next_threads
+            if functools.reduce(operator.mul, root_thread_counts, 1) <= 1024:
+                break
+    return (
+        root_block_sizes[0],
+        root_block_sizes[1],
+        root_thread_counts[0],
+        root_thread_counts[1],
+    )
+
+
+def _specialized_mma_root_threads_support_impl(
+    mma_impl: str,
+    *,
+    bm: int,
+    bn: int,
+    root_m_threads: int,
+    root_n_threads: int,
+) -> bool:
+    from .cute_mma import _mma_active_n_threads
+    from .cute_mma import _tcgen05_root_m_threads
+
+    if mma_impl == "tcgen05":
+        return (
+            _tcgen05_root_m_threads(bm, bn) <= root_m_threads <= bm
+            and bm % root_m_threads == 0
+            and _mma_active_n_threads("tcgen05") <= root_n_threads <= bn
+            and bn % root_n_threads == 0
+            and root_m_threads * root_n_threads <= 1024
+        )
+    return mma_impl in ("warp", "universal") and (
+        root_m_threads == bm and root_n_threads == bn
+    )
+
+
+def _detect_grouped_rank3_specialized_mma_loop(
     fn: DeviceFunction,
     block_ids: list[int],
     *,
@@ -128,11 +192,102 @@ def _detect_specialized_mma_loop(
 ) -> bool:
     from ..compile_environment import CompileEnvironment
     from ..host_function import HostFunction
+    from .cute_mma import _rank3_grouped_root_axes
+
+    device_ir = HostFunction.current().device_ir
+    if len(device_ir.grid_block_ids) != 1 or len(block_ids) != 1:
+        return False
+    root_grid_ids = device_ir.grid_block_ids[0]
+    if any(block_id in root_grid_ids for block_id in block_ids):
+        return False
+    env = CompileEnvironment.current()
+    semantic_block_ids = env.config_spec._tcgen05_matmul_block_ids()
+    axes = None
+    if semantic_block_ids is not None:
+        m_block_id, n_block_id, k_block_id = semantic_block_ids
+        if env.canonical_block_id(k_block_id) == env.canonical_block_id(block_ids[0]):
+            axes = _rank3_grouped_root_axes(
+                env,
+                device_ir,
+                m_block_id=m_block_id,
+                n_block_id=n_block_id,
+                k_block_id=block_ids[0],
+            )
+    if semantic_block_ids is not None and axes is None:
+        return False
+    if axes is not None:
+        segment_root_grid_id = axes.segment_block_id
+        mn_root_grid_ids = [axes.m_block_id, axes.n_block_id]
+    elif len(root_grid_ids) == 2:
+        segment_root_grid_id = None
+        mn_root_grid_ids = root_grid_ids
+    elif len(root_grid_ids) == 3:
+        segment_root_grid_id = root_grid_ids[0]
+        mn_root_grid_ids = root_grid_ids[1:]
+    else:
+        return False
+    if segment_root_grid_id is not None:
+        segment_block = env.block_sizes[segment_root_grid_id].from_config(config)
+        segment_threads = env.config_spec.num_threads.config_get(
+            config.num_threads, segment_root_grid_id, 0
+        )
+        if segment_block != 1 or segment_threads not in (0, 1):
+            return False
+    root_layout = _specialized_mma_root_thread_layout(mn_root_grid_ids, config)
+    if root_layout is None:
+        return False
+    bm, bn, root_m_threads, root_n_threads = root_layout
+    (bk,) = block_sizes
+    if not isinstance(bk, int):
+        return False
+    if not _specialized_mma_root_threads_support_impl(
+        "tcgen05",
+        bm=bm,
+        bn=bn,
+        root_m_threads=root_m_threads,
+        root_n_threads=root_n_threads,
+    ):
+        return False
+
+    for graph_info in fn.codegen.codegen_graphs:
+        if getattr(graph_info, "block_ids", None) != block_ids:
+            continue
+        for node in graph_info.graph.nodes:
+            if (
+                _grouped_rank3_specialized_mma_plan(
+                    node,
+                    fn=fn,
+                    k_block_id=block_ids[0],
+                    bk=bk,
+                    config=config,
+                    env=env,
+                )
+                is not None
+            ):
+                return True
+    return False
+
+
+def _detect_specialized_mma_loop(
+    fn: DeviceFunction,
+    block_ids: list[int],
+    *,
+    block_sizes: Sequence[int | torch.SymInt],
+    config: Config,
+) -> bool:
+    from ..host_function import HostFunction
     from .cute_mma import _choose_mma_impl
-    from .cute_mma import _mma_active_n_threads
     from .cute_mma import _mma_tiles_are_static_full
-    from .cute_mma import _tcgen05_root_m_threads
     from .cute_mma import analyze_cute_mma_node
+    from .cute_mma import ensure_tcgen05_fragment_epilogue_plan
+
+    if _detect_grouped_rank3_specialized_mma_loop(
+        fn,
+        block_ids,
+        block_sizes=block_sizes,
+        config=config,
+    ):
+        return True
 
     device_ir = HostFunction.current().device_ir
     if len(device_ir.grid_block_ids) != 1:
@@ -153,89 +308,29 @@ def _detect_specialized_mma_loop(
                 and candidate.operands.k_block_id == block_ids[0]
                 and _specialized_mma_root_mn_block_ids(candidate, config) is not None
             ):
-                candidates.append(candidate)
+                candidates.append((node, candidate))
     if not candidates:
         return False
 
-    root_mn_block_ids = _specialized_mma_root_mn_block_ids(candidates[0], config)
+    root_mn_block_ids = _specialized_mma_root_mn_block_ids(candidates[0][1], config)
     assert root_mn_block_ids is not None
-
-    env = CompileEnvironment.current()
-    root_block_sizes: list[int] = []
-    root_thread_counts: list[int] = []
-    root_thread_auto: list[bool] = []
-    for block_id in root_mn_block_ids:
-        block_size = env.block_sizes[block_id].from_config(config)
-        if not isinstance(block_size, int):
-            return False
-        root_block_sizes.append(block_size)
-        threads = env.config_spec.num_threads.config_get(
-            config.num_threads, block_id, 0
-        )
-        resolved_threads = threads if threads > 0 else block_size
-        root_thread_counts.append(resolved_threads)
-        root_thread_auto.append(threads == 0)
-
-    if functools.reduce(operator.mul, root_thread_counts, 1) > 1024:
-        for idx in sorted(
-            (i for i, is_auto in enumerate(root_thread_auto) if is_auto),
-            reverse=True,
-        ):
-            other_threads = functools.reduce(
-                operator.mul,
-                (
-                    root_thread_counts[j]
-                    for j in range(len(root_thread_counts))
-                    if j != idx
-                ),
-                1,
-            )
-            if other_threads <= 0:
-                continue
-            thread_budget = max(1024 // other_threads, 1)
-            next_threads = _largest_divisor_at_most(
-                root_block_sizes[idx], thread_budget
-            )
-            root_thread_counts[idx] = next_threads
-            if functools.reduce(operator.mul, root_thread_counts, 1) <= 1024:
-                break
-
+    root_layout = _specialized_mma_root_thread_layout(root_mn_block_ids, config)
+    if root_layout is None:
+        return False
+    bm, bn, root_m_threads, root_n_threads = root_layout
     (bk,) = block_sizes
     if not isinstance(bk, int):
         return False
-    bm, bn = root_block_sizes
-    root_m_threads, root_n_threads = root_thread_counts
     candidates = [
-        candidate
-        for candidate in candidates
+        (node, candidate)
+        for node, candidate in candidates
         if not candidate.operands.has_leading_passthrough
         or _mma_tiles_are_static_full(candidate.operands, bm=bm, bn=bn, bk=bk)
     ]
     if not candidates:
         return False
 
-    def root_threads_support_impl(mma_impl: str) -> bool:
-        if mma_impl == "tcgen05":
-            mma_n_threads = _mma_active_n_threads("tcgen05")
-            min_root_m_threads = _tcgen05_root_m_threads(bm, bn)
-            if (
-                root_m_threads < min_root_m_threads
-                or root_m_threads > bm
-                or bm % root_m_threads != 0
-            ):
-                return False
-            if root_n_threads < mma_n_threads or root_n_threads > bn:
-                return False
-            if bn % root_n_threads != 0:
-                return False
-            return root_m_threads * root_n_threads <= 1024
-        if mma_impl == "warp":
-            return root_m_threads == bm and root_n_threads == bn
-        if mma_impl == "universal":
-            return root_m_threads == bm and root_n_threads == bn
-        return False
-
-    for candidate in candidates:
+    for node, candidate in candidates:
         lhs_val = candidate.operands.lhs.source_fake
         mma_impl = _choose_mma_impl(
             lhs_val.dtype,
@@ -246,10 +341,32 @@ def _detect_specialized_mma_loop(
             input_device=lhs_val.device,
         )
         if candidate.requires_accumulator_seed:
-            if root_threads_support_impl("universal"):
+            if _specialized_mma_root_threads_support_impl(
+                "universal",
+                bm=bm,
+                bn=bn,
+                root_m_threads=root_m_threads,
+                root_n_threads=root_n_threads,
+            ):
                 return True
             continue
-        if mma_impl != "universal" and root_threads_support_impl(mma_impl):
+        if mma_impl != "universal" and _specialized_mma_root_threads_support_impl(
+            mma_impl,
+            bm=bm,
+            bn=bn,
+            root_m_threads=root_m_threads,
+            root_n_threads=root_n_threads,
+        ):
+            if mma_impl == "tcgen05" and not ensure_tcgen05_fragment_epilogue_plan(
+                fn,
+                node,
+                candidate,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                config=config,
+            ):
+                continue
             return True
     return False
 
@@ -376,6 +493,10 @@ def _detect_attention_mma_loop(
     default scalar-fallback path is unchanged while the path is incomplete.
     """
     if not _attention_flash_gate_enabled() or not _attention_flash_supported():
+        return False
+    from ..compile_environment import CompileEnvironment
+
+    if CompileEnvironment.current().config_spec.cute_attention_generic_fallback_enabled:
         return False
     shape = _attention_loop_shape(fn, block_ids, config=config)
     if shape is None:
@@ -679,9 +800,16 @@ _CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS = 600
 class CuteBackend(Backend):
     """CuTe DSL (CUTLASS Python DSL) code generation backend."""
 
+    # Bump when config_value_priors() changes its candidate distribution.
+    config_value_priors_version = 3
+
     @property
     def name(self) -> str:
         return "cute"
+
+    @property
+    def supports_eager_prepared_call(self) -> bool:
+        return True
 
     def validate_environment(self) -> None:
         from .cutedsl_compat import check_cute_backend_requirements
@@ -708,6 +836,13 @@ class CuteBackend(Backend):
         from .strategies import Tcgen05Strategy
         from .tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 
+        async_store_policy_weights: dict[object, float] = {"default": 1.0}
+        if (
+            config_spec is not None
+            and config_spec.cute_l2_evict_last_store_policy_supported
+        ):
+            async_store_policy_weights = {"l2_evict_last": 4.0, "default": 1.0}
+
         priors: dict[str, ValuePrior] = {
             # Generic knobs shared by every cute kernel.
             "num_warps": weighted_choice({8: 4.0, 4: 2.0, 16: 1.0}),
@@ -722,6 +857,16 @@ class CuteBackend(Backend):
                     "persistent_blocked": 1.0,
                 }
             ),
+            # In-place vector state updates: the five-stage/two-row schedule
+            # is the measured B256 winner. Disabled remains represented so
+            # small grids can avoid the shared-memory occupancy cost.
+            "cute_async_load_stages": weighted_choice({5: 4.0, 0: 2.0, 4: 1.0, 3: 1.0}),
+            "cute_async_load_lookahead": weighted_choice({4: 4.0, 3: 1.0, 2: 1.0}),
+            "cute_async_load_group_rows": weighted_choice({2: 4.0, 4: 1.0}),
+            "cute_async_load_cache": weighted_choice({"cg": 4.0, "ca": 1.0}),
+            "cute_async_store_policy": weighted_choice(async_store_policy_weights),
+            "cute_bf16x2_recurrence": weighted_choice({True: 4.0, False: 1.0}),
+            "cute_proven_bounds": weighted_choice({False: 4.0, True: 1.0}),
             # tcgen05 / 2-CTA matmul knobs (absent on non-matmul kernels).
             "tcgen05_cluster_m": weighted_choice({2: 3.0, 1: 1.0}),
             "tcgen05_ab_stages": weighted_choice(
@@ -744,27 +889,7 @@ class CuteBackend(Backend):
             ),
             TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: weighted_choice({True: 3.0, False: 1.0}),
         }
-        if config_spec is not None and config_spec.cute_flash_search_enabled:
-            priors.update(self._cute_flash_config_value_priors(config_spec))
         return priors
-
-    @staticmethod
-    def _cute_flash_config_value_priors(
-        config_spec: ConfigSpec,
-    ) -> dict[str, ValuePrior]:
-        from ...autotuner.config_priors import weighted_choice
-        from .cute_flash import flash_attention_value_prior_weights
-
-        return {
-            key: weighted_choice(weights)
-            for key, weights in flash_attention_value_prior_weights(
-                config_spec._cute_flash_head_dim or 0,
-                config_spec._cute_flash_num_kv,
-                is_causal=config_spec._cute_flash_is_causal,
-                has_kv_tile_pruning=config_spec._cute_flash_has_kv_tile_pruning,
-                requires_ws_overlap=config_spec._cute_flash_requires_ws_overlap,
-            ).items()
-        }
 
     def customize_ast(self, hf: HostFunction) -> None:
         """CuTe-specific AST rewrites that rewrite high-level patterns into
@@ -787,9 +912,35 @@ class CuteBackend(Backend):
         config: Config,
         tile_strategy: TileStrategyDispatch,
     ) -> None:
+        from ..device_function import DeviceFunction
+        from .chunk_prepare import plan_chunk_prepare
+        from .chunk_recurrence import plan_chunk_recurrence
+        from .fixed_token_rank1_recurrence import plan_fixed_token_rank1_recurrence
         from .layout_propagation import plan_layouts
+        from .single_token_rank1_recurrence import plan_single_token_rank1_recurrence
+        from .split_single_token_rank1_recurrence import (
+            plan_split_single_token_rank1_recurrence,
+        )
         from .view_subtile import annotate_view_subtiles
 
+        plan_chunk_prepare(graphs, tile_strategy)
+        if DeviceFunction.current().cute_state.chunk_prepare_plan is not None:
+            return
+        plan_chunk_recurrence(graphs, tile_strategy)
+        if DeviceFunction.current().cute_state.chunk_recurrence_plan is not None:
+            return
+        plan_single_token_rank1_recurrence(graphs, tile_strategy)
+        if DeviceFunction.current().cute_state.single_token_rank1_plan is not None:
+            return
+        split_t1_plan = plan_split_single_token_rank1_recurrence(graphs, tile_strategy)
+        DeviceFunction.current().cute_state.split_single_token_rank1_plan = (
+            split_t1_plan
+        )
+        if split_t1_plan is not None:
+            return
+        plan_fixed_token_rank1_recurrence(graphs, tile_strategy)
+        if DeviceFunction.current().cute_state.fixed_token_rank1_plan is not None:
+            return
         annotate_view_subtiles(graphs, config)
         plan_layouts(graphs, config, tile_strategy)
 
@@ -797,7 +948,17 @@ class CuteBackend(Backend):
         if (
             key == "num_threads"
             or key == "cute_vector_widths"
-            or key.startswith(("tcgen05_", "cute_flash_"))
+            or key == "cute_lane_layouts"
+            or key == "cute_reduction_reloads"
+            or key == "cute_async_store_policy"
+            or key == "cute_bf16x2_recurrence"
+            or key == "cute_proven_bounds"
+            or key == "cute_chunk_recurrence_dv_partitions"
+            or key == "cute_chunk_recurrence_register_cap"
+            or key == "cute_chunk_prepare_schedule"
+            or key == "cute_cluster_n"
+            or key == "cute_min_blocks_per_mp"
+            or key.startswith(("tcgen05_", "cute_flash_", "cute_async_load_"))
         ):
             return True
         return super().supports_config_key(key)
@@ -816,6 +977,8 @@ class CuteBackend(Backend):
             # does not support scalar dereference for its 4-bit type yet, so
             # SIMT scalar loads treat the tensor as raw byte storage.
             return "cutlass.Uint8"
+        if dtype is torch.uint32:
+            return "cutlass.Uint32"
         if dtype is torch.uint64:
             return "cutlass.Int64"
 
@@ -935,6 +1098,18 @@ class CuteBackend(Backend):
                 source.encode("utf-8")
             ).hexdigest()
 
+    def generated_source_hash(self, compiled_fn: object) -> str | None:
+        fn_globals = getattr(compiled_fn, "__globals__", None)
+        fn_name = getattr(compiled_fn, "__name__", None)
+        if not isinstance(fn_globals, dict) or not isinstance(fn_name, str):
+            return None
+        cute_kernel = fn_globals.get(f"_helion_{fn_name}")
+        source_hash = getattr(cute_kernel, "_helion_cute_source_hash", None)
+        return source_hash if isinstance(source_hash, str) else None
+
+    def should_deduplicate_generated_sources(self, config_spec: ConfigSpec) -> bool:
+        return config_spec.cute_flash_search_enabled
+
     def classify_autotune_exception(self, err: BaseException) -> str | None:
         # Exceptions raised from inside the cute/cutlass DSL during compile or
         # launch are expected when an invalid config is tried; treat them as
@@ -950,23 +1125,15 @@ class CuteBackend(Backend):
             return "warn"
         return None
 
-    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
-        # The default Triton do_bench uses CUDA events that mis-time the CuTe
-        # path on Blackwell - launches show up as ~5ms when the kernel is
-        # actually 250ms+. Use synchronized wall-clock timing instead so
-        # autotune scores reflect real performance.
-        from ...autotuner.benchmarking import do_bench_generic
-
-        return do_bench_generic
-
-    def get_interleaved_bench(self) -> Callable[..., list[float]]:
-        # Same rationale as get_do_bench: the default interleaved bench uses
-        # CUDA events that mis-time the CuTe path. Use the synchronized
-        # wall-clock fallback so the autotuner's interleaved compare path
-        # produces real timings.
-        from ...autotuner.benchmarking import interleaved_bench_generic
-
-        return interleaved_bench_generic
+    # Note: this backend intentionally does NOT override get_do_bench /
+    # get_interleaved_bench. CUDA-event timing once mis-read CuTe launches
+    # (~5ms reported for 250ms kernels) because the pre-compiled-launcher
+    # per-call ``@cute.jit`` dispatch path spent ~200ms on the host per
+    # launch; with ``_CompiledCuteLauncher`` kernels launch on the Torch
+    # current stream and event timing matches synchronized wall-clock timing
+    # to <0.1ms on B200 across flash families (including CLC+PDL and
+    # multi-second launches). Event timing avoids charging per-launch host
+    # overhead to the kernel, which the wall path does.
 
     def autotune(
         self,
@@ -1030,9 +1197,16 @@ class CuteBackend(Backend):
                 "from helion._compiler.cute.epilogue_helpers import "
                 "gelu_erf_exact_f32x2 as _cute_gelu_erf_exact_f32x2"
             ),
+            "_cute_sigmoid_approx_ftz_f32": (
+                "from helion._compiler.cute.epilogue_helpers import "
+                "sigmoid_approx_ftz_f32 as _cute_sigmoid_approx_ftz_f32"
+            ),
             "_cute_grouped_reduce_shared_tree": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_tree",
             "_cute_grouped_reduce_shared_two_stage": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage",
             "_cute_grouped_reduce_warp": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_warp",
+            "_cute_grouped_reduce_cluster": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_cluster",
+            "_cute_grouped_reduce_block": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_block",
+            "_cute_grouped_reduce_cluster_online_pair": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_cluster_online_pair",
             "_cute_pre_vec_fold": "from helion._compiler.cute.reduce_helpers import _cute_pre_vec_fold",
             "_cute_store_shared_remote_x4": "from helion._compiler.cute.cluster_helpers import store_shared_remote_x4 as _cute_store_shared_remote_x4",
             "_cute_issue_clc_query_nomulticast": "from helion._compiler.cute.clc_helpers import issue_clc_query_nomulticast as _cute_issue_clc_query_nomulticast",
@@ -1040,6 +1214,26 @@ class CuteBackend(Backend):
             "_cute_fp8e4m3fn_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_to_float32 as _cute_fp8e4m3fn_to_float32",
             "_cute_fp8e4m3fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_x2_to_float32 as _cute_fp8e4m3fn_x2_to_float32",
             "_cute_float4_e2m1fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x2_to_float32 as _cute_float4_e2m1fn_x2_to_float32",
+            "_cute_float4_e2m1fn_x16_to_float16": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x16_to_float16 as _cute_float4_e2m1fn_x16_to_float16",
+            "_cute_bfloat16_x16_to_float16": "from helion._compiler.cute.quantized_helpers import bfloat16_x16_to_float16 as _cute_bfloat16_x16_to_float16",
+            "_cute_store_u16_vec": "from helion._compiler.cute.vec_utils import store_u16_vec as _cute_store_u16_vec",
+            "_cute_store_u32_vec": "from helion._compiler.cute.vec_utils import store_u32_vec as _cute_store_u32_vec",
+            "_cute_rank1_pack_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_pack_bf16x2 as _cute_rank1_pack_bf16x2",
+            "_cute_rank1_mul_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_mul_bf16x2 as _cute_rank1_mul_bf16x2",
+            "_cute_rank1_add_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_add_bf16x2 as _cute_rank1_add_bf16x2",
+            "_cute_rank1_fma_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_fma_bf16x2 as _cute_rank1_fma_bf16x2",
+            "_cute_rank1_load_u32x2_nc": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_load_u32x2_nc as _cute_rank1_load_u32x2_nc",
+            "_cute_rank1_load_f32x4_nc": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_load_f32x4_nc as _cute_rank1_load_f32x4_nc",
+            "_cute_rank1_load_f32_nc": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_load_f32_nc as _cute_rank1_load_f32_nc",
+            "_cute_rank1_load_u16_nc": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_load_u16_nc as _cute_rank1_load_u16_nc",
+            "_cute_rank1_load_i32_nc": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_load_i32_nc as _cute_rank1_load_i32_nc",
+            "_cute_rank1_load_i64_nc": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_load_i64_nc as _cute_rank1_load_i64_nc",
+            "_cute_rank1_load_u32x4_if_valid": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_load_u32x4_if_valid as _cute_rank1_load_u32x4_if_valid",
+            "_cute_rank1_store_u32x4_if_valid": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_store_u32x4_if_valid as _cute_rank1_store_u32x4_if_valid",
+            "_cute_rank1_store_u16_or_zero": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_store_u16_or_zero as _cute_rank1_store_u16_or_zero",
+            "_cute_load_l2_evict_last": "from helion._compiler.cute.l2_policy import load_v16b_l2_evict_last as _cute_load_l2_evict_last",
+            "_cute_store_u16x8_l2_evict_last": "from helion._compiler.cute.l2_policy import store_u16x8_l2_evict_last as _cute_store_u16x8_l2_evict_last",
+            "_cute_store_u32x4_l2_evict_last": "from helion._compiler.cute.l2_policy import store_u32x4_l2_evict_last as _cute_store_u32x4_l2_evict_last",
             "_cute_grid_barrier": "from helion._compiler.cute.grid_barrier import grid_barrier as _cute_grid_barrier",
             "_cute_atomic_max_float32": "from helion._compiler.cute.atomic_helpers import atomic_max_float32 as _cute_atomic_max_float32",
             "_cute_atomic_min_float32": "from helion._compiler.cute.atomic_helpers import atomic_min_float32 as _cute_atomic_min_float32",
@@ -1055,6 +1249,191 @@ class CuteBackend(Backend):
         )
 
         class HelionCuteDSLOpOverrides(CuteDSLOpOverrides):
+            @staticmethod
+            def _ftz_safe_current_node() -> bool:
+                from torch._inductor.virtualized import V
+
+                from .exp2_fastmath import FTZ_SAFE_EXP_META_KEY
+
+                node = V.current_node
+                return node is not None and bool(node.meta.get(FTZ_SAFE_EXP_META_KEY))
+
+            @staticmethod
+            def exp(x: CuteDSLArg) -> CuteDSLArg:
+                # Marked sites (sum(exp(x - amax(x)))) are provably
+                # unaffected by flushing denormal exp outputs; skip the
+                # default lowering's denormal fixup (FSETP + 2 predicated
+                # FMULs per element) — see exp2_fastmath.py.
+                if (
+                    HelionCuteDSLOpOverrides._ftz_safe_current_node()
+                    or HelionCuteDSLOpOverrides._fastmath_on()
+                ):
+                    if CuteDSLOpOverrides._get_cse_var(x) is None:
+                        x = CuteDSLOpOverrides._cast_expr(str(x), torch.float32)
+                    return CuteDSLOpOverrides._apply_unary_op(
+                        x,
+                        f"cute.math.exp2({{x}} * {CuteDSLOpOverrides.LOG2_E}, fastmath=True)",
+                    )
+                return CuteDSLOpOverrides.exp(x)
+
+            @staticmethod
+            def exp2(x: CuteDSLArg) -> CuteDSLArg:
+                if (
+                    HelionCuteDSLOpOverrides._ftz_safe_current_node()
+                    or HelionCuteDSLOpOverrides._fastmath_on()
+                ):
+                    return CuteDSLOpOverrides._apply_unary_op(
+                        x, "cute.math.exp2({x}, fastmath=True)"
+                    )
+                return CuteDSLOpOverrides.exp2(x)
+
+            @staticmethod
+            def _fastmath_on() -> bool:
+                from ..compile_environment import CompileEnvironment
+
+                return CompileEnvironment.current().settings.fast_math
+
+            @staticmethod
+            def _unary_math(x: CuteDSLArg, name: str) -> CuteDSLArg:
+                suffix = (
+                    ", fastmath=True" if HelionCuteDSLOpOverrides._fastmath_on() else ""
+                )
+                return CuteDSLOpOverrides._apply_unary_op(
+                    x, f"cute.math.{name}({{x}}{suffix})"
+                )
+
+            @staticmethod
+            def sqrt(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "sqrt")
+
+            @staticmethod
+            def rsqrt(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "rsqrt")
+
+            @staticmethod
+            def log(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "log")
+
+            @staticmethod
+            def log2(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "log2")
+
+            @staticmethod
+            def log10(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "log10")
+
+            @staticmethod
+            def cos(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "cos")
+
+            @staticmethod
+            def sin(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "sin")
+
+            @staticmethod
+            def tan(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "tan")
+
+            @staticmethod
+            def acos(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "acos")
+
+            @staticmethod
+            def asin(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "asin")
+
+            @staticmethod
+            def atan(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "atan")
+
+            @staticmethod
+            def atan2(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:
+                suffix = (
+                    ", fastmath=True" if HelionCuteDSLOpOverrides._fastmath_on() else ""
+                )
+                return CuteDSLOpOverrides._apply_binary_op(
+                    a, b, f"cute.math.atan2({{a}}, {{b}}{suffix})"
+                )
+
+            @staticmethod
+            def erf(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "erf")
+
+            @staticmethod
+            def tanh(x0: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x0, "tanh")
+
+            @staticmethod
+            # pyrefly: ignore [bad-override]
+            def sigmoid(x: CuteDSLArg) -> CuteDSLArg:
+                # RCP.APPROX + EX2.APPROX, the same sequence triton's default
+                # tl.sigmoid compiles to (one MUFU.EX2 + one MUFU.RCP).  The
+                # base lowering's accurate IEEE div is a ~20-instruction
+                # BRANCHY SASS expansion (BSSY/BSYNC reconvergence per
+                # element) that buys no accuracy here: sigmoid's error is
+                # dominated by the shared x*log2e argument rounding, and both
+                # forms measure max 64 ulp / mean 3.5 ulp vs an fp64
+                # reference on [-87, 87] (identical distributions), with
+                # specials preserved (nan->nan, +-inf->1/0, saturation->0).
+                # Only denormal OUTPUTS differ: this form flushes them to
+                # zero, as triton kernels do by default.  fp16 sigmoid
+                # 67108864: 4943 -> 5805 GB/s (B200, cold autotune).
+                x_cse = CuteDSLOpOverrides._get_cse_var(x)
+                if x_cse is not None:
+                    x_fp32: CuteDSLArg = CuteDSLOpOverrides.to_dtype(
+                        x_cse,
+                        torch.float32,
+                        use_compute_types=False,
+                    )
+                else:
+                    x_fp32 = CuteDSLOpOverrides._cast_expr(str(x), torch.float32)
+                result = CuteDSLOpOverrides._apply_unary_op(
+                    x_fp32,
+                    f"cute.math.rcp(1.0 + cute.math.exp2("
+                    f"-{{x}} * {CuteDSLOpOverrides.LOG2_E}, fastmath=True), "
+                    f"approx=True, ftz=True)",
+                )
+                expected = CuteDSLOpOverrides._expected_tensor_val()
+                expected_dtype = expected.dtype if expected is not None else None
+                if expected_dtype is not None and expected_dtype != torch.float32:
+                    result_cse = CuteDSLOpOverrides._get_cse_var(result)
+                    if result_cse is not None:
+                        return CuteDSLOpOverrides.to_dtype(
+                            result_cse,
+                            expected_dtype,
+                            use_compute_types=False,
+                        )
+                    return CuteDSLOpOverrides._cast_expr(str(result), expected_dtype)
+                return result
+
+            @staticmethod
+            def truediv(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:
+                # cute.math.div lowers to an NVVM intrinsic that only accepts
+                # fp32 scalars; 16/64-bit operands raise at DSL trace time, so
+                # keep the accurate IEEE path for every other dtype.
+                expected = CuteDSLOpOverrides._expected_tensor_val()
+                if (
+                    HelionCuteDSLOpOverrides._fastmath_on()
+                    and expected is not None
+                    and expected.dtype == torch.float32
+                ):
+                    return CuteDSLOpOverrides._apply_binary_op(
+                        a, b, "cute.math.div({a}, {b}, approx=True, ftz=True)"
+                    )
+                return CuteDSLOpOverrides.truediv(a, b)
+
+            @staticmethod
+            def floordiv(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:
+                return CuteDSLOpOverrides._apply_binary_op(a, b, "(({a}) // ({b}))")
+
+            @staticmethod
+            def mod(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:
+                return CuteDSLOpOverrides._apply_binary_op(a, b, "(({a}) % ({b}))")
+
+            @staticmethod
+            def remainder(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides.mod(a, b)
+
             @staticmethod
             def where(
                 condition: CuteDSLArg,
@@ -1110,6 +1489,12 @@ class CuteBackend(Backend):
 
     def lane_offset_expr(self, lane_var: str) -> str:
         return f"cutlass.Int32({lane_var})"
+
+    def thread_index_expr(self, *, axis: int) -> str:
+        from ..compile_environment import CompileEnvironment
+
+        index_dtype = CompileEnvironment.current().index_type()
+        return f"{index_dtype}(cute.arch.thread_idx()[{axis}])"
 
     def sympy_printer_expr(self, expr: sympy.Expr) -> str:
         from .printer import cute_texpr
@@ -1213,12 +1598,28 @@ class CuteBackend(Backend):
     def reduction_axis_first(self) -> bool:
         return True
 
+    def supports_lane_loop_reductions(self) -> bool:
+        return True
+
     def thread_in_tile_mask_expr(
         self, block_size_var: str, *, axis: int = 0
     ) -> str | None:
         return f"cutlass.Int32(cute.arch.thread_idx()[{axis}]) < ({block_size_var})"
 
     def force_tile_mask(self) -> bool:
+        # Masks are elided per-axis when the extent is a known multiple of
+        # the block size (same rule as the Triton backend) AND the launch
+        # cannot run the axis wider than the tile (see
+        # ``launches_surplus_tile_threads``).  Every per-element mask costs
+        # a compare + select in the SIMT lane loop, which is significant
+        # for memory-bound reduction kernels.
+        return False
+
+    def launches_surplus_tile_threads(self) -> bool:
+        # Mutually exclusive kernel sections (e.g. persistent stages around
+        # an ``hl.barrier()``) share one launch whose block dims are the
+        # elementwise max across sections, so a section can run with more
+        # threads on an axis than its own tile is wide.
         return True
 
     def full_expr(
@@ -1336,6 +1737,7 @@ class CuteBackend(Backend):
         *,
         block_size_var: str | None = None,
         threads_in_group: int | None = None,
+        dtype: torch.dtype | None = None,
     ) -> str:
         threads = (
             threads_in_group
@@ -1387,6 +1789,7 @@ class CuteBackend(Backend):
         block_size_var: str | None = None,
         index_dtype: torch.dtype | None = None,
         threads_in_group: int | None = None,
+        dtype: torch.dtype | None = None,
     ) -> str:
         if index_dtype is None:
             raise exc.BackendUnsupported(self.name, "missing index_dtype for argreduce")
@@ -1418,6 +1821,7 @@ class CuteBackend(Backend):
         acc_index: str,
         value: str,
         index: str,
+        dtype: torch.dtype | None = None,
     ) -> list[str]:
         if reduction_type == "argmin":
             better = (
@@ -1446,6 +1850,8 @@ class CuteBackend(Backend):
             return []
 
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
+        from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY
+        from ...autotuner.config_spec import _cute_chunk_recurrence_config_is_safe
         from ..device_function import DeviceFunction
         from ..host_function import HostFunction
         from .thread_budget import MAX_THREADS_PER_BLOCK
@@ -1468,6 +1874,32 @@ class CuteBackend(Backend):
         def launcher_args_with_compile_options(block_arg: str) -> list[str]:
             launcher_args = [block_arg]
             compile_options: list[str] = []
+            recurrence_register_cap = config.get(CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY)
+            if recurrence_register_cap is not None:
+                recurrence_plan = device_function.cute_state.chunk_recurrence_plan
+                if recurrence_plan is None or type(recurrence_register_cap) is not int:
+                    raise exc.BackendUnsupported(
+                        "cute", "invalid matched recurrence register cap"
+                    )
+                if not _cute_chunk_recurrence_config_is_safe(
+                    recurrence_plan.dv_partitions, recurrence_register_cap
+                ):
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        "register caps are unsafe for the TMEM DV2 recurrence "
+                        "schedule's dynamic register allocation",
+                    )
+                compile_options.append(
+                    "--ptxas-options='--override-directive-values "
+                    f"--maxrregcount={recurrence_register_cap}'"
+                )
+            prepare_plan = device_function.cute_state.chunk_prepare_plan
+            if prepare_plan is not None and prepare_plan.schedule.startswith(
+                "split_alias_cpc"
+            ):
+                compile_options.append(
+                    "--ptxas-options='--override-directive-values --maxrregcount=48'"
+                )
             if config.get(TCGEN05_CUBIN_LINEINFO_CONFIG_KEY) is True:
                 compile_options.append("--generate-line-info")
             # ``--enable-tvm-ffi`` is emitted in codegen only when the
@@ -1496,6 +1928,40 @@ class CuteBackend(Backend):
                     f"cute_compile_options={' '.join(compile_options)!r}"
                 )
             return launcher_args
+
+        # The single-token rank-1 path owns the complete physical body.  The
+        # original B1 schedule uses 256 threads while its batched schedule uses
+        # one warp; the structural plan proves which topology was emitted.
+        single_rank1_plan = device_function.cute_state.single_token_rank1_plan
+        if single_rank1_plan is not None:
+            return launcher_args_with_compile_options(
+                f"block=({single_rank1_plan.threads}, 1, 1)"
+            )
+
+        # The split-input T=1 path owns one 32-thread warp per 16 output rows.
+        if device_function.cute_state.split_single_token_rank1_plan is not None:
+            return launcher_args_with_compile_options("block=(32, 1, 1)")
+
+        # The fixed-token grouped rank-1 path owns one physical CTA per
+        # sequence/head/value split and replaces the complete device body.
+        fixed_rank1_plan = device_function.cute_state.fixed_token_rank1_plan
+        if fixed_rank1_plan is not None:
+            fixed_rank1_threads = (
+                128 * fixed_rank1_plan.key_split // fixed_rank1_plan.value_split
+            )
+            return launcher_args_with_compile_options(
+                f"block=({fixed_rank1_threads}, 1, 1)"
+            )
+
+        # The exact chunk-prepare and chunk-recurrence lowerings own their physical
+        # launch topology rather than the carrier's logical tile axes.
+        if device_function.cute_state.chunk_prepare_plan is not None:
+            return launcher_args_with_compile_options("block=(128, 1, 1)")
+        recurrence_plan = device_function.cute_state.chunk_recurrence_plan
+        if recurrence_plan is not None:
+            return launcher_args_with_compile_options(
+                f"block=({recurrence_plan.threads}, 1, 1)"
+            )
 
         # Fused tcgen05 flash-attention: 128 threads (single-warpgroup Stage-3)
         # or 256 threads (Stage-4 warp-spec producer/consumer split). The custom
@@ -1672,14 +2138,15 @@ class CuteBackend(Backend):
                     root_grid_dims[axis] = max(root_grid_dims[axis], size)
         root_static_dims = tuple(root_grid_dims)
         root_static_threads = functools.reduce(operator.mul, root_static_dims, 1)
-        specialized_root_tcgen05 = (
+        recorded_tcgen05_block_shape = device_function.cute_state.block_shape
+        specialized_root_tcgen05 = recorded_tcgen05_block_shape is not None or (
             _kernel_specialized_mma_impl(device_function, config=device_function.config)
             == "tcgen05"
             and root_static_dims != (1, 1, 1)
             and root_static_threads <= MAX_THREADS_PER_BLOCK
         )
         tcgen05_compact_dims = (
-            device_function.cute_state.block_shape if specialized_root_tcgen05 else None
+            recorded_tcgen05_block_shape if specialized_root_tcgen05 else None
         )
         if referenced_dims != (1, 1, 1):
             dims = referenced_dims
@@ -1895,8 +2362,8 @@ class CuteBackend(Backend):
         from ..device_ir import ForLoopGraphInfo
         from ..device_ir import ReductionLoopGraphInfo
         from ..host_function import HostFunction
-        from ..tile_strategy import CuteFlattenedTileStrategy
-        from ..tile_strategy import CuteNDTileStrategy
+        from ..tile_strategy import PerThreadFlattenedTileStrategy
+        from ..tile_strategy import PerThreadNDTileStrategy
 
         env = CompileEnvironment.current()
         device_ir = HostFunction.current().device_ir
@@ -2155,16 +2622,14 @@ class CuteBackend(Backend):
             from .thread_budget import check_thread_limit
 
             # Detect MMA-compatible K-loops: device loops containing
-            # addmm/mm with float16/bfloat16 operands.
+            # addmm/mm with float16/bfloat16 operands.  Metal borrows this
+            # planner but has its own matmul lowering (MPP), and everything
+            # ``mma_mode`` selects -- tcgen05, warpgroups, cute_state -- is
+            # CuTe's, so only run the detectors for CuTe.
             mma_mode = False
-            if is_device_loop:
-                mma_mode = _detect_specialized_mma_loop(
-                    fn,
-                    block_ids,
-                    block_sizes=nd_block_size,
-                    config=config,
-                )
-                if not mma_mode and _detect_attention_mma_loop(
+            detect_mma = self.name == "cute"
+            if is_device_loop and detect_mma:
+                if _detect_attention_mma_loop(
                     fn,
                     block_ids,
                     config=config,
@@ -2175,8 +2640,16 @@ class CuteBackend(Backend):
                     # whole device body; the FX-graph statement walk is bypassed.
                     mma_mode = True
                     fn.cute_state.attention_flash_block_ids = list(block_ids)
+                else:
+                    mma_mode = _detect_specialized_mma_loop(
+                        fn,
+                        block_ids,
+                        block_sizes=nd_block_size,
+                        config=config,
+                    )
             elif (
-                len(device_ir.grid_block_ids) == 1
+                detect_mma
+                and len(device_ir.grid_block_ids) == 1
                 and block_ids == device_ir.grid_block_ids[0]
             ):
                 specialized_mma_plan = _kernel_specialized_mma_plan(fn, config=config)
@@ -2223,7 +2696,7 @@ class CuteBackend(Backend):
                     )
 
             check_thread_limit(static_threads, context=str(tuple(nd_block_size)))
-            return CuteNDTileStrategy(
+            return PerThreadNDTileStrategy(
                 fn,
                 block_ids,
                 block_size=nd_block_size,
@@ -2257,7 +2730,7 @@ class CuteBackend(Backend):
             from .thread_budget import check_thread_limit
 
             check_thread_limit(flat_num_threads, context=str(block_size))
-        return CuteFlattenedTileStrategy(
+        return PerThreadFlattenedTileStrategy(
             fn,
             block_ids,
             block_size=block_size,

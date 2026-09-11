@@ -48,10 +48,43 @@ if TYPE_CHECKING:
     from ..runtime import Config
     from .device_ir import GraphInfo
     from .host_function import HostFunction
-    from .loop_dependency_checker import LoopDependencyChecker
     from .pallas.compact_worklist import ResidentPrepHoist
+    from .pallas.dma import DmaResources
     from .tile_strategy import DeviceLoopOrGridState
     from .type_info import TensorType
+
+
+def _flatten_starred_args(args: list[ast.expr]) -> list[ast.expr]:
+    """Expand ``f(*xs)`` into per-element nodes (``xs[0]``, ``xs[1]``, ...).
+
+    Type propagation flattens starred args the same way (see
+    `TypePropagation.visit_Call`), so host codegen must match it to keep the ast
+    args aligned with the proxy args of an API function.
+    """
+    from .type_info import SequenceType
+
+    if not any(isinstance(arg, ast.Starred) for arg in args):
+        return args
+    result: list[ast.expr] = []
+    for arg in args:
+        if not isinstance(arg, ast.Starred):
+            result.append(arg)
+            continue
+        value = arg.value
+        assert isinstance(value, ExtendedAST)
+        seq_type = value._type_info
+        assert isinstance(seq_type, SequenceType)
+        for i, element_type in enumerate(seq_type.unpack()):
+            result.append(
+                create(
+                    ast.Subscript,
+                    value=value,
+                    slice=create(ast.Constant, value=i, kind=None),
+                    ctx=ast.Load(),
+                    _type_info=element_type,
+                )
+            )
+    return result
 
 
 @dataclasses.dataclass(frozen=True)
@@ -59,17 +92,8 @@ class ResidentPrepLowering:
     hoist: ResidentPrepHoist
     resident_window_name: str
     cache_name: str
-    # The value the refill writes into the cache's padded (out-of-range) tail; it also
-    # serves as the elision key, since a downstream per-tile ``_mask_to`` with this same
-    # fill is then redundant and may be dropped (letting Mosaic fold the transpose into
-    # the matmul push).  Every prep that installs a refill -- all of them today -- must
-    # declare a finite value: ``_emit_resident_prep_refill`` emits it as a bare literal
-    # and asserts it is non-None and finite.  The ``None`` default is a construction guard
-    # only -- a new prep kind that forgets to set a fill is not silently opted into elision
-    # (the elision dict skips ``None``) and trips that refill assert -- NOT a usable "write
-    # a fill but keep the load mask" mode.  Expressing that needs the field split into a
-    # required tail-write value plus an optional (separate) elision fill.
-    tail_fill_value: float | None = None
+    # Fill written to the padded tail and used to identify redundant masks.
+    tail_fill_value: float
 
 
 class GenerateAST(NodeVisitor, CodegenInterface):
@@ -161,8 +185,14 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         ] = {}
         self.grouped_resident_prep_refill_cache: dict[tuple[object, ...], str] = {}
         self.grouped_fori_dma_resource_cache: dict[
-            tuple[object, ...], tuple[str, str]
+            tuple[object, ...], DmaResources
         ] = {}
+        self._statements_by_owner_node_id: dict[
+            int, list[tuple[list[ast.AST], ast.AST]]
+        ] = {}
+        self._track_statement_owners = (
+            CompileEnvironment.current().backend.name == "cute"
+        )
 
         # Now create device function and initialize CodegenInterface
         self.device_function = DeviceFunction(
@@ -218,10 +248,6 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             return loops[-1].strategy.mask_var(block_idx)
         return None
 
-    def _phase_checker(self, root_id: int) -> LoopDependencyChecker:
-        phase_idx = self.host_function.device_ir.phase_for_root(root_id)
-        return self.host_function.device_ir.phases[phase_idx].loop_dependency_checker
-
     def _compute_inter_loop_barriers(self) -> None:
         """Walk every codegen graph; for each pair of consecutive sibling
         ``_for_loop`` / ``_for_loop_step`` nodes, set ``needs_barrier_before``
@@ -276,19 +302,28 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
     def _compute_intra_loop_barriers(self) -> None:
         """Mark loads that read a tensor an earlier store in the same body wrote,
-        so the Triton ``load`` codegen emits a ``tl.debug_barrier()`` before them.
+        so the Triton ``load`` codegen emits a ``tl.debug_barrier()`` before them
+        (the CuTe ``load`` codegen emits ``cute.arch.sync_threads()``).
 
-        Gated on Triton for the same reason as ``_compute_inter_loop_barriers``:
+        TileIR is excluded for the same reason as ``_compute_inter_loop_barriers``:
         ``tl.debug_barrier()`` lowers to ``ttg.barrier`` which the TileIR pass
         pipeline does not legalize.
         """
         from .loop_dependency_checker import mark_intra_loop_raw_barriers
 
         env = CompileEnvironment.current()
-        if env.codegen_name != "triton" or env.backend.name == "tileir":
+        if env.backend.name != "cute" and (
+            env.codegen_name != "triton" or env.backend.name == "tileir"
+        ):
             return
         mark_intra_loop_raw_barriers(
-            self.codegen_graphs, self.host_function.device_ir.root_ids
+            self.codegen_graphs,
+            self.host_function.device_ir.root_ids,
+            # A CuTe SIMT branch condition can vary per thread, and the
+            # convergent ``sync_threads`` barrier deadlocks in a divergent
+            # branch.  Triton branches are uniform per program, so the
+            # barrier is always placeable there.
+            mark_in_divergent_control_flow=env.backend.name != "cute",
         )
 
     def _triton_global_barrier_tensor_names(self, names: frozenset[str]) -> set[str]:
@@ -326,14 +361,112 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 out.add(name)
         return out
 
+    def _clear_attention_flash_state(self) -> None:
+        cute_state = self.device_function.cute_state
+        cute_state.attention_flash_block_ids = None
+        cute_state.attention_flash_score_plan = None
+        cute_state.attention_flash_threads = 128
+
+    def _try_codegen_attention_flash_root(self) -> bool:
+        cute_state = self.device_function.cute_state
+        if cute_state.attention_flash_block_ids is None:
+            return False
+
+        from .cute.cute_flash import codegen_attention_flash
+
+        if codegen_attention_flash(self):
+            return True
+        self._clear_attention_flash_state()
+        raise exc.BackendUnsupported("cute", "flash attention failed late validation")
+
+    def _try_codegen_single_token_rank1_root(self) -> bool:
+        plan = self.device_function.cute_state.single_token_rank1_plan
+        if plan is None:
+            return False
+        from .cute.single_token_rank1_recurrence import (
+            codegen_single_token_rank1_recurrence,
+        )
+
+        if codegen_single_token_rank1_recurrence(self):
+            return True
+        self.device_function.cute_state.single_token_rank1_plan = None
+        raise exc.BackendUnsupported(
+            "cute", "single-token rank-1 recurrence failed late validation"
+        )
+
+    def _try_codegen_split_single_token_rank1_root(self) -> bool:
+        plan = self.device_function.cute_state.split_single_token_rank1_plan
+        if plan is None:
+            return False
+        from .cute.split_single_token_rank1_recurrence import (
+            codegen_split_single_token_rank1_recurrence,
+        )
+
+        if codegen_split_single_token_rank1_recurrence(self, plan):
+            return True
+        self.device_function.cute_state.split_single_token_rank1_plan = None
+        raise exc.BackendUnsupported(
+            "cute", "split single-token rank-1 recurrence failed late validation"
+        )
+
+    def _try_codegen_fixed_token_rank1_root(self) -> bool:
+        plan = self.device_function.cute_state.fixed_token_rank1_plan
+        if plan is None:
+            return False
+        from .cute.fixed_token_rank1_recurrence import (
+            codegen_fixed_token_rank1_recurrence,
+        )
+
+        if codegen_fixed_token_rank1_recurrence(self):
+            return True
+        self.device_function.cute_state.fixed_token_rank1_plan = None
+        raise exc.BackendUnsupported(
+            "cute", "fixed-token rank-1 recurrence failed late validation"
+        )
+
+    def _try_codegen_chunk_prepare_root(self) -> bool:
+        plan = self.device_function.cute_state.chunk_prepare_plan
+        if plan is None:
+            return False
+        from .cute.chunk_prepare import codegen_chunk_prepare
+
+        if codegen_chunk_prepare(self):
+            return True
+        self.device_function.cute_state.chunk_prepare_plan = None
+        raise exc.BackendUnsupported("cute", "chunk prepare failed late validation")
+
+    def _try_codegen_chunk_recurrence_root(self) -> bool:
+        plan = self.device_function.cute_state.chunk_recurrence_plan
+        if plan is None:
+            return False
+        from .cute.chunk_recurrence import codegen_chunk_recurrence
+
+        if codegen_chunk_recurrence(self):
+            return True
+        self.device_function.cute_state.chunk_recurrence_plan = None
+        raise exc.BackendUnsupported("cute", "chunk recurrence failed late validation")
+
     def add_statement(self, stmt: ast.AST | str | None) -> None:
         if stmt is None:
             return
         if isinstance(stmt, str):
             stmt = statement_from_string(stmt)
         self.statements_stack[-1].append(stmt)
+        owner_node = self._statement_owner_fx_node
+        if owner_node is not None and self._track_statement_owners:
+            self._statements_by_owner_node_id.setdefault(id(owner_node), []).append(
+                (self.statements_stack[-1], stmt)
+            )
         self._record_statement_thread_references([stmt])
         self._record_tcgen05_owned_statement(stmt)
+
+    def remove_statements_owned_by_nodes(self, nodes: tuple[Node, ...]) -> None:
+        """Remove statements emitted earlier for exactly these FX nodes."""
+        for node in nodes:
+            entries = self._statements_by_owner_node_id.pop(id(node), ())
+            for body, stmt in entries:
+                with contextlib.suppress(ValueError):
+                    body.remove(stmt)
 
     def _record_tcgen05_owned_statement(self, stmt: ast.AST) -> None:
         owner_node = self._statement_owner_fx_node
@@ -994,9 +1127,6 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             assert not node.orelse
 
             assert node._root_id is not None
-            # Loop dependency checks were already run during lowering; phase checker kept for symmetry/debug.
-            self._phase_checker(node._root_id)
-
             if len(self.host_function.device_ir.root_ids) == 1:
                 body = self.device_function.body
             else:
@@ -1036,8 +1166,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         assert isinstance(iter_node, ast.Call)
                         args = []
                         kwargs = {}
-                        for arg_node in iter_node.args:
-                            assert not isinstance(arg_node, ast.Starred)
+                        for arg_node in _flatten_starred_args(iter_node.args):
                             assert isinstance(arg_node, ExtendedAST)
                             assert arg_node._type_info is not None
                             args.append(arg_node._type_info.proxy())
@@ -1072,28 +1201,44 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         )
 
                         codegen_fn(state)
+                    if isinstance(self.current_grid_state, DeviceGridState):
+                        self.current_grid_state.hoist_parent_statements = (
+                            self.statements_stack[-1]
+                        )
                     root = root_graph_info.graph
-                    grid_state = self.current_grid_state
-                    if isinstance(grid_state, DeviceGridState):
-                        # Codegen the body first so synthetic free-``hl.arange``
-                        # lane loops registered *during* body lowering (CuTe
-                        # over-budget chunking) are visible to the wrap below.
-                        wrapped_body: list[ast.AST] = []
-                        with self.set_statements(wrapped_body):
-                            codegen_call_with_graph(self, root, [])
-                        if grid_state.has_lane_loops():
-                            self.statements_stack[-1].extend(grid_state.outer_prefix)
-                            if self.device_function.cute_state.consume_root_lane_loop_suppression():
-                                self.statements_stack[-1].extend(wrapped_body)
-                            else:
+                    if (
+                        not self._try_codegen_chunk_prepare_root()
+                        and not self._try_codegen_chunk_recurrence_root()
+                        and not self._try_codegen_single_token_rank1_root()
+                        and not self._try_codegen_split_single_token_rank1_root()
+                        and not self._try_codegen_fixed_token_rank1_root()
+                        and not self._try_codegen_attention_flash_root()
+                    ):
+                        grid_state = self.current_grid_state
+                        if isinstance(grid_state, DeviceGridState):
+                            # Codegen the body first so synthetic free-``hl.arange``
+                            # lane loops registered *during* body lowering (CuTe
+                            # over-budget chunking) are visible to the wrap below.
+                            wrapped_body: list[ast.AST] = []
+                            with self.set_statements(wrapped_body):
+                                codegen_call_with_graph(self, root, [])
+                            if grid_state.has_lane_loops():
                                 self.statements_stack[-1].extend(
-                                    grid_state.wrap_body(wrapped_body)
+                                    grid_state.outer_prefix
                                 )
-                            self.statements_stack[-1].extend(grid_state.outer_suffix)
+                                if self.device_function.cute_state.consume_root_lane_loop_suppression():
+                                    self.statements_stack[-1].extend(wrapped_body)
+                                else:
+                                    self.statements_stack[-1].extend(
+                                        grid_state.wrap_body(wrapped_body)
+                                    )
+                                self.statements_stack[-1].extend(
+                                    grid_state.outer_suffix
+                                )
+                            else:
+                                self.statements_stack[-1].extend(wrapped_body)
                         else:
-                            self.statements_stack[-1].extend(wrapped_body)
-                    else:
-                        codegen_call_with_graph(self, root, [])
+                            codegen_call_with_graph(self, root, [])
                 finally:
                     self.current_root_graph_info = previous_root_graph_info
 
@@ -1141,23 +1286,6 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         self.device_function.body = self.device_function.cute_state.move_tcgen05_post_loop_stmts_to_end(
                             list(self.device_function.body)
                         )
-                # Fused tcgen05 flash-attention (HELION_CUTE_FLASH): the
-                # detector set ``attention_flash_block_ids``; replace the
-                # FX-derived scalar body with the dedicated tensor-core flash
-                # kernel that mirrors ``.notes/spikes/fa_tcgen05_spike.py``.
-                if (
-                    self.device_function.cute_state.attention_flash_block_ids
-                    is not None
-                ):
-                    from .cute.cute_flash import codegen_attention_flash
-
-                    if not codegen_attention_flash(self):
-                        # Codegen declined a config the detector could not fully
-                        # vet before the device-function arguments were populated
-                        # (e.g. non-contiguous operands). Clear the flash state so
-                        # the launch override does not force block=(N,1,1) onto
-                        # the scalar fallback body that stays in df.body.
-                        self.device_function.cute_state.attention_flash_block_ids = None
                 # Mark extra params as placeholder args — they appear only in
                 # placeholder strings, not in the AST body, so DCE would
                 # otherwise remove them.
@@ -1182,7 +1310,20 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         )
                     )
                     self.device_function.body = split_lane_loop_reductions(
-                        list(self.device_function.body)
+                        list(self.device_function.body),
+                        uniform_names={
+                            *(
+                                argument.name
+                                for argument in self.device_function.arguments
+                            ),
+                            *self._extra_params,
+                        },
+                        proven_disjoint_tensor_pairs=(
+                            self.device_function.proven_disjoint_tensor_pairs()
+                        ),
+                        proven_tensor_stride_values=(
+                            self.device_function.proven_tensor_stride_values()
+                        ),
                     )
                     # Safety net: revert any lane-reduce marker that neither pass
                     # rewrote so no ``_helion_lane_reduce`` call leaks into the
@@ -1195,7 +1336,12 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     # lane-invariant rescale / chunk-entry stores / final combine
                     # hoisted to run once per chunk (gdn_fwd_h).
                     self.device_function.body = hoist_lane_invariant_chunk_recurrence(
-                        list(self.device_function.body)
+                        list(self.device_function.body),
+                        rename_groups={
+                            name: aliases[0]
+                            for name, aliases in self.device_function._variable_renames.items()
+                        },
+                        running_sums=self.device_function.cute_matmul_running_sums,
                     )
                 self.device_function.dead_code_elimination()
                 if not self.device_function.preamble and not self.device_function.body:
@@ -1241,11 +1387,15 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         elif isinstance(type_info, SequenceType) and all(
             isinstance(x, TileIndexType) for x in type_info.unpack()
         ):
-            values = type_info.unpack()
+            values = [
+                value
+                for value in type_info.unpack()
+                if isinstance(value, TileIndexType)
+            ]
             return expr_from_string(
                 self.host_function.literal_expr(
                     [
-                        self.device_function.resolved_block_size(x.block_id)  # pyrefly: ignore[missing-attribute]
+                        self.device_function.resolved_block_size(x.block_id)
                         for x in values
                     ]
                 )
@@ -1264,8 +1414,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             ast_kwargs = {}
             proxy_args = []
             proxy_kwargs = {}
-            for arg in node.args:
-                assert not isinstance(arg, ast.Starred)
+            for arg in _flatten_starred_args(node.args):
                 assert isinstance(arg, ExtendedAST)
                 assert arg._type_info is not None
                 ast_args.append(arg)
@@ -1318,10 +1467,16 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
     def host_dead_code_elimination(self) -> None:
         dce_vars: OrderedSet[str] = OrderedSet()
+        allow_compiler_shape_helpers = (
+            self.device_function.config.cross_loop_schedule == "static_pipeline"
+        )
         for stmt in self.host_statements:
             if (
                 isinstance(stmt, ast.Assign)
-                and definitely_does_not_have_side_effects(stmt.value)
+                and definitely_does_not_have_side_effects(
+                    stmt.value,
+                    allow_compiler_shape_helpers=allow_compiler_shape_helpers,
+                )
                 and all(isinstance(name, ast.Name) for name in stmt.targets)
             ):
                 for name in stmt.targets:
@@ -1376,6 +1531,8 @@ def generate_ast(
     extra_params: list[str] | None = None,
 ) -> ast.Module:
     with func:
+        env = CompileEnvironment.current()
+        env.cute_resolved_wrapper_plans = []
         if len(func.device_ir.phases) > 1:
             if not str(config.pid_type).startswith("persistent"):
                 raise exc.BarrierRequiresPersistent(config.pid_type)
@@ -1468,7 +1625,14 @@ def generate_ast(
             )
             final_host_statements = rng_statements + codegen.host_statements
             shape_bake_safe_wrapper_only = codegen.cute_wrapper_plans and all(
-                plan.get("kind") in {"helion_small_biased_attention", "helion_flash"}
+                plan.get("kind")
+                in {
+                    "helion_small_biased_attention",
+                    "helion_flash",
+                    "chunk_prepare_tma",
+                    "chunk_recurrence_sm100",
+                    "chunk_recurrence_warp_dv4",
+                }
                 for plan in codegen.cute_wrapper_plans
             )
             if codegen.cute_uses_matmul and not shape_bake_safe_wrapper_only:
@@ -1479,6 +1643,9 @@ def generate_ast(
                     *final_host_statements,
                 ]
             launcher_arg_positions: dict[str, int] | None = None
+            host_arg_positions = {
+                arg.arg: idx for idx, arg in enumerate(func.args.args)
+            }
 
             def resolve_cute_plan_arg_positions(
                 plans: list[dict[str, object]],
@@ -1511,38 +1678,65 @@ def generate_ast(
                         "d_name",
                         "q_name",
                         "k_name",
+                        "g_name",
+                        "beta_name",
+                        "a_log_name",
+                        "dt_name",
+                        "cu_seqlens_name",
+                        "cu_chunks_name",
+                        "chunk_to_seq_name",
+                        "kd_name",
+                        "qd_name",
+                        "ak_name",
+                        "aq_name",
+                        "gt_name",
                         "v_name",
                         "o_name",
+                        "out_name",
+                        "state_name",
                         "lse_name",
                         "bias_name",
                         "alibi_name",
                         "document_name",
+                        "layout_name",
+                        "n_sizes_name",
+                        "k_sizes_name",
+                        "direct_pointers_name",
+                        "direct_strides_name",
+                        "scale_name",
                     ):
                         if key in resolved:
+                            arg_name = str(resolved.pop(key))
                             resolved[key[:-5] + "_idx"] = launcher_arg_positions[
-                                str(resolved.pop(key))
+                                arg_name
                             ]
+                            if key in {"layout_name", "n_sizes_name"} and (
+                                arg_name in host_arg_positions
+                            ):
+                                resolved[key[:-5] + "_bind_idx"] = host_arg_positions[
+                                    arg_name
+                                ]
                     resolved_plans.append(resolved)
                 return resolved_plans
 
+            post_kernel_metadata_statements: list[ast.AST] = []
             resolved_wrapper_plans: list[dict[str, object]] = []
             if codegen.cute_wrapper_plans:
                 resolved_wrapper_plans = resolve_cute_plan_arg_positions(
                     codegen.cute_wrapper_plans
                 )
-                final_host_statements = [
+                env.cute_resolved_wrapper_plans = resolved_wrapper_plans
+                post_kernel_metadata_statements.append(
                     statement_from_string(
                         f"{codegen.device_function.name}._helion_cute_wrapper_plans = {resolved_wrapper_plans!r}"
-                    ),
-                    *final_host_statements,
-                ]
+                    )
+                )
             if codegen.device_function.cute_state.cluster_shape is not None:
-                final_host_statements = [
+                post_kernel_metadata_statements.append(
                     statement_from_string(
                         f"{codegen.device_function.name}._helion_cute_cluster_shape = {codegen.device_function.cute_state.cluster_shape!r}"
-                    ),
-                    *final_host_statements,
-                ]
+                    )
+                )
             # Assert sourceless prologue params were actually removed by DCE
             if codegen.device_function.sourceless_prologue_params:
                 remaining = codegen.device_function.sourceless_prologue_params & {
@@ -1564,15 +1758,19 @@ def generate_ast(
                 call_def = [func.codegen_call_function()]
                 main_def = [emit_main_def()]
 
-            module_body = [
+            module_body: list[ast.stmt] = []
+            for stmt in (
                 *func.codegen_imports(),
                 *codegen.module_statements,
                 *codegen.device_function.codegen_helper_functions(),
                 *kernel_def,
+                *post_kernel_metadata_statements,
                 host_def,
                 *call_def,
                 *main_def,
-            ]
+            ):
+                assert isinstance(stmt, ast.stmt)
+                module_body.append(stmt)
             result = ast.Module(module_body, [])
             existing_imports = {
                 ast.unparse(stmt)

@@ -8,21 +8,25 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import field
+import operator
 from typing import TYPE_CHECKING
+from typing import cast
 
 import sympy
 import torch
 
 from ... import exc
+from .memory_access import tensor_origin_key
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ...runtime.config import Config
     from ..compile_environment import CompileEnvironment
     from ..device_ir import GraphInfo
     from ..host_function import SymbolOrigin
     from ..tile_dispatch import TileStrategyDispatch
-    from .gather import GatherPlan
-    from .gather import ScatterPlan
+    from .memory_access import MemoryAccess
 
 
 @dataclass
@@ -72,19 +76,16 @@ class NonePattern(IndexingPattern):
 class TensorIndexPattern(IndexingPattern):
     """Tensor-valued index - no tiling. Resolved for indirect load/store codegen."""
 
-
-@dataclass
-class IndirectGatherPattern(IndexingPattern):
-    """Indirect gather load ``table[idx, ...]`` - no tiling on this dim."""
-
-    plan: GatherPlan
+    index_ndim: int = 1
 
 
 @dataclass
-class IndirectScatterPattern(IndexingPattern):
-    """Indirect scatter store ``table[idx, ...]`` - no tiling on this dim."""
+class ContiguousRangeIndexPattern(IndexingPattern):
+    """Aligned ``base + arange(length)`` index addressable as one HBM window."""
 
-    plan: ScatterPlan
+    base: int | torch.SymInt | torch.fx.Node
+    length: int
+    alignment: int
 
 
 @dataclass
@@ -99,16 +100,91 @@ class DimensionTiling:
     block_ids: list[int] = field(default_factory=list)
 
 
+REMOTE_SRC_INDEXING_PATTERNS = "pallas_remote_src_indexing_patterns"
+REMOTE_DST_INDEXING_PATTERNS = "pallas_remote_dst_indexing_patterns"
+
+
 def plan_tiling(
     graphs: list[GraphInfo],
     config: Config,
     tile_strategy: TileStrategyDispatch,
 ) -> None:
+    graph_lookup = {graph_info.graph_id: graph_info for graph_info in graphs}
+    parent_ids = _collect_control_flow_parent_ids(graphs)
     for graph_info in graphs:
-        _analyze_indexing_expressions(graph_info, config)
+        local_access_keys = _collect_local_access_keys_with_ancestors(
+            graph_info, graph_lookup, parent_ids
+        )
+        _analyze_indexing_expressions(graph_info, config, local_access_keys)
 
 
-def _analyze_indexing_expressions(graph_info: GraphInfo, config: Config) -> None:
+def _collect_local_access_keys(graph: torch.fx.Graph) -> set[str | int]:
+    from ...language import memory_ops
+    from ...language.atomic_ops import ATOMIC_OPS
+
+    local_access_targets = ATOMIC_OPS | {memory_ops.load, memory_ops.store}
+    local_access_keys: set[str | int] = set()
+    for node in graph.nodes:
+        if node.op != "call_function" or node.target not in local_access_targets:
+            continue
+        tensor_arg = node.args[0]
+        if isinstance(tensor_arg, torch.fx.Node):
+            tensor = tensor_arg.meta.get("val")
+            if isinstance(tensor, torch.Tensor):
+                local_access_keys.add(tensor_origin_key(tensor))
+    return local_access_keys
+
+
+def _collect_control_flow_parent_ids(graphs: list[GraphInfo]) -> dict[int, int]:
+    from ...language import _tracing_ops
+
+    parent_ids: dict[int, int] = {}
+    for graph_info in graphs:
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function":
+                continue
+            child_ids: tuple[object, ...] = ()
+            if _tracing_ops.is_for_loop_target(node.target):
+                child_ids = node.args[:1]
+            elif node.target is _tracing_ops._if:
+                child_ids = node.args[1:3]
+            elif node.target is _tracing_ops._while_loop:
+                child_ids = node.args[:2]
+            for child_id in child_ids:
+                if isinstance(child_id, int):
+                    parent_ids.setdefault(child_id, graph_info.graph_id)
+    return parent_ids
+
+
+def _collect_local_access_keys_with_ancestors(
+    graph_info: GraphInfo,
+    graph_lookup: dict[int, GraphInfo],
+    parent_ids: dict[int, int],
+) -> set[str | int]:
+    """Find local accesses visible to one nested control-flow graph.
+
+    A child loop may communicate through a tensor initialized by its parent, so
+    parent accesses keep that tensor in the resident VMEM view. Accesses in a
+    sibling or later root do not: those require an HBM-backed destination that
+    survives between control-flow regions.
+    """
+    result: set[str | int] = set()
+    current = graph_info
+    visited: set[int] = set()
+    while current.graph_id not in visited:
+        visited.add(current.graph_id)
+        result.update(_collect_local_access_keys(current.graph))
+        parent_id = parent_ids.get(current.graph_id)
+        if parent_id is None:
+            break
+        current = graph_lookup[parent_id]
+    return result
+
+
+def _analyze_indexing_expressions(
+    graph_info: GraphInfo, config: Config, local_access_keys: set[str | int]
+) -> None:
+    from ...language import distributed_ops
     from ...language import memory_ops
     from ...language.atomic_ops import ATOMIC_OPS
 
@@ -116,8 +192,92 @@ def _analyze_indexing_expressions(graph_info: GraphInfo, config: Config) -> None
     for node in graph_info.graph.nodes:
         if node.op != "call_function":
             continue
-        if node.target in indexing_targets:
+        if node.target is distributed_ops.make_async_remote_copy:
+            _analyze_remote_copy(node, config, local_access_keys)
+        elif node.target in indexing_targets:
             _analyze_indexing(node, config)
+
+
+def _analyze_remote_copy(
+    node: torch.fx.Node, config: Config, local_access_keys: set[str | int]
+) -> None:
+    if len(node.args) != 5:
+        raise exc.InternalError(
+            RuntimeError("remote copy was not normalized to its five-argument form")
+        )
+    _analyze_remote_operand(
+        node,
+        node.args[0],
+        node.args[1],
+        config,
+        local_access_keys,
+        REMOTE_SRC_INDEXING_PATTERNS,
+        is_destination=False,
+    )
+    _analyze_remote_operand(
+        node,
+        node.args[3],
+        node.args[4],
+        config,
+        local_access_keys,
+        REMOTE_DST_INDEXING_PATTERNS,
+        is_destination=True,
+    )
+
+
+def _analyze_remote_operand(
+    node: torch.fx.Node,
+    tensor_arg: object,
+    subscript: object,
+    config: Config,
+    local_access_keys: set[str | int],
+    metadata_key: str,
+    *,
+    is_destination: bool,
+) -> None:
+    if not isinstance(tensor_arg, torch.fx.Node):
+        raise exc.InternalError(RuntimeError("remote-copy operand is not an FX node"))
+    if not isinstance(subscript, (list, tuple)):
+        raise exc.InternalError(RuntimeError("remote-copy index is not a sequence"))
+    tensor = tensor_arg.meta.get("val")
+    if not isinstance(tensor, torch.Tensor):
+        raise exc.InternalError(RuntimeError("remote-copy operand is not a tensor"))
+
+    from ..device_function import DeviceFunction
+    from ..device_function import PallasMemorySpace
+
+    device_fn = DeviceFunction.current()
+    tensor_id = id(tensor)
+    tensor_key = tensor_origin_key(tensor)
+    device_fn.mark_pallas_remote_copy_operand(tensor)
+    if tensor_id not in device_fn.pallas_tensor_dim_tilings:
+        device_fn.pallas_tensor_dim_tilings[tensor_id] = [
+            DimensionTiling() for _ in range(tensor.ndim)
+        ]
+    node.meta[metadata_key] = _analyze_subscript_patterns(
+        tensor,
+        list(subscript),
+        device_fn.pallas_tensor_dim_tilings[tensor_id],
+        node,
+        config,
+    )
+
+    if is_destination and tensor_key not in local_access_keys:
+        # A destination that is not locally accessed by this graph must retain
+        # a persistent HBM allocation. This includes route-in-one-loop,
+        # consume-in-a-later-loop pipelines. Once any graph needs persistence,
+        # later local accesses must not downgrade the tensor to VMEM.
+        device_fn.pallas_memory_space[tensor_id] = PallasMemorySpace.HBM
+    elif device_fn.pallas_memory_space.get(tensor_id) != PallasMemorySpace.HBM:
+        # When the same graph both communicates through and computes from a
+        # tensor, its BlockSpec is the symmetric resident region addressed by
+        # the remote copy. Keeping that region in VMEM avoids an unnecessary
+        # HBM round trip and permits immediate consumption after the DMA wait.
+        device_fn.pallas_memory_space[tensor_id] = (
+            PallasMemorySpace.VMEM
+            if tensor_key in local_access_keys
+            else PallasMemorySpace.HBM
+        )
 
 
 def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
@@ -142,8 +302,11 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
     indexing_patterns = _analyze_subscript_patterns(
         tensor_val, list(subscript), dim_tilings, node, config
     )
-    _resolve_tensor_index_patterns(
-        node, tensor_val, list(subscript), indexing_patterns, config
+    from .memory_access import MEMORY_ACCESS_META
+    from .memory_access import build_memory_access
+
+    node.meta[MEMORY_ACCESS_META] = build_memory_access(
+        node, tensor_val, list(subscript), indexing_patterns
     )
     node.meta["indexing_patterns"] = indexing_patterns
 
@@ -161,11 +324,21 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
 
     is_all_scalar = all(
         isinstance(p, (ArbitraryIndexPattern, TileBeginWithOffsetPattern, NonePattern))
+        or (isinstance(p, TensorIndexPattern) and p.index_ndim == 0)
         for p in indexing_patterns
+    )
+    has_contiguous_hbm_window = any(
+        isinstance(pattern, ContiguousRangeIndexPattern)
+        for pattern in indexing_patterns
     )
     tid = id(tensor_val)
     current = device_fn.pallas_memory_space.get(tid)
-    if is_all_scalar:
+    if has_contiguous_hbm_window:
+        # A dynamic contiguous range cannot be represented by a static
+        # BlockSpec. Keep the source argument in HBM and stage exactly the
+        # selected range at its load site.
+        device_fn.pallas_memory_space[tid] = PallasMemorySpace.HBM
+    elif is_all_scalar:
         # Only mark for SMEM if not already assigned to VMEM or HBM
         if current is None:
             device_fn.pallas_memory_space[tid] = PallasMemorySpace.SMEM
@@ -190,30 +363,68 @@ def _analyze_subscript_patterns(
     from ..compile_environment import CompileEnvironment
 
     env = CompileEnvironment.current()
-    patterns: list[IndexingPattern] = []
+    patterns = _detect_subscript_patterns(tensor, subscript, node, config)
     tensor_dim = 0  # Track which tensor dimension we're indexing
+    for pattern in patterns:
+        if isinstance(pattern, NonePattern):
+            continue
+        # Update dim_tilings based on the detected pattern
+        _update_tiling_decision(tensor, pattern, tensor_dim, dim_tilings, env, config)
+        tensor_dim += 1
+    return patterns
 
-    for i, idx in enumerate(subscript):
-        if idx is None:
-            # None adds an unsqueezed dimension but doesn't consume a tensor dimension
+
+def _detect_subscript_patterns(
+    tensor: torch.Tensor,
+    subscript: list[object],
+    node: torch.fx.Node,
+    config: Config | None = None,
+) -> list[IndexingPattern]:
+    """Describe an access without applying config-dependent tiling decisions."""
+    from ..compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    patterns: list[IndexingPattern] = []
+    tensor_dim = 0
+    for position, index in enumerate(subscript):
+        if index is None:
             patterns.append(NonePattern())
             continue
-
         if tensor_dim >= tensor.ndim:
             raise AssertionError(
                 f"Indexing {tensor_dim}th dim but tensor only has {tensor.ndim} dims"
             )
-
-        # Detect different indexing patterns
-        pattern = _detect_indexing_pattern(idx, tensor, tensor_dim, node, i, env)
-        patterns.append(pattern)
-
-        # Update dim_tilings based on the detected pattern
-        _update_tiling_decision(tensor, pattern, tensor_dim, dim_tilings, env, config)
-
+        patterns.append(
+            _detect_indexing_pattern(
+                index,
+                tensor,
+                tensor_dim,
+                node,
+                position,
+                env,
+                config,
+            )
+        )
         tensor_dim += 1
-
     return patterns
+
+
+def build_pallas_memory_access(node: torch.fx.Node) -> MemoryAccess:
+    """Build shared memory metadata before config-dependent tiling is available."""
+    from .memory_access import build_memory_access
+
+    tensor_node, raw_subscript = node.args[:2]
+    assert isinstance(tensor_node, torch.fx.Node)
+    assert isinstance(raw_subscript, (list, tuple))
+    tensor = tensor_node.meta.get("val")
+    assert isinstance(tensor, torch.Tensor)
+    subscript = list(cast("list[object] | tuple[object, ...]", raw_subscript))
+    return build_memory_access(
+        node,
+        tensor,
+        subscript,
+        _detect_subscript_patterns(tensor, subscript, node),
+    )
 
 
 def _is_supported_slice(idx: slice) -> bool:
@@ -231,6 +442,242 @@ def _is_supported_slice(idx: slice) -> bool:
     return True
 
 
+def _is_scalar_value(value: object) -> bool:
+    if isinstance(value, (int, torch.SymInt)):
+        return True
+    if isinstance(value, torch.fx.Node):
+        value = value.meta.get("val")
+    return isinstance(value, (int, torch.SymInt)) or (
+        isinstance(value, torch.Tensor) and value.ndim == 0
+    )
+
+
+def _constant_int(value: object) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, torch.fx.Node):
+        node_value = value.meta.get("val")
+        if isinstance(node_value, int):
+            return node_value
+    return None
+
+
+def _is_proven_multiple(value: object, alignment: int, config: Config | None) -> bool:
+    """Conservatively prove that a scalar FX expression is alignment-multiple."""
+    constant = _constant_int(value)
+    if constant is not None:
+        return constant % alignment == 0
+
+    symbolic_value = (
+        value.meta.get("val") if isinstance(value, torch.fx.Node) else value
+    )
+    if isinstance(value, torch.fx.Node) and isinstance(symbolic_value, torch.SymInt):
+        from ...language import _tracing_ops
+        from ..compile_environment import CompileEnvironment
+
+        if value.target is _tracing_ops._get_symnode:
+            return (
+                CompileEnvironment.current().size_hint(symbolic_value) % alignment == 0
+            )
+    tile_begin = _maybe_get_tile_begin_with_offset_info(symbolic_value)
+    if (
+        config is not None
+        and tile_begin is not None
+        and isinstance(tile_begin.offset, int)
+    ):
+        from ..compile_environment import CompileEnvironment
+
+        block_size = (
+            CompileEnvironment.current()
+            .block_sizes[tile_begin.block_id]
+            .from_config(config)
+        )
+        return (
+            isinstance(block_size, int)
+            and block_size % alignment == 0
+            and tile_begin.offset % alignment == 0
+        )
+    if isinstance(symbolic_value, torch.SymInt):
+        from ..compile_environment import CompileEnvironment
+        from ..compile_environment import _symint_expr
+        from ..host_function import HostFunction
+
+        expression = _symint_expr(symbolic_value)
+        if expression is not None and all(
+            (origin := HostFunction.current().expr_to_origin.get(symbol)) is not None
+            and origin.origin.is_host()
+            for symbol in expression.free_symbols
+        ):
+            return (
+                CompileEnvironment.current().size_hint(symbolic_value) % alignment == 0
+            )
+    if not isinstance(value, torch.fx.Node) or value.op != "call_function":
+        return False
+
+    if value.target in (
+        operator.add,
+        torch.ops.aten.add.Scalar,
+        torch.ops.aten.add.Tensor,
+    ):
+        if value.kwargs.get("alpha", 1) != 1:
+            return False
+        return all(
+            _is_proven_multiple(arg, alignment, config) for arg in value.args[:2]
+        )
+    if value.target in (
+        operator.sub,
+        torch.ops.aten.sub.Scalar,
+        torch.ops.aten.sub.Tensor,
+    ):
+        if value.kwargs.get("alpha", 1) != 1:
+            return False
+        return all(
+            _is_proven_multiple(arg, alignment, config) for arg in value.args[:2]
+        )
+    if value.target in (
+        operator.mul,
+        torch.ops.aten.mul.Scalar,
+        torch.ops.aten.mul.Tensor,
+    ):
+        lhs, rhs = value.args[:2]
+        return _is_proven_multiple(lhs, alignment, config) or _is_proven_multiple(
+            rhs, alignment, config
+        )
+    return False
+
+
+def _may_be_aligned_tile_begin(value: object, alignment: int) -> bool:
+    """Return whether a tile begin has an alignment-compatible configuration.
+
+    Config-independent memory-access discovery runs before a concrete block size
+    is selected.  At that point, recognize a tile begin as a possible direct
+    HBM window when at least one legal block size provides the required
+    alignment.  The config-specific pass still calls ``_is_proven_multiple``
+    and rejects configurations that do not provide it.
+    """
+    symbolic_value = (
+        value.meta.get("val") if isinstance(value, torch.fx.Node) else value
+    )
+    tile_begin = _maybe_get_tile_begin_with_offset_info(symbolic_value)
+    if (
+        tile_begin is None
+        or not isinstance(tile_begin.offset, int)
+        or tile_begin.offset % alignment != 0
+    ):
+        return False
+
+    from ..compile_environment import CompileEnvironment
+    from ..compile_environment import FixedBlockSizeSource
+
+    env = CompileEnvironment.current()
+    block_id = env.canonical_block_id(tile_begin.block_id)
+    source = env.block_sizes[block_id].block_size_source
+    if isinstance(source, FixedBlockSizeSource):
+        block_size = env.try_concretize_symint(source.value)
+        return isinstance(block_size, int) and block_size % alignment == 0
+    try:
+        spec = env.config_spec.block_sizes.block_id_lookup(block_id)
+    except KeyError:
+        return False
+    # Block-size choices are powers of two.  Therefore a maximum at least as
+    # large as this power-of-two alignment guarantees that an aligned choice
+    # exists in the search space.
+    return spec.max_size >= alignment
+
+
+def _iota_length(node: object) -> int | None:
+    if (
+        not isinstance(node, torch.fx.Node)
+        or node.op != "call_function"
+        or node.target is not torch.ops.prims.iota.default
+    ):
+        return None
+    start = node.kwargs.get("start", 0)
+    step = node.kwargs.get("step", 1)
+    if start != 0 or step != 1 or len(node.args) != 1:
+        return None
+    length = node.args[0]
+    if isinstance(length, torch.fx.Node):
+        length = length.meta.get("val")
+    if isinstance(length, torch.SymInt):
+        from ..compile_environment import CompileEnvironment
+
+        length = CompileEnvironment.current().size_hint(length)
+    return length if isinstance(length, int) and length > 0 else None
+
+
+def _match_contiguous_range_index(
+    node: torch.fx.Node,
+    tensor: torch.Tensor,
+    tensor_dim: int,
+    load_value: object,
+    config: Config | None,
+) -> ContiguousRangeIndexPattern | None:
+    """Match an aligned scalar base plus an explicit unit-stride ``hl.arange``."""
+    from ..host_function import HostFunction
+
+    origin = HostFunction.current().tensor_to_origin.get(tensor)
+    if (
+        origin is None
+        or node.op != "call_function"
+        or node.target
+        not in (operator.add, torch.ops.aten.add.Scalar, torch.ops.aten.add.Tensor)
+        or len(node.args) != 2
+        or node.kwargs.get("alpha", 1) != 1
+    ):
+        return None
+    if not isinstance(load_value, torch.Tensor):
+        return None
+    from ..compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    load_shape = tuple(
+        env.size_hint(size) if isinstance(size, torch.SymInt) else size
+        for size in load_value.shape
+    )
+    if not all(isinstance(size, int) for size in load_shape):
+        return None
+    from .dma import is_tpu_dma_aligned_shape
+
+    if not is_tpu_dma_aligned_shape(load_shape, tensor.dtype):
+        return None
+    bitwidth = min(tensor.dtype.itemsize * 8, 32)
+    if tensor.ndim == 1:
+        alignment = 128 * (32 // bitwidth)
+    elif tensor_dim == tensor.ndim - 1:
+        alignment = 128
+    elif tensor_dim == tensor.ndim - 2:
+        alignment = 8
+    else:
+        alignment = 1
+    lhs, rhs = node.args
+    for base, iota in ((lhs, rhs), (rhs, lhs)):
+        length = _iota_length(iota)
+        if length is None or length % alignment != 0:
+            continue
+        if not isinstance(base, (int, torch.SymInt, torch.fx.Node)):
+            continue
+        if not _is_scalar_value(base):
+            continue
+        aligned = _is_proven_multiple(base, alignment, config)
+        if config is None and not aligned:
+            aligned = _may_be_aligned_tile_begin(base, alignment)
+        if not aligned:
+            continue
+        value = node.meta.get("val")
+        if (
+            isinstance(value, torch.Tensor)
+            and value.ndim == 1
+            and value.shape[0] == length
+        ):
+            return ContiguousRangeIndexPattern(
+                base=base,
+                length=length,
+                alignment=alignment,
+            )
+    return None
+
+
 def _detect_indexing_pattern(
     idx: object,
     tensor: torch.Tensor,
@@ -238,6 +685,7 @@ def _detect_indexing_pattern(
     node: torch.fx.Node,
     subscript_index: int,
     env: CompileEnvironment,
+    config: Config | None = None,
 ) -> IndexingPattern:
     """Detect the specific indexing pattern for a subscript element."""
     from ..indexing_strategy import _get_tile_with_offset_info
@@ -268,10 +716,23 @@ def _detect_indexing_pattern(
                 block_id=tile_begin_with_offset.block_id,
                 offset=tile_begin_with_offset.offset,
             )
+        from ...language import memory_ops
+
+        if node.target is memory_ops.load:
+            contiguous_range = _match_contiguous_range_index(
+                idx,
+                tensor,
+                tensor_dim,
+                node.meta.get("val"),
+                config,
+            )
+            if contiguous_range is not None:
+                return contiguous_range
+
         # A tensor-valued index that didn't match any arithmetic-of-tile
         # pattern is an indirect gather (e.g. table[idx, :]).
         if isinstance(idx_val, torch.Tensor):
-            return TensorIndexPattern()
+            return TensorIndexPattern(index_ndim=idx_val.ndim)
         # Indices produced by other FX nodes, such as indices[tile] used in
         # tensor-indexed atomics, are legal but cannot participate in Pallas
         # tiling.
@@ -332,7 +793,10 @@ def _update_tiling_decision(
             # bounded slice: fixed subrange of the dim, must stay untiled
             _disallow_tiling()
 
-    elif isinstance(pattern, (ArbitraryIndexPattern, TensorIndexPattern)):
+    elif isinstance(
+        pattern,
+        (ArbitraryIndexPattern, ContiguousRangeIndexPattern, TensorIndexPattern),
+    ):
         _disallow_tiling()
 
     elif isinstance(pattern, NonePattern):
@@ -374,14 +838,77 @@ def resident_block_elements(
         ``block_size``, clamped to the full dim extent.
       - ``TileBeginWithOffsetPattern`` / ``ArbitraryIndexPattern``: scalar
         index, contributes 1.
-      - Anything else (full slice, indirect tensor index): the full dim
-        extent.
+      - ``ContiguousRangeIndexPattern``: its fixed range length.
+      - Anything else (full slice, indirect tensor index): the full dim extent.
 
     Returns ``None`` if any consumed dim is symbolic.
     """
     from ..compile_environment import CompileEnvironment
 
     env = CompileEnvironment.current()
+    return _resident_block_elements(
+        tensor,
+        patterns,
+        lambda block_id: env.block_sizes[block_id].from_config(config),
+    )
+
+
+def minimum_resident_block_elements(
+    node: torch.fx.Node,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    block_size_minimums: dict[int, int],
+) -> int | None:
+    """Minimum resident elements permitted by any block-size configuration."""
+    from ..compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    patterns: list[IndexingPattern] = []
+    tensor_dim = 0
+    for position, index in enumerate(subscript):
+        if tensor_dim >= tensor.ndim:
+            return None
+        pattern = _detect_indexing_pattern(
+            index,
+            tensor,
+            tensor_dim,
+            node,
+            position,
+            env,
+        )
+        patterns.append(pattern)
+        if not isinstance(pattern, NonePattern):
+            tensor_dim += 1
+    patterns.extend(
+        ArbitrarySlicePattern(slice(None)) for _ in range(tensor_dim, tensor.ndim)
+    )
+
+    def minimum_block_size(block_id: int) -> int:
+        from ..compile_environment import FixedBlockSizeSource
+
+        canonical_id = env.canonical_block_id(block_id)
+        if minimum := block_size_minimums.get(canonical_id):
+            return minimum
+        source = env.block_sizes[canonical_id].block_size_source
+        if isinstance(source, FixedBlockSizeSource):
+            value = env.try_concretize_symint(source.value)
+            if isinstance(value, int):
+                return value
+        # Unknown non-tunable sources cannot prove structural impossibility.
+        return 1
+
+    return _resident_block_elements(
+        tensor,
+        patterns,
+        minimum_block_size,
+    )
+
+
+def _resident_block_elements(
+    tensor: torch.Tensor,
+    patterns: list[IndexingPattern],
+    block_size_for: Callable[[int], int | torch.SymInt | None],
+) -> int | None:
     elements = 1
     tdim = 0
     for p in patterns:
@@ -392,51 +919,17 @@ def resident_block_elements(
             # No support for dynamic shapes.
             return None
         if isinstance(p, (TilePattern, TileIndexWithOffsetPattern)):
-            bs = env.block_sizes[p.block_id].from_config(config)
+            bs = block_size_for(p.block_id)
             if isinstance(bs, int):
                 dim_size = min(bs, dim_size)
         elif isinstance(p, (TileBeginWithOffsetPattern, ArbitraryIndexPattern)):
             dim_size = 1
+        elif isinstance(p, ContiguousRangeIndexPattern):
+            dim_size = p.length
         elements *= dim_size
         # Advance only on patterns that consume a tensor dim; NonePattern doesn't.
         tdim += 1
     return elements
-
-
-def _resolve_tensor_index_patterns(
-    node: torch.fx.Node,
-    tensor: torch.Tensor,
-    subscript: list[object],
-    patterns: list[IndexingPattern],
-    config: Config,
-) -> None:
-    """Replace TensorIndexPattern with Pallas indirect load/store patterns."""
-    positions = [i for i, p in enumerate(patterns) if isinstance(p, TensorIndexPattern)]
-    if not positions:
-        return
-
-    from ...language import memory_ops
-
-    if node.target is memory_ops.load:
-        from .gather import build_gather_plan
-
-        plan = build_gather_plan(tensor, subscript, positions, patterns, config)
-        for i in positions:
-            patterns[i] = IndirectGatherPattern(plan=plan)
-        return
-
-    if node.target is memory_ops.store:
-        from .gather import build_scatter_plan
-
-        plan = build_scatter_plan(tensor, subscript, positions)
-        for i in positions:
-            patterns[i] = IndirectScatterPattern(plan=plan)
-        return
-
-    op_name = getattr(node.target, "__name__", str(node.target))
-    raise NotImplementedError(
-        f"Pallas: tensor-indexed memory op is not supported for op={op_name}."
-    )
 
 
 # Helper functions moved from memory_ops.py

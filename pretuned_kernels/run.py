@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """Run every pretuned kernel's benchmark sweep and emit aggregate metrics as JSON.
 
-Drives the nightly pretuned-kernel dashboard pipeline. Each kernel module under
-``pretuned_kernels/<name>/<name>.py`` defines a ``main()`` that benchmarks the
-Helion kernel against PyTorch eager across its checked-in shape sweep and prints
-a machine-parseable line::
+Drives the nightly pretuned-kernel dashboard pipeline. Each registered kernel
+module defines a ``main()`` that benchmarks its checked-in Helion heuristic
+against one or more reference baselines and returns aggregate metrics::
 
-    SUMMARY: helion_wins=.. total=.. geomean=.. best_speedup=..
+    {"helion_wins": .., "total": .., "geomean": .., "best_speedup": ..,
+     "baselines": {"name": {..}}}
 
-This script runs each ``main()``, parses that line, and writes a JSON list of
-per-kernel records that ``.github/dashboard/build_pretuned_dashboard_data.py``
-aggregates for the dashboard's Pretuned tab. A kernel that crashes (e.g. no
-heuristic for the current GPU) is recorded with an ``error`` field so the rest
-of the sweep still reports.
+This script runs each ``main()`` and writes a JSON list of per-kernel records
+that ``.github/dashboard/build_pretuned_dashboard_data.py`` aggregates for the
+dashboard's Pretuned tab. A kernel that crashes (e.g. no heuristic for the
+current GPU) is recorded with an ``error`` field so the rest of the sweep still
+reports.
 """
 
 from __future__ import annotations
@@ -31,6 +31,9 @@ if TYPE_CHECKING:
     from types import ModuleType
 
 PRETUNED_KERNELS_DIR = Path(__file__).resolve().parent
+REPO_ROOT = PRETUNED_KERNELS_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 # Kernel directory == module file stem == kernel name. Ordered cheap-to-expensive
 # so a partial run (e.g. timeout) still captures the quick kernels.
@@ -42,6 +45,11 @@ KERNELS = [
     "softmax",
     "scaled_mm",
     "scale_mm_cute",
+    "nvfp4_gemv",
+    "nvfp4_gemv_cute",
+    # B200 tcgen05 register-fragment epilogues.
+    "projection_rotary",
+    "interleaved_swiglu",
     "cross_entropy",
     # Ported from vLLM (vllm/kernels/helion/ops); torch-native baselines.
     "silu_mul_fp8",
@@ -51,11 +59,36 @@ KERNELS = [
     "rms_norm_per_block_quant",
     "silu_and_mul_per_block_quant",
     "fused_qk_norm_rope",
+    # Fixed-shape model regions compiled as one Triton kernel.
+    "qwen3_decode_layer",
+    "gemma4_a4b_moe",
+    # External grouped references compile substantial CuTe/DeepGEMM code.
+    "grouped_gemm",
+    "grouped_gemm_deepgemm",
 ]
 
 # Map a compute capability (heuristic file suffix) to a hardware alias. The
 # nightly runs one GPU per alias.
 _HARDWARE_BY_COMPUTE = {"sm90": "h100", "sm100": "b200"}
+
+
+def _kernel_directory(name: str) -> Path:
+    megakernel = PRETUNED_KERNELS_DIR / "megakernels" / name
+    return megakernel if megakernel.is_dir() else PRETUNED_KERNELS_DIR / name
+
+
+def parse_kernel_names(value: str) -> list[str]:
+    """Parse the comma-separated kernel input used by CLI and CI dispatches."""
+    return [name.strip() for name in value.split(",") if name.strip()]
+
+
+def grouped_reference_requirements(value: str) -> dict[str, bool]:
+    """Return which external grouped references a selected sweep requires."""
+    selected = set(parse_kernel_names(value))
+    return {
+        "cutlass": not selected or "grouped_gemm" in selected,
+        "deepgemm": not selected or "grouped_gemm_deepgemm" in selected,
+    }
 
 
 def _supported_hardware(name: str) -> set[str]:
@@ -66,7 +99,7 @@ def _supported_hardware(name: str) -> set[str]:
     single source of truth -- no per-kernel declaration to keep in sync.
     """
     hardware = set()
-    for path in (PRETUNED_KERNELS_DIR / name).glob(f"_helion_aot_{name}_cuda_sm*.py"):
+    for path in _kernel_directory(name).glob(f"_helion_aot_{name}_cuda_sm*.py"):
         match = re.search(r"_cuda_(sm\d+)\.py$", path.name)
         if match:
             hardware.add(_HARDWARE_BY_COMPUTE.get(match.group(1), match.group(1)))
@@ -78,7 +111,7 @@ def _import_kernel_module(name: str) -> ModuleType:
     # global-scope resolution would try to import) that avoids clashing with
     # examples/<name>.py.
     module_name = f"_helion_pretuned_run_{name}"
-    file_path = PRETUNED_KERNELS_DIR / name / f"{name}.py"
+    file_path = _kernel_directory(name) / f"{name}.py"
     spec = importlib.util.spec_from_file_location(module_name, file_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -153,7 +186,7 @@ def main() -> None:
     current_hardware = args.hardware or _HARDWARE_BY_COMPUTE.get(compute, compute)
     print(f"GPU: {device} ({compute}); hardware={current_hardware}")
 
-    kernels = [k.strip() for k in args.kernels.split(",") if k.strip()]
+    kernels = parse_kernel_names(args.kernels)
     records = []
     for name in kernels:
         print(f"\n{'=' * 60}\nBenchmarking pretuned kernel: {name}\n{'=' * 60}")

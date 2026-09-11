@@ -316,6 +316,13 @@ def skipIfPallas(reason: str) -> Callable[[Callable], Callable]:
     return skipIfFn(lambda: _get_backend() == "pallas", reason)
 
 
+def skipIfPallasTpu(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test only on real Pallas TPU (not in interpret mode)."""
+    return skipIfFn(
+        lambda: _get_backend() == "pallas" and not is_pallas_interpret(), reason
+    )
+
+
 def xfailIfPallas(reason: str) -> Callable[[Callable], Callable]:
     """Mark test as expected failure if running with pallas (TPU or interpret mode)"""
     return xfailIfFn(lambda: _get_backend() == "pallas", reason)
@@ -356,8 +363,8 @@ def skipUnlessMultiXCD(reason: str) -> Callable[[Callable], Callable]:
     Single-XCD parts and CPX-partitioned devices (which expose one XCD) are
     skipped, since xcd_remap is a no-op there.
     """
-    from helion._compat import get_num_xcd
     from helion._compat import supports_amd_cdna_tunables
+    from helion.runtime.triton.launcher import get_num_xcd
 
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
     return skipIfFn(
@@ -406,6 +413,21 @@ def xfailIfCute(reason: str) -> Callable[[Callable], Callable]:
 def skipIfCute(reason: str) -> Callable[[Callable], Callable]:
     """Skip test when CUTLASS CuTe backend is selected."""
     return skipIfFn(lambda: _get_backend() == "cute", reason)
+
+
+def matchesBackends(backends: Sequence[str]) -> bool:
+    """Return whether `_get_backend() in backends`, matching onlyBackends."""
+    backend = _get_backend()
+    return backend in backends or (backend == "tileir" and "triton" in backends)
+
+
+def skipUnlessBackends(backends: Sequence[str]) -> pytest.MarkDecorator:
+    """Return a pytest mark that skips unless `_get_backend() in backends`."""
+    backend = _get_backend()
+    return pytest.mark.skipif(
+        not matchesBackends(backends),
+        reason=f"disabled for HELION_BACKEND={backend}",
+    )
 
 
 def default_cute_mma_support(
@@ -483,7 +505,7 @@ def onlyBackends(
 
     def wrapper(cls: type[unittest.TestCase]) -> type[unittest.TestCase]:
         backend = _get_backend()
-        if backend in backends or (backend == "tileir" and "triton" in backends):
+        if matchesBackends(backends):
             return cls
         return unittest.skip(f"disabled for HELION_BACKEND={backend}")(cls)
 
@@ -587,32 +609,6 @@ def skipIfCudaCapabilityLessThan(
         cond,
         reason=reason
         or f"Requires CUDA capability >= {min_capability[0]}.{min_capability[1]}",
-    )
-
-
-def skipIfCudaSharedMemoryLessThan(
-    min_shared_memory: int,
-    *,
-    reason: str | None = None,
-) -> Callable[[Callable], Callable]:
-    """Skip test if GPU shared memory per block is below min_shared_memory."""
-
-    def cond() -> bool:
-        if not torch.cuda.is_available():
-            return False
-        props = torch.cuda.get_device_properties(torch.cuda.current_device())
-        default_shared = cast("int", props.shared_memory_per_block)
-        optin_shared = cast(
-            "int | None", getattr(props, "shared_memory_per_block_optin", None)
-        )
-        max_shared = default_shared if optin_shared is None else optin_shared
-        return max_shared < min_shared_memory
-
-    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
-    return skipIfFn(
-        cond,
-        reason=reason
-        or f"Requires GPU shared memory per block >= {min_shared_memory} bytes",
     )
 
 

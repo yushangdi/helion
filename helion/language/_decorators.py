@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import threading
 from typing import TYPE_CHECKING
 from typing import Generic
 from typing import Literal
@@ -36,12 +37,62 @@ if TYPE_CHECKING:
         def __call__(self, fn: Callable[..., _T]) -> object: ...
 
 
+_CodegenT = TypeVar("_CodegenT")
+_CODEGEN_REPAIR_STATE = threading.local()
+
+
+def _codegen_repair_in_progress() -> bool:
+    return getattr(_CODEGEN_REPAIR_STATE, "codegen_names", None) is not None
+
+
+def _begin_codegen_repair(codegen_names: frozenset[str]) -> None:
+    assert not _codegen_repair_in_progress()
+    _CODEGEN_REPAIR_STATE.codegen_names = codegen_names
+    _CODEGEN_REPAIR_STATE.registrations = set()
+
+
+def _end_codegen_repair() -> None:
+    del _CODEGEN_REPAIR_STATE.codegen_names
+    del _CODEGEN_REPAIR_STATE.registrations
+
+
+def _register_codegen_handler(
+    implementations: dict[str, _CodegenT], backend: str, handler: _CodegenT
+) -> None:
+    codegen_names: frozenset[str] | None = getattr(
+        _CODEGEN_REPAIR_STATE, "codegen_names", None
+    )
+    if codegen_names is None:
+        assert backend not in implementations, (
+            f"codegen already registered for backend {backend!r}"
+        )
+    else:
+        if backend not in codegen_names:
+            return
+        key = (id(implementations), backend)
+        registrations: set[tuple[int, str]] = _CODEGEN_REPAIR_STATE.registrations
+        assert key not in registrations, (
+            f"codegen already registered for backend {backend!r}"
+        )
+        registrations.add(key)
+    implementations[backend] = handler
+
+
 class CodegenDict(dict[str, "Callable[[CodegenState], object]"]):
     """A dict subclass that falls back to the 'common' key when a backend key is missing."""
 
+    def __getitem__(self, key: str) -> Callable[[CodegenState], object]:
+        if key != "common":
+            from .._compiler.backend_registry import repair_backend_codegen
+
+            # Exact hits also wait: a partial module may have registered a
+            # handler before defining helpers that it calls.
+            repair_backend_codegen(key)
+        return dict.__getitem__(self, key)
+
     def __missing__(self, key: str) -> Callable[[CodegenState], object]:
         if key != "common" and "common" in self:
-            return self["common"]
+            return dict.__getitem__(self, "common")
         raise KeyError(key)
 
     # pyrefly: ignore[bad-override]
@@ -78,6 +129,8 @@ class APIFunc(Protocol):
             tracing and compilation.
         _prepare_args: A callable that preprocesses the arguments before they're
             passed to the actual function implementation.
+        _post_create_proxy: An optional callback invoked with the newly created FX
+            node and prepared arguments.
         _get_masked_value: A callable that retrieves the masked value for a node,
         _signature: The function signature for binding and validating arguments.
     """
@@ -93,6 +146,7 @@ class APIFunc(Protocol):
     _codegen: CodegenDict
     _fake_fn: Callable[..., object] | None
     _prepare_args: Callable[[tuple[object, ...]], tuple[object, ...]]
+    _post_create_proxy: Callable[..., None] | None
     _get_masked_value: Callable[[torch.fx.Node], float | bool | None] | None
     _to_device_ir: Callable[..., object] | None
     _allow_host_tensor: bool
@@ -189,6 +243,8 @@ def api(
                         wrapper,
                         *args_to_proxies(tracer, flat_args, {}),
                     )
+                    if api._post_create_proxy is not None:
+                        api._post_create_proxy(proxy_out.node, *flat_args)
                     assert api._fake_fn is not None
                     out = api._fake_fn(*flat_args)
                     proxy_tensor.track_tensor_tree(
@@ -209,6 +265,7 @@ def api(
         api._type_function = None
         api._codegen = CodegenDict()
         api._fake_fn = None
+        api._post_create_proxy = None
         api._get_masked_value = None
         api._to_device_ir = None
         api._allow_host_tensor = allow_host_tensor
@@ -274,6 +331,23 @@ def prepare_args(
     return _impl
 
 
+def post_create_proxy(
+    original_fn: Callable[..., object],
+) -> _NoReturnDecorator[None]:
+    """Register a callback that annotates an API call's newly created FX node."""
+
+    def _impl(callback: Callable[..., None]) -> Callable[..., Never]:
+        assert is_api_func(original_fn), (
+            f"{post_create_proxy.__qualname__} can only be used on API functions"
+        )
+        assert original_fn._post_create_proxy is None
+        original_fn._post_create_proxy = callback
+        return _no_call
+
+    # pyrefly: ignore [bad-return]
+    return _impl
+
+
 def codegen(
     original_fn: Callable[..., object],
     backend: str,
@@ -282,10 +356,7 @@ def codegen(
         assert is_api_func(original_fn), (
             f"{type_propagation.__qualname__} can only be used on API functions"
         )
-        assert backend not in original_fn._codegen, (
-            f"codegen already registered for backend {backend!r}"
-        )
-        original_fn._codegen[backend] = codegen_fn
+        _register_codegen_handler(original_fn._codegen, backend, codegen_fn)
         return _no_call
 
     # pyrefly: ignore [bad-return]

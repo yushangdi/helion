@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import functools
 import logging
+import operator
 import textwrap
 from typing import TYPE_CHECKING
 
@@ -15,6 +17,8 @@ from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import _symint_expr
 from .._compiler.cute.cutedsl_compat import emit_pipeline_advance
+from .._compiler.cute.device_state import Tcgen05GroupedDMode
+from .._compiler.cute.device_state import Tcgen05Orientation
 from .._compiler.cute.strategies import tcgen05_explicit_d_store_tile_expr
 from .._compiler.cute.strategies import tcgen05_is_two_cta_m128
 from .._compiler.cute.strategies import tcgen05_resolve_epilogue_tile
@@ -24,6 +28,9 @@ from .._compiler.cute.tcgen05_constants import (
 )
 from .._compiler.cute.tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP
+from .._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
+from .._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
+from .._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP
 from .._compiler.cute.tcgen05_constants import (
@@ -45,6 +52,7 @@ from .._compiler.cute.tcgen05_constants import (
     TCGEN05_EPILOGUE_LAYOUT_SPLIT_ACC_T2R_STORE_TAIL,
 )
 from .._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_SPLIT_FIRST_T2R
+from .._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreBodyCoreParams
 from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStorePipelineParams
@@ -65,8 +73,11 @@ from . import _decorators
 from .stack_tensor import StackTensor
 
 if TYPE_CHECKING:
+    from .._compiler.cute.cute_epilogue import Tcgen05GroupedTailEpilogueMatch
     from .._compiler.cute.cute_epilogue import Tcgen05UnaryEpilogueChain
-    from .._compiler.cute.cute_epilogue import _AuxiliaryTensorStep
+    from .._compiler.cute.cute_epilogue import _AuxiliaryTensorLoadExpr
+    from .._compiler.cute.device_state import CuteTcgen05StoreValue
+    from .._compiler.cute.fragment_epilogue import Tcgen05FragmentEpiloguePlan
     from .._compiler.inductor_lowering import CodegenState
     from .._compiler.tile_strategy import LoopDimInfo
 
@@ -90,6 +101,7 @@ class _AuxStepRecord:
     the per-output-tile setup and per-subtile load helpers.
     """
 
+    expr: _AuxiliaryTensorLoadExpr
     aux_tensor_name: str
     broadcast_axis: int | None
     has_leading_passthrough: bool
@@ -112,6 +124,9 @@ class _AuxStepRecord:
     # accumulator ``consumer_wait`` so the rowvec GMEM latency hides under
     # the MMA wait. ``None`` keeps the per-subtile GMEM load.
     aux_rmem_full: str | None = None
+    # Full-tile bm=256 four-CTA path: the per-row value is invariant across
+    # every N subtile, so retain it in a scalar register for the whole tile.
+    colvec_scalar_full: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -132,6 +147,7 @@ class _RowvecAuxStageRecord:
     copy_bits: int
     copy_elems: int
     aux_extent: int
+    warp_private: bool
 
 
 def _tcgen05_rowvec_aux_stage_copy_elems(
@@ -758,6 +774,8 @@ def _cute_scalar_load_expr(
     tensor_name: str,
     index_exprs: list[str],
     dtype: torch.dtype,
+    *,
+    eviction_suffix: str = "",
 ) -> str:
     if "None" in index_exprs:
         return f"{tensor_name}[{', '.join(index_exprs)}]"
@@ -765,6 +783,22 @@ def _cute_scalar_load_expr(
         return (
             f"cute.arch.load({_cute_scalar_pointer_expr(tensor_name, index_exprs)}, "
             "cutlass.Uint8)"
+        )
+    if eviction_suffix == _CUTE_L2_LAST_SUFFIX:
+        # The L2 policy helper only exists in 16-byte vector form.
+        eviction_suffix = ""
+    if eviction_suffix and dtype.itemsize >= 4 and dtype is not torch.bool:
+        # ``(ptr).load()`` has no cache-hint kwargs; route hinted scalar
+        # sites through ``cute.arch.load`` instead.  Sub-32-bit dtypes stay
+        # on the plain form: their scalar load lowers to ``nvvm.load.ext``,
+        # which rejects cache modifiers ("Unsupported FP type for
+        # ExtLoadOp"); their hints apply on the vectorized forms instead.
+        from .._compiler.compile_environment import CompileEnvironment
+
+        dtype_str = CompileEnvironment.current().backend.dtype_str(dtype)
+        return (
+            f"cute.arch.load({_cute_scalar_pointer_expr(tensor_name, index_exprs)}, "
+            f"{dtype_str}{eviction_suffix})"
         )
     return f"{_cute_scalar_pointer_expr(tensor_name, index_exprs)}.load()"
 
@@ -782,14 +816,23 @@ _CUTE_VECTOR_DTYPES: dict[torch.dtype, tuple[str, int]] = {
     torch.bfloat16: ("cutlass.BFloat16", _CUTE_VECTOR_MAX_BYTES // 2),
 }
 
-# ``unroll`` mode loads bf16/fp16 inputs as Uint16 vectors and bitcasts each
-# extracted lane back to the original dtype.  This avoids the CuTe DSL
-# crash that fires when subscripting a bf16/fp16 vector value.  Cutlass
-# scalar type for the extracted lane is paired with the vec-element type
-# name used in ``ir.VectorType.get``.
+# ``unroll`` mode loads inputs as same-width INTEGER vectors (Uint16 for
+# bf16/fp16, Uint32 for fp32) and bitcasts each extracted lane back to the
+# original dtype.  This avoids the CuTe DSL crash that fires when
+# subscripting a bf16/fp16 vector value, and for fp32 sidesteps the retired
+# explicit-vec mode (see ``_cute_vec_kernel_mode``).  Maps the tensor dtype
+# to the cutlass scalar type of the extracted lane.
 _CUTE_VECTOR_UNROLL_DTYPES: dict[torch.dtype, str] = {
     torch.float16: "cutlass.Float16",
     torch.bfloat16: "cutlass.BFloat16",
+    torch.float32: "cutlass.Float32",
+}
+
+# Integer carrier type for an unroll-mode vector load of a given dtype.
+_CUTE_VECTOR_UNROLL_CARRIER: dict[torch.dtype, str] = {
+    torch.float16: "cutlass.Uint16",
+    torch.bfloat16: "cutlass.Uint16",
+    torch.float32: "cutlass.Uint32",
 }
 
 # 1-byte fp8 dtypes also use ``unroll`` mode.  Rather than a
@@ -826,14 +869,15 @@ def _cute_is_unroll_dtype(dtype: torch.dtype) -> bool:
 def _cute_unroll_vec_elem_type(dtype: torch.dtype, vec_width: int = 1) -> str:
     """Cutlass load type for an ``unroll``-mode hoisted vec load.
 
-    fp8 loads ``vec_width`` bytes as a single packed integer; bf16/fp16 load a
-    ``Uint16`` vector element (the ``VectorType`` width is applied by callers).
+    fp8 loads ``vec_width`` bytes as a single packed integer; bf16/fp16/fp32
+    load a same-width integer vector element (the ``VectorType`` width is
+    applied by callers).
     """
     if _cute_is_byte_packed(dtype):
         pack = _CUTE_BYTE_PACK_TYPE.get(vec_width)
         assert pack is not None, f"unsupported fp8 vec_width {vec_width}"
         return pack
-    return "cutlass.Uint16"
+    return _CUTE_VECTOR_UNROLL_CARRIER[dtype]
 
 
 def _cute_lane_axis_pos(strategy: object, block_id: int, index_exprs: list[str]) -> int:
@@ -851,16 +895,33 @@ def _cute_lane_axis_pos(strategy: object, block_id: int, index_exprs: list[str])
     return len(index_exprs) - 1
 
 
+# Sentinel eviction "suffix" for the ``l2_last`` policy: not a kwarg on
+# ``cute.arch.load`` (which has no L2 policy support) but a marker that the
+# 16-byte unroll-hoist load should go through the inline-PTX
+# ``createpolicy.fractional.L2::evict_last`` helper.  Non-16-byte or scalar
+# sites silently drop the hint.
+_CUTE_L2_LAST_SUFFIX = "__l2_last__"
+
+
 def _cute_unroll_vec_load_expr(
-    ptr_expr: str, dtype: torch.dtype, vec_width: int
+    ptr_expr: str, dtype: torch.dtype, vec_width: int, eviction_suffix: str = ""
 ) -> str:
     """Build the ``cute.arch.load(...)`` RHS for an unroll-mode hoist."""
+    if eviction_suffix == _CUTE_L2_LAST_SUFFIX:
+        if not _cute_is_byte_packed(dtype) and vec_width * dtype.itemsize == 16:
+            return (
+                f"_cute_load_l2_evict_last({ptr_expr}, "
+                f"ir.VectorType.get([{vec_width}], "
+                f"{_cute_unroll_vec_elem_type(dtype)}.mlir_type))"
+            )
+        eviction_suffix = ""
     if _cute_is_byte_packed(dtype):
         pack = _cute_unroll_vec_elem_type(dtype, vec_width)
-        return f"cute.arch.load({ptr_expr}, {pack})"
+        return f"cute.arch.load({ptr_expr}, {pack}{eviction_suffix})"
     return (
         f"cute.arch.load({ptr_expr}, "
-        f"ir.VectorType.get([{vec_width}], cutlass.Uint16.mlir_type))"
+        f"ir.VectorType.get([{vec_width}], {_cute_unroll_vec_elem_type(dtype)}.mlir_type)"
+        f"{eviction_suffix})"
     )
 
 
@@ -875,20 +936,190 @@ def _cute_unroll_vec_extract(hoist_var: str, idx: str, dtype: torch.dtype) -> st
     if dtype in _CUTE_VECTOR_UNROLL_BYTE_DTYPES:
         return f"cutlass.Uint8(({hoist_var} >> (8 * ({idx}))) & 0xFF)"
     elem_dtype = _CUTE_VECTOR_UNROLL_DTYPES[dtype]
-    return f"cutlass.Uint16({hoist_var}[{idx}]).bitcast({elem_dtype})"
+    carrier = _CUTE_VECTOR_UNROLL_CARRIER[dtype]
+    return f"{carrier}({hoist_var}[{idx}]).bitcast({elem_dtype})"
+
+
+def _cute_lane_vloop_insert_pos(
+    strategy: object, block_id: int, lane_body: list
+) -> int:
+    """Insertion position for statements that must run just BEFORE the
+    constexpr V-loop in ``lane_body``.
+
+    Uses the strategy's recorded V-loop node when available (the V-loop is
+    no longer guaranteed to be the last entry once vec-store flushes are
+    appended after it); falls back to ``len(lane_body) - 1``.
+    """
+    vloop_by_block = getattr(strategy, "_cute_lane_vloop_by_block", None)
+    vloop = None
+    if isinstance(vloop_by_block, dict):
+        vloop = vloop_by_block.get(block_id)
+    if vloop is not None:
+        for i, stmt in enumerate(lane_body):
+            if stmt is vloop:
+                return i
+    return len(lane_body) - 1
+
+
+def _cute_register_tile_unroll_vec_store(
+    state: CodegenState,
+    strategy: object,  # BlockSizeTileStrategy (PerThreadNDTileStrategy)
+    block_id: int,
+    tensor_name: str,
+    index_exprs: list[str],
+    value_expr: str,
+    mask_expr: str | None,
+    dtype: torch.dtype = torch.float16,
+) -> ast.stmt | None:
+    """Vector-store counterpart of ``_cute_register_tile_unroll_vec_hoist``.
+
+    Replaces the per-lane scalar ``(ptr).store(value)`` inside the constexpr
+    V-loop with an append onto a compile-time Python list, and splices ONE
+    ``_cute_store_u16_vec(base_ptr, vals)`` (bf16/fp16; ``_cute_store_u32_vec``
+    for fp32) flush AFTER the V-loop, emitting an ST.64/ST.128 instead of V
+    scalar stores.
+
+    Caller must guarantee the per-element mask is uniform across the V
+    lanes (``numel % V == 0``, no extra_mask); the flush reuses the scalar
+    mask expression, whose per-element vars hold the last unrolled lane's
+    (uniform) value after the V-loop.
+
+    Returns the per-lane append statement, or None when the lane context
+    isn't available.
+    """
+    base_var_by_block = getattr(strategy, "_cute_lane_base_index_var_by_block", {})
+    lane_body_by_block = getattr(strategy, "_cute_lane_body_by_block", {})
+    base_index_var = base_var_by_block.get(block_id)
+    lane_body = lane_body_by_block.get(block_id)
+    if not isinstance(base_index_var, str) or not isinstance(lane_body, list):
+        return None
+    vloop_by_block = getattr(strategy, "_cute_lane_vloop_by_block", None)
+    if not isinstance(vloop_by_block, dict) or vloop_by_block.get(block_id) is None:
+        return None
+    if getattr(strategy, "_cute_flat_multi", False):
+        # See the flat-multi note in ``_cute_register_tile_unroll_vec_hoist``.
+        index_dtype = CompileEnvironment.current().index_type()
+        base_ptr_expr = f"({tensor_name}.iterator + {index_dtype}({base_index_var}))"
+    else:
+        lane_pos = _cute_lane_axis_pos(strategy, block_id, index_exprs)
+        base_exprs = list(index_exprs)
+        base_exprs[lane_pos] = base_index_var
+        base_ptr_expr = _cute_scalar_pointer_expr(tensor_name, base_exprs)
+    sites_by_block = getattr(strategy, "_cute_lane_vec_stores_by_block", None)
+    if sites_by_block is None:
+        sites_by_block = {}
+        # pyrefly: ignore [missing-attribute]
+        strategy._cute_lane_vec_stores_by_block = sites_by_block
+    sites = sites_by_block.setdefault(block_id, [])
+    site_index = len(sites)
+    list_var = state.device_function.new_var(
+        f"_tile_store_vals_{block_id}_{site_index}", dce=False
+    )
+    sites.append(list_var)
+    vloop_pos = _cute_lane_vloop_insert_pos(strategy, block_id, lane_body)
+    lane_body.insert(vloop_pos, statement_from_string(f"{list_var} = []"))
+    carrier = _CUTE_VECTOR_UNROLL_CARRIER[dtype]
+    flush_helper = (
+        "_cute_store_u32_vec" if dtype is torch.float32 else "_cute_store_u16_vec"
+    )
+    flush_expr = f"{flush_helper}({base_ptr_expr}, {list_var})"
+    if mask_expr is not None:
+        flush_stmt = statement_from_string(f"if {mask_expr}:\n    {flush_expr}")
+    else:
+        flush_stmt = statement_from_string(flush_expr)
+    # Insert after the V-loop AND after any earlier sites' flushes so the
+    # emitted store order matches the source order.
+    lane_body.insert(
+        _cute_lane_vloop_insert_pos(strategy, block_id, lane_body) + 1 + site_index,
+        flush_stmt,
+    )
+    return statement_from_string(
+        f"{list_var}.append(({value_expr}).bitcast({carrier}))"
+    )
+
+
+def _cute_register_reduction_unroll_vec_store(
+    state: CodegenState,
+    strategy: object,  # LoopedReductionStrategy at runtime
+    tensor_name: str,
+    index_exprs: list[str],
+    value_expr: str,
+    mask_expr: str | None,
+    dtype: torch.dtype = torch.float16,
+) -> ast.stmt | None:
+    """Reduction-lane variant of ``_cute_register_tile_unroll_vec_store``.
+
+    Consume sweeps of rolled reductions (layernorm / rmsnorm epilogues)
+    store one fp16/bf16 element per constexpr V-loop iter; this collects
+    the V per-lane values into a compile-time list and flushes them with a
+    single ``_cute_store_u16_vec`` after the V-loop (ST.64/ST.128 instead
+    of V scalar 2-byte stores).
+
+    Same mask precondition as the tile variant: the caller only reaches
+    this when ``strategy._mask_var is None`` (uniform, mask-free lanes), so
+    ``mask_expr`` can wrap the flush as a whole.
+    """
+    base_index_var = getattr(strategy, "_cute_lane_base_index_var", None)
+    lane_body = getattr(strategy, "_cute_lane_body", None)
+    vloop = getattr(strategy, "_cute_lane_vloop", None)
+    if (
+        not isinstance(base_index_var, str)
+        or not isinstance(lane_body, list)
+        or vloop is None
+    ):
+        return None
+
+    def _vloop_pos() -> int:
+        for i, stmt in enumerate(lane_body):
+            if stmt is vloop:
+                return i
+        return len(lane_body) - 1
+
+    # The inner reduction-axis index_expr is the last entry (same layout as
+    # ``_cute_register_unroll_vec_hoist``).
+    base_exprs = list(index_exprs)
+    base_exprs[-1] = base_index_var
+    base_ptr_expr = _cute_scalar_pointer_expr(tensor_name, base_exprs)
+    sites = getattr(strategy, "_cute_lane_vec_stores", None)
+    if not isinstance(sites, list):
+        sites = []
+        # pyrefly: ignore [missing-attribute]
+        strategy._cute_lane_vec_stores = sites
+    site_index = len(sites)
+    list_var = state.device_function.new_var(
+        f"_reduction_store_vals_{site_index}", dce=False
+    )
+    sites.append(list_var)
+    lane_body.insert(_vloop_pos(), statement_from_string(f"{list_var} = []"))
+    carrier = _CUTE_VECTOR_UNROLL_CARRIER[dtype]
+    flush_helper = (
+        "_cute_store_u32_vec" if dtype is torch.float32 else "_cute_store_u16_vec"
+    )
+    flush_expr = f"{flush_helper}({base_ptr_expr}, {list_var})"
+    if mask_expr is not None:
+        flush_stmt = statement_from_string(f"if {mask_expr}:\n    {flush_expr}")
+    else:
+        flush_stmt = statement_from_string(flush_expr)
+    # Insert after the V-loop AND after any earlier sites' flushes so the
+    # emitted store order matches the source order.
+    lane_body.insert(_vloop_pos() + 1 + site_index, flush_stmt)
+    return statement_from_string(
+        f"{list_var}.append(({value_expr}).bitcast({carrier}))"
+    )
 
 
 def _cute_register_tile_unroll_vec_hoist(
     state: CodegenState,
-    strategy: object,  # BlockSizeTileStrategy (CuteNDTileStrategy)
+    strategy: object,  # BlockSizeTileStrategy (PerThreadNDTileStrategy)
     block_id: int,
     tensor: torch.Tensor,
     tensor_name: str,
     index_exprs: list[str],
     vec_width: int,
+    eviction_suffix: str = "",
 ) -> str:
     """Tile-loop variant of ``_cute_register_unroll_vec_hoist`` for
-    ``CuteNDTileStrategy`` lane loops.
+    ``PerThreadNDTileStrategy`` lane loops.
 
     Splices a single ``cute.arch.load(base_ptr, <elem>x V)`` into the
     outer-lane body (above the constexpr V-loop) and returns the
@@ -905,14 +1136,25 @@ def _cute_register_tile_unroll_vec_hoist(
     assert isinstance(base_index_var, str)
     assert isinstance(lane_body, list)
     assert isinstance(vec_lane_var, str)
-    # The lane-axis index_expr (stride-1 dim) is swapped with the per-lane
-    # base so the vec load points at the start of the V-wide chunk this
-    # thread owns.  The position is the last entry for a row-major lhs, or
-    # the recorded position for a K-major rhs.
-    lane_pos = _cute_lane_axis_pos(strategy, block_id, index_exprs)
-    base_exprs = list(index_exprs)
-    base_exprs[lane_pos] = base_index_var
-    base_ptr_expr = _cute_scalar_pointer_expr(tensor_name, base_exprs)
+    flat_multi = bool(getattr(strategy, "_cute_flat_multi", False))
+    if flat_multi:
+        # Flattened multi-dim tile: the ctx gate guarantees the tensor is
+        # contiguous and covers the whole iteration space, so the V-wide
+        # chunk starting at flat ``lane_base`` is memory-contiguous even
+        # when it straddles a row boundary.
+        env_flat = CompileEnvironment.current()
+        index_dtype = env_flat.index_type()
+        lane_pos = -1
+        base_ptr_expr = f"({tensor_name}.iterator + {index_dtype}({base_index_var}))"
+    else:
+        # The lane-axis index_expr (stride-1 dim) is swapped with the
+        # per-lane base so the vec load points at the start of the V-wide
+        # chunk this thread owns.  The position is the last entry for a
+        # row-major lhs, or the recorded position for a K-major rhs.
+        lane_pos = _cute_lane_axis_pos(strategy, block_id, index_exprs)
+        base_exprs = list(index_exprs)
+        base_exprs[lane_pos] = base_index_var
+        base_ptr_expr = _cute_scalar_pointer_expr(tensor_name, base_exprs)
     cache_key = (tensor_name, base_ptr_expr)
     cache_by_block = getattr(strategy, "_cute_lane_vec_loads_by_block", None)
     if cache_by_block is None:
@@ -936,145 +1178,87 @@ def _cute_register_tile_unroll_vec_hoist(
         # fetched bytes are then ignored downstream by the per-lane
         # mask gate that wraps the bitcast result.
         env_local = CompileEnvironment.current()
-        numel = env_local.block_sizes[block_id].numel
+        if flat_multi:
+            # Bounds are in FLAT elements over the whole iteration space.
+            numel = functools.reduce(
+                operator.mul,
+                [env_local.block_sizes[bid].numel for bid in strategy.block_ids],  # pyrefly: ignore
+            )
+        else:
+            numel = env_local.block_sizes[block_id].numel
         numel_expr = state.sympy_expr(numel)
-        # Build the "anchor" pointer: same index_exprs but with the
-        # inner reduction-axis index forced to 0.  This is the
-        # ``tile_offset == 0, lane_var == 0, vec_lane_var == 0`` base
-        # for the very first outer-tile iter, which is always in-bounds
-        # for any grid block.
-        anchor_exprs = list(index_exprs)
-        anchor_exprs[lane_pos] = "0"
-        anchor_ptr_expr = _cute_scalar_pointer_expr(tensor_name, anchor_exprs)
-        guarded_ptr = (
-            f"({base_ptr_expr} if {base_index_var} < {numel_expr} "
-            f"else {anchor_ptr_expr})"
+        block_pos = strategy.block_ids.index(block_id)  # pyrefly: ignore
+        bs_obj = strategy.block_size  # pyrefly: ignore
+        if isinstance(bs_obj, (list, tuple)):
+            bs_obj = bs_obj[block_pos]
+        static_bs = strategy._configured_block_size_int(bs_obj)  # pyrefly: ignore
+        mask_vars = getattr(strategy, "mask_vars", None)
+        if isinstance(mask_vars, dict):
+            # PerThreadNDTileStrategy: per-block mask registry.
+            mask_elided = block_id in mask_vars and mask_vars[block_id] is None
+        else:
+            # FlattenedTileStrategy keeps a single (elision-aware) mask var.
+            mask_elided = strategy.mask_var(block_id) is None  # pyrefly: ignore
+        try:
+            numel_int = int(numel)
+        except (TypeError, ValueError):
+            numel_int = None
+        # GRID tiles have no software-pipelined prefetch past the end, so a
+        # mask-free extent that divides evenly into blocks means every
+        # per-thread vec base is provably in-bounds.  (The pipelining pass'
+        # pipeline_inner_loads only matches an outer ``range`` loop wrapping
+        # an inner lane For, which a grid lane loop can never be — if that
+        # ever changes, this elision must learn about it.)
+        from .._compiler.tile_strategy import DeviceGridState
+
+        loops_for_block = state.codegen.active_device_loops.get(block_id)
+        is_grid_state = bool(loops_for_block) and isinstance(
+            loops_for_block[-1], DeviceGridState
         )
+        if (
+            mask_elided
+            and isinstance(static_bs, int)
+            and numel_int is not None
+            and (
+                static_bs >= numel_int or (is_grid_state and numel_int % static_bs == 0)
+            )
+        ):
+            # Single-trip tile loop whose block provably covers the extent
+            # (the strategy elided the bounds mask): every per-thread vec
+            # base is in-bounds and there is no next-iteration prefetch to
+            # clamp (the software-pipelining pass, which prefetches one
+            # tile PAST the loop end, needs the guard on multi-trip
+            # loops).  Dropping the pointer select saves ~14 registers per
+            # thread on the resident-row softmax family.  Same for exact
+            # grid tilings (numel % block == 0).
+            guarded_ptr = base_ptr_expr
+        else:
+            # Build the "anchor" pointer: same index_exprs but with the
+            # inner reduction-axis index forced to 0.  This is the
+            # ``tile_offset == 0, lane_var == 0, vec_lane_var == 0`` base
+            # for the very first outer-tile iter, which is always
+            # in-bounds for any grid block.
+            if flat_multi:
+                index_dtype_local = CompileEnvironment.current().index_type()
+                anchor_ptr_expr = f"({tensor_name}.iterator + {index_dtype_local}(0))"
+            else:
+                anchor_exprs = list(index_exprs)
+                anchor_exprs[lane_pos] = "0"
+                anchor_ptr_expr = _cute_scalar_pointer_expr(tensor_name, anchor_exprs)
+            guarded_ptr = (
+                f"({base_ptr_expr} if {base_index_var} < {numel_expr} "
+                f"else {anchor_ptr_expr})"
+            )
         hoist_stmt = statement_from_string(
-            f"{hoist_var} = {_cute_unroll_vec_load_expr(guarded_ptr, tensor.dtype, vec_width)}"
+            f"{hoist_var} = {_cute_unroll_vec_load_expr(guarded_ptr, tensor.dtype, vec_width, eviction_suffix)}"
         )
-        # Insert the hoist just BEFORE the constexpr V-loop (the last
-        # entry in lane_body).
-        lane_body.insert(len(lane_body) - 1, hoist_stmt)
+        # Insert the hoist just BEFORE the constexpr V-loop.
+        lane_body.insert(
+            _cute_lane_vloop_insert_pos(strategy, block_id, lane_body), hoist_stmt
+        )
     else:
         hoist_var, _ = cache[cache_key]
     return _cute_unroll_vec_extract(hoist_var, vec_lane_var, tensor.dtype)
-
-
-def _cute_register_tile_unroll_vec_hoist_split2(
-    state: CodegenState,
-    strategy: object,  # BlockSizeTileStrategy (CuteNDTileStrategy)
-    block_id: int,
-    tensor: torch.Tensor,
-    tensor_name: str,
-    index_exprs: list[str],
-    vec_width: int,
-) -> str:
-    """Split-2 variant of ``_cute_register_tile_unroll_vec_hoist`` for V=8
-    on fp16/bf16.
-
-    The CuTe DSL's ``nvvm.load.ext`` ICEs at V=8 for these dtypes, so the
-    full 16-byte LDG.128 is decomposed into TWO back-to-back V=4 loads
-    (lanes 0-3 and 4-7).  The SASS scheduler is free to overlap the two
-    LDGs, so the per-thread bytes-per-load grows from 8 (V=4) to the
-    full 16 (effective V=8) without invoking the DSL bug.
-
-    Returns a per-vec-lane expression of the form::
-
-        (
-            cutlass.Uint16(_tile_unroll_vec_ < n > _ < m > _a[vi]).bitcast(dtype)
-            if vi < 4
-            else cutlass.Uint16(_tile_unroll_vec_ < n > _ < m > _b[vi - 4]).bitcast(
-                dtype
-            )
-        )
-
-    Because ``vec_lane_var`` is the target of a ``cutlass.range_constexpr(8)``
-    loop, it is a Python-int constant at each unrolled iter, so the
-    ``if vi < 4`` branch folds away at trace time and the emitted SASS
-    contains only the active load's extract.
-    """
-    assert vec_width == 8, (
-        "tile_unroll_split2 expects V=8 (4+4); other widths use tile_unroll"
-    )
-    half = vec_width // 2
-    vec_elem_type = _cute_unroll_vec_elem_type(tensor.dtype)
-    base_var_by_block = getattr(strategy, "_cute_lane_base_index_var_by_block", {})
-    lane_body_by_block = getattr(strategy, "_cute_lane_body_by_block", {})
-    vec_lane_var_by_block = getattr(strategy, "_cute_vec_lane_var_by_block", {})
-    base_index_var = base_var_by_block.get(block_id)
-    lane_body = lane_body_by_block.get(block_id)
-    vec_lane_var = vec_lane_var_by_block.get(block_id)
-    assert isinstance(base_index_var, str)
-    assert isinstance(lane_body, list)
-    assert isinstance(vec_lane_var, str)
-    lane_pos = _cute_lane_axis_pos(strategy, block_id, index_exprs)
-    base_exprs = list(index_exprs)
-    base_exprs[lane_pos] = base_index_var
-    base_ptr_expr_a = _cute_scalar_pointer_expr(tensor_name, base_exprs)
-    # The second-half pointer points 4 elements past the first.  Build
-    # it by substituting ``base_index_var + half`` for the inner index.
-    base_exprs_b = list(index_exprs)
-    base_exprs_b[lane_pos] = f"({base_index_var} + {half})"
-    base_ptr_expr_b = _cute_scalar_pointer_expr(tensor_name, base_exprs_b)
-    cache_key = (tensor_name, base_ptr_expr_a, "split2")
-    cache_by_block = getattr(strategy, "_cute_lane_vec_loads_by_block", None)
-    if cache_by_block is None:
-        cache_by_block = {}
-        # pyrefly: ignore [missing-attribute]
-        strategy._cute_lane_vec_loads_by_block = cache_by_block
-    cache = cache_by_block.setdefault(block_id, {})
-    if cache_key not in cache:
-        slot = len(cache)
-        hoist_var_a = state.device_function.new_var(
-            f"_tile_unroll_vec_{block_id}_{slot}_a", dce=False
-        )
-        hoist_var_b = state.device_function.new_var(
-            f"_tile_unroll_vec_{block_id}_{slot}_b", dce=False
-        )
-        # Stash both names plus the split marker so this entry doesn't
-        # collide with the V=4 cache_key shape.  Downstream readers
-        # don't introspect this tuple — it's just a sentinel.
-        cache[cache_key] = ((hoist_var_a, hoist_var_b), tensor.dtype)
-        env_local = CompileEnvironment.current()
-        numel = env_local.block_sizes[block_id].numel
-        numel_expr = state.sympy_expr(numel)
-        anchor_exprs = list(index_exprs)
-        anchor_exprs[lane_pos] = "0"
-        anchor_ptr_expr = _cute_scalar_pointer_expr(tensor_name, anchor_exprs)
-        # The first-half OOB guard checks the same V-aligned base used by
-        # the V=4 path; the second-half pointer is ``base + 4`` and only
-        # needs guarding when ``base + 4 < numel``.  Reuse the same
-        # anchor pointer for both halves' fallbacks (the per-element
-        # mask gate downstream drops any anchor-fetched bytes anyway).
-        guarded_ptr_a = (
-            f"({base_ptr_expr_a} if {base_index_var} < {numel_expr} "
-            f"else {anchor_ptr_expr})"
-        )
-        guarded_ptr_b = (
-            f"({base_ptr_expr_b} if ({base_index_var} + {half}) < {numel_expr} "
-            f"else {anchor_ptr_expr})"
-        )
-        hoist_stmt_a = statement_from_string(
-            f"{hoist_var_a} = cute.arch.load({guarded_ptr_a}, "
-            f"ir.VectorType.get([{half}], {vec_elem_type}.mlir_type))"
-        )
-        hoist_stmt_b = statement_from_string(
-            f"{hoist_var_b} = cute.arch.load({guarded_ptr_b}, "
-            f"ir.VectorType.get([{half}], {vec_elem_type}.mlir_type))"
-        )
-        # Insert both hoists just BEFORE the constexpr V-loop (the last
-        # entry in lane_body).  Emit them back-to-back so the SASS
-        # scheduler can issue the two LDGs together.
-        lane_body.insert(len(lane_body) - 1, hoist_stmt_a)
-        lane_body.insert(len(lane_body) - 1, hoist_stmt_b)
-    else:
-        (hoist_var_a, hoist_var_b), _ = cache[cache_key]
-    extract_a = _cute_unroll_vec_extract(hoist_var_a, vec_lane_var, tensor.dtype)
-    extract_b = _cute_unroll_vec_extract(
-        hoist_var_b, f"{vec_lane_var} - {half}", tensor.dtype
-    )
-    return f"({extract_a} if {vec_lane_var} < {half} else {extract_b})"
 
 
 def _cute_combined_mask(
@@ -1461,6 +1645,38 @@ def _cute_tile_begin_expr(state: CodegenState, idx: object) -> str:
     raise exc.BackendUnsupported("cute", f"unlowerable tile base index: {idx}")
 
 
+def _tcgen05_segment_store_matches_proof(
+    state: CodegenState,
+    tcgen05_value: CuteTcgen05StoreValue,
+) -> bool:
+    from .._compiler.cute.cute_mma import _rank3_rhs_broadcast_mask_base
+    from .._compiler.cute.cute_mma import _trace_to_outer_graph_arg
+
+    store_node = tcgen05_value.segment_store_node
+    if store_node is None or state.fx_node is not store_node:
+        return False
+    index = store_node.args[1] if len(store_node.args) > 1 else None
+    extra_mask = store_node.args[3] if len(store_node.args) > 3 else None
+    if (
+        not isinstance(index, (list, tuple))
+        or len(index) != 2
+        or not isinstance(index[0], torch.fx.Node)
+        or not isinstance(extra_mask, torch.fx.Node)
+        or tcgen05_value.segment_store_row_index is None
+        or tcgen05_value.segment_store_valid_m is None
+    ):
+        return False
+    store_row = _trace_to_outer_graph_arg(state.codegen, index[0])
+    if store_row is not tcgen05_value.segment_store_row_index:
+        return False
+    store_mask = _trace_to_outer_graph_arg(state.codegen, extra_mask)
+    store_valid_m = _rank3_rhs_broadcast_mask_base(store_mask, broadcast_dim=1)
+    if store_valid_m is None:
+        return False
+    store_valid_m = _trace_to_outer_graph_arg(state.codegen, store_valid_m)
+    return store_valid_m is tcgen05_value.segment_store_valid_m
+
+
 def _cute_leading_passthrough_view_2d(
     result_name: str,
     tensor_name: str,
@@ -1486,11 +1702,23 @@ def _codegen_cute_store_tcgen05_tile(
     extra_mask: ast.AST | None,
     value_name: str,
     epilogue_chain: Tcgen05UnaryEpilogueChain | None = None,
+    grouped_tail_epilogue: Tcgen05GroupedTailEpilogueMatch | None = None,
+    fragment_epilogue: Tcgen05FragmentEpiloguePlan | None = None,
 ) -> list[ast.AST] | ast.AST | None:
     df = state.device_function
     candidate_names = df.variable_aliases(value_name)
     tcgen05_value = df.cute_state.get_tcgen05_store_value(candidate_names)
     if tcgen05_value is None:
+        return None
+    segment_store = bool(
+        tcgen05_value.segment_store_m_offset
+        and tcgen05_value.segment_store_start
+        and tcgen05_value.segment_store_actual_m
+    )
+    if segment_store and (
+        extra_mask is None
+        or not _tcgen05_segment_store_matches_proof(state, tcgen05_value)
+    ):
         return None
     if extra_mask is not None:
         if tcgen05_value.pure_matmul_role_lifecycle:
@@ -1498,7 +1726,8 @@ def _codegen_cute_store_tcgen05_tile(
                 "cute",
                 "tcgen05 pure role-lifecycle store cannot use an extra store mask",
             )
-        return None
+        if not segment_store:
+            return None
     if tcgen05_value.pure_matmul_role_lifecycle and tensor.ndim != 2:
         raise exc.BackendUnsupported(
             "cute",
@@ -1510,22 +1739,59 @@ def _codegen_cute_store_tcgen05_tile(
     env = CompileEnvironment.current()
     store_node = state.fx_node
     store_subscripts = store_node.args[1] if store_node is not None else None
-    actual_block_ids = (
-        exact_tile_block_ids(env, store_subscripts)
-        if isinstance(store_subscripts, (list, tuple))
-        else None
-    )
-    if actual_block_ids != tcgen05_value.output_block_ids:
+    actual_block_ids = None
+    if isinstance(store_subscripts, (list, tuple)):
+        if segment_store:
+            # The registered segment proof ties the dynamic row index to the
+            # work and M axes. The remaining N index must still be the exact
+            # zero-offset output tile, just as it is for ordinary stores.
+            actual_block_ids = exact_tile_block_ids(env, store_subscripts[1:])
+            expected_block_ids = tcgen05_value.output_block_ids[-1:]
+        else:
+            actual_block_ids = exact_tile_block_ids(env, store_subscripts)
+            expected_block_ids = tcgen05_value.output_block_ids
+    else:
+        expected_block_ids = tcgen05_value.output_block_ids
+    if (
+        fragment_epilogue is not None
+        and fragment_epilogue.store_node is store_node
+        and fragment_epilogue.changes_shape
+    ):
+        # The committed planner exhaustively proved the derived indices are
+        # the exact compact destination tile. ``exact_tile_block_ids`` cannot
+        # see through the reshape/split/floor-divide address expression.
+        actual_block_ids = expected_block_ids
+    if actual_block_ids != expected_block_ids:
         raise exc.BackendUnsupported(
             "cute",
             "tcgen05 matmul store requires the exact zero-offset output tile axes",
         )
     if tcgen05_value.pure_matmul_role_lifecycle:
-        if epilogue_chain is not None:
+        if (
+            epilogue_chain is not None
+            or grouped_tail_epilogue is not None
+            or fragment_epilogue is not None
+        ):
             raise exc.BackendUnsupported(
                 "cute",
                 "tcgen05 pure role-lifecycle supports only identity pure-matmul stores",
             )
+    if tcgen05_value.orientation is Tcgen05Orientation.NM and (
+        epilogue_chain is not None
+        or grouped_tail_epilogue is not None
+        or fragment_epilogue is not None
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 N,M-oriented worklist path supports only an identity BF16 store",
+        )
+    assert (
+        sum(
+            value is not None
+            for value in (epilogue_chain, grouped_tail_epilogue, fragment_epilogue)
+        )
+        <= 1
+    )
     # When one matmul accumulator fans out to multiple output stores (e.g.
     # aux = pre-activation and out = gelu(pre)), the per-matmul TMA-store
     # atom/tensor kernel-arg names allocated in cute_mma are shared by every
@@ -1622,20 +1888,121 @@ def _codegen_cute_store_tcgen05_tile(
             f"up with epi_elem_dtype_str={tcgen05_value.epi_elem_dtype_str!r} "
             f"but the store target tensor dtype is {target_dtype!r}.",
         )
-    base_indices = [_cute_tile_begin_expr(state, idx) for idx in subscript]
-    if len(base_indices) != (3 if leading_passthrough_output else 2):
+    if (
+        tcgen05_value.orientation is Tcgen05Orientation.NM
+        and target_dtype != "cutlass.BFloat16"
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 N,M-oriented worklist path requires a fixed BF16 store",
+        )
+    tcgen05_d_store_layout = tcgen05_value.d_store_layout
+    tcgen05_nm_store = tcgen05_value.orientation is Tcgen05Orientation.NM
+    if (
+        tcgen05_nm_store
+        and (
+            tcgen05_value.explicit_epi_tile_m,
+            tcgen05_value.explicit_epi_tile_n,
+            tcgen05_value.explicit_d_store_box_n,
+        )
+        != TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 N,M-oriented store requires explicit "
+            "epi_tile=(128, 32) and d_store_box_n=32",
+        )
+    if len(subscript) != (3 if leading_passthrough_output else 2):
         if tcgen05_value.pure_matmul_role_lifecycle:
             raise exc.BackendUnsupported(
                 "cute",
                 "tcgen05 pure role-lifecycle store requires a rank-2 tile store",
             )
         return None
+    if fragment_epilogue is not None and fragment_epilogue.changes_shape:
+        source_base_indices = [
+            _cute_tile_begin_expr(state, size)
+            for size in fragment_epilogue.store_tile_sizes
+        ]
+        column_ratio = (
+            fragment_epilogue.source_shape[-1]
+            // fragment_epilogue.destination_shape[-1]
+        )
+        base_indices = [
+            *source_base_indices[:-1],
+            f"({source_base_indices[-1]}) // cutlass.Int32({column_ratio})",
+        ]
+    elif segment_store:
+        base_indices = [
+            "",
+            _cute_tile_begin_expr(state, subscript[1]),
+        ]
+    else:
+        base_indices = [_cute_tile_begin_expr(state, idx) for idx in subscript]
     leading_index = base_indices[0] if leading_passthrough_output else None
     m_index, n_index = base_indices[-2:]
     m_size = _cute_tensor_dim_size_expr(state, tensor, tensor.ndim - 2)
     n_size = _cute_tensor_dim_size_expr(state, tensor, tensor.ndim - 1)
-    tile_coord_m = f"({m_index}) // cutlass.Int32({tcgen05_value.bm})"
-    tile_coord_n = f"({n_index}) // cutlass.Int32({tcgen05_value.bn})"
+    segment_store_local_m = tcgen05_value.segment_store_m_offset
+    segment_store_base_m = (
+        f"cutlass.Int32({tcgen05_value.segment_store_start}) + {segment_store_local_m}"
+        if segment_store
+        else ""
+    )
+    matmul_plan = df.cute_state.matmul_plan
+    segment_grouped = (
+        matmul_plan.grouped if segment_store and matmul_plan is not None else None
+    )
+    grouped_fixed_d_tensormap = (
+        segment_store
+        and segment_grouped is not None
+        and segment_grouped.fixed_tensormaps
+    )
+    tcgen05_source_bm = tcgen05_value.source_tile_m
+    tcgen05_source_bn = tcgen05_value.source_tile_n
+    tile_coord_m = (
+        "cutlass.Int32(0)"
+        if segment_store
+        else f"({m_index}) // cutlass.Int32({tcgen05_source_bm})"
+    )
+    compact_fragment_epilogue = (
+        fragment_epilogue
+        if fragment_epilogue is not None and fragment_epilogue.changes_shape
+        else None
+    )
+    compact_fragment_store = compact_fragment_epilogue is not None
+    tcgen05_destination_bm = (
+        compact_fragment_epilogue.destination_shape[-2]
+        if compact_fragment_epilogue is not None
+        else tcgen05_source_bm
+    )
+    tcgen05_destination_bn = (
+        compact_fragment_epilogue.destination_shape[-1]
+        if compact_fragment_epilogue is not None
+        else tcgen05_source_bn
+    )
+    # NM grouped stores expose transposed logical source dimensions, while the
+    # wrapper already applies the NM orientation when constructing the D
+    # TensorMap. Keep the descriptor and device local tile in the physical MMA
+    # orientation; MN compact-fragment stores still use their proven
+    # destination shape.
+    tcgen05_tma_store_bm = (
+        tcgen05_value.bm if tcgen05_nm_store else tcgen05_destination_bm
+    )
+    tcgen05_tma_store_bn = (
+        tcgen05_value.bn if tcgen05_nm_store else tcgen05_destination_bn
+    )
+    tile_coord_n = f"({n_index}) // cutlass.Int32({tcgen05_destination_bn})"
+    static_tile_coord_m = tile_coord_m
+    static_tile_coord_n = tile_coord_n
+    # M-paired tiles: the epilogue body is wrapped in a two-iteration
+    # ``_tcgen05_msub`` loop (one per 256-row subtile); each iteration drains
+    # its own acc stage at the subtile's M tile coordinate.
+    tcgen05_m_subtile_count = (
+        matmul_plan.m_subtile_count if matmul_plan is not None else 1
+    )
+    if tcgen05_m_subtile_count > 1:
+        static_tile_coord_m = f"({tile_coord_m} + cutlass.Int32(_tcgen05_msub))"
     full_tile = df.new_var("tcgen05_full_tile")
 
     gmem_tile = df.new_var("tcgen05_gC")
@@ -1646,6 +2013,7 @@ def _codegen_cute_store_tcgen05_tile(
     tcgc_planned = df.new_var("tcgen05_tCgC_planned")
     tccc = df.new_var("tcgen05_tCcC")
     tacc = df.new_var("tcgen05_tAcc")
+    tacc_epi = df.new_var("tcgen05_tAcc_epi")
     epi_tile = df.new_var("tcgen05_store_epi_tile")
     tiled_copy_t2r = df.new_var("tcgen05_tiled_copy_t2r")
     thr_copy_t2r = df.new_var("tcgen05_thr_copy_t2r")
@@ -1660,9 +2028,23 @@ def _codegen_cute_store_tcgen05_tile(
     ttr_tacc = df.new_var("tcgen05_tTR_tAcc")
     ttr_gc_grouped = df.new_var("tcgen05_tTR_gC_grouped")
     ttr_cc_grouped = df.new_var("tcgen05_tTR_cC_grouped")
-    ttr_tacc_mn = df.new_var("tcgen05_tTR_tAcc_mn")
+    compact_gmem_2d = df.new_var("tcgen05_compact_gD2d")
+    compact_gmem_epi = df.new_var("tcgen05_compact_gD_epi")
+    compact_ttr_gd = df.new_var("tcgen05_compact_tTR_gD")
+    compact_ttr_gd_grouped = df.new_var("tcgen05_compact_tTR_gD_grouped")
+    compact_gd_subtile = df.new_var("tcgen05_compact_tTR_gD_subtile")
+    compact_coord_epi = df.new_var("tcgen05_compact_cD_epi")
+    compact_ttr_coord = df.new_var("tcgen05_compact_tTR_cD")
+    compact_ttr_coord_grouped = df.new_var("tcgen05_compact_tTR_cD_grouped")
+    compact_coord_subtile = df.new_var("tcgen05_compact_tTR_cD_subtile")
+    ttr_tacc_mn = df.new_var(
+        "tcgen05_tTR_tAcc_nm" if tcgen05_nm_store else "tcgen05_tTR_tAcc_mn"
+    )
     ttr_gc_subtile = df.new_var("tcgen05_tTR_gC_subtile")
     ttr_cc_subtile = df.new_var("tcgen05_tTR_cC_subtile")
+    trs_cc = df.new_var("tcgen05_tRS_cC")
+    trs_cc_grouped = df.new_var("tcgen05_tRS_cC_grouped")
+    trs_cc_subtile = df.new_var("tcgen05_tRS_cC_subtile")
     acc_vec = df.new_var("tcgen05_acc_vec")
     kernel_desc = df.new_var("tcgen05_kernel_desc")
     mcld = df.new_var("tcgen05_mcld")
@@ -1672,12 +2054,37 @@ def _codegen_cute_store_tcgen05_tile(
     smem_d_ptr = df.new_var("tcgen05_sD_ptr")
     smem_d = df.new_var("tcgen05_sD")
     tiled_copy_r2s = df.new_var("tcgen05_tiled_copy_r2s")
+    copy_atom_r2s = df.new_var("tcgen05_selected_nm_stsm_atom")
+    thr_copy_r2s = df.new_var("tcgen05_thr_copy_r2s")
     trs_rd = df.new_var("tcgen05_tRS_rD")
     trs_racc = df.new_var("tcgen05_tRS_rAcc")
     trs_sd = df.new_var("tcgen05_tRS_sD")
     bsg_sd = df.new_var("tcgen05_bSG_sD")
     bsg_gd_partitioned = df.new_var("tcgen05_bSG_gD_partitioned")
     bsg_gd = df.new_var("tcgen05_bSG_gD")
+    grouped_d_tensormap_manager = df.new_var("tcgen05_grouped_d_tensormap_manager")
+    grouped_d_tensormap_grid_dim = df.new_var("tcgen05_grouped_d_tensormap_grid_dim")
+    grouped_d_tensormap_workspace_idx = df.new_var(
+        "tcgen05_grouped_d_tensormap_workspace_idx"
+    )
+    grouped_d_tensormap_ptr = df.new_var("tcgen05_grouped_d_tensormap_ptr")
+    grouped_d_tensormap_desc_ptr = df.new_var("tcgen05_grouped_d_tensormap_desc_ptr")
+    grouped_d_tensormap_smem_ptr = df.new_var("tcgen05_grouped_d_tensormap_smem_ptr")
+    grouped_d_tensormap_last_group = df.new_var(
+        "tcgen05_grouped_d_tensormap_last_group"
+    )
+    grouped_d_tensormap_group_changed = df.new_var(
+        "tcgen05_grouped_d_tensormap_group_changed"
+    )
+    grouped_d_tensormap_base = df.new_var("tcgen05_grouped_d_tensormap_base")
+    grouped_d_tensormap_addr = df.new_var("tcgen05_grouped_d_tensormap_addr")
+    grouped_d_tensormap_stride_m = df.new_var("tcgen05_grouped_d_tensormap_stride_m")
+    grouped_d_tensormap_stride_n = df.new_var("tcgen05_grouped_d_tensormap_stride_n")
+    grouped_d_tensormap_real_d = df.new_var(
+        "tcgen05_grouped_d_tensormap_d_nm"
+        if tcgen05_nm_store
+        else "tcgen05_grouped_d_tensormap_real_d"
+    )
     c_buffer = df.new_var("tcgen05_c_buffer")
     epilog_sync_barrier = df.new_var("tcgen05_epilog_sync_barrier")
     c_pipeline_producer_group = df.new_var("tcgen05_c_pipeline_producer_group")
@@ -1716,7 +2123,7 @@ def _codegen_cute_store_tcgen05_tile(
         epi_warp_ids += ","
 
     # Per-aux-step plumbing: per-thread auxiliary tensor reads at
-    # the splice site. For each ``_AuxiliaryTensorStep`` in the
+    # the splice site. For each ``_AuxiliaryTensorLoadExpr`` in the
     # chain we register the auxiliary tensor as a kernel arg,
     # allocate fresh AST var names for the partitioning chain, and
     # later (inside each per-thread splice site) emit per-subtile
@@ -1725,8 +2132,82 @@ def _codegen_cute_store_tcgen05_tile(
     # ``ttr_aux_subtile.load()`` form. SIMT-store edge tiles use a
     # predicated GMEM-to-register copy first, so the aux read observes
     # the same runtime predicate as the output store.
-    aux_steps_in_chain: tuple[_AuxiliaryTensorStep, ...] = (
-        epilogue_chain.auxiliary_tensor_steps if epilogue_chain is not None else ()
+    aux_steps_in_chain: tuple[_AuxiliaryTensorLoadExpr, ...] = (
+        epilogue_chain.auxiliary_tensor_loads if epilogue_chain is not None else ()
+    )
+    tcgen05_aux_load_placement = df.config.get(
+        TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
+        TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT,
+    )
+    if tcgen05_aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT:
+        if not aux_steps_in_chain:
+            raise exc.InvalidConfig(
+                f"invalid {TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY}="
+                f"{TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT!r}: the epilogue has "
+                "no per-subtile auxiliary loads to place"
+            )
+        if tcgen05_value.partial_output_tma_store:
+            raise exc.InvalidConfig(
+                f"invalid {TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY}="
+                f"{TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT!r}: per-subtile "
+                "auxiliary loads cannot precede the accumulator wait for a "
+                "partial-output TMA-store epilogue"
+            )
+
+    _TCGEN05_TMEM_DATAPATH_M = 128
+    if tcgen05_value.has_explicit_epilogue_tile:
+        assert tcgen05_value.explicit_epi_tile_m is not None
+        tcgen05_epi_tile_m = tcgen05_value.explicit_epi_tile_m
+    elif tcgen05_is_two_cta_m128(
+        is_two_cta=tcgen05_lifecycle.is_two_cta, bm=tcgen05_value.bm
+    ):
+        tcgen05_epi_tile_m = tcgen05_value.bm // 2
+    else:
+        tcgen05_epi_tile_m = tcgen05_value.bm
+
+    aux_matmul_plan = df.cute_state.matmul_plan
+
+    def can_stage_rowvec_per_warp(
+        broadcast_axis: int | None,
+        copy_elems: int | None,
+        *,
+        has_full_register_hoist: bool,
+    ) -> bool:
+        """Whether this rowvec can use a warp-private full-tile SMEM stage."""
+
+        return (
+            tcgen05_aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+            and tcgen05_value.use_tma_store_epilogue
+            and not tcgen05_value.partial_output_tma_store
+            and not tcgen05_value.output_column_major
+            and tcgen05_epi_tile_m >= _TCGEN05_TMEM_DATAPATH_M
+            and broadcast_axis == 1
+            and copy_elems is not None
+            and not has_full_register_hoist
+        )
+
+    def is_profitable_rowvec_per_warp_config(aux_dtype_bits: int) -> bool:
+        """Whether reuse should amortize this warp-private FP32 stage."""
+
+        if aux_dtype_bits != 32:
+            return False
+        stage_bytes = (
+            tcgen05_value.epi_warp_count * tcgen05_value.bn * (aux_dtype_bits // 8)
+        )
+        # B200 sweep boundaries: bn=32 only breaks even, and the largest
+        # winning stage used 4 KiB without changing occupancy.
+        return tcgen05_value.bn >= 64 and stage_bytes <= 4 * 1024
+
+    use_full_tile_bm256_broadcast_aux = (
+        tcgen05_aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+        and aux_matmul_plan is not None
+        and aux_matmul_plan.cluster_n == 2
+        and tcgen05_lifecycle.is_two_cta
+        and tcgen05_value.bm == 256
+        and tcgen05_value.bn == 128
+        and tcgen05_value.use_tma_store_epilogue
+        and not tcgen05_value.partial_output_tma_store
+        and not tcgen05_value.output_column_major
     )
 
     aux_step_records: list[_AuxStepRecord] = []
@@ -1754,6 +2235,7 @@ def _codegen_cute_store_tcgen05_tile(
         )
         aux_step_records.append(
             _AuxStepRecord(
+                expr=aux_step,
                 aux_tensor_name=aux_tensor_name,
                 broadcast_axis=aux_step.broadcast_axis,
                 has_leading_passthrough=aux_torch_tensor.ndim == 3,
@@ -1793,12 +2275,21 @@ def _codegen_cute_store_tcgen05_tile(
                     df.new_var(f"tcgen05_aux_rmem_full_{aux_idx}")
                     if (
                         aux_step.broadcast_axis in (0, 1)
+                        and tcgen05_aux_load_placement
+                        == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
                         and tcgen05_is_two_cta_m128(
                             is_two_cta=tcgen05_lifecycle.is_two_cta,
                             bm=tcgen05_value.bm,
                         )
                         and tcgen05_value.use_tma_store_epilogue
-                        and not tcgen05_value.partial_output_tma_store
+                    )
+                    else None
+                ),
+                colvec_scalar_full=(
+                    df.new_var(f"tcgen05_colvec_scalar_full_{aux_idx}")
+                    if (
+                        use_full_tile_bm256_broadcast_aux
+                        and aux_step.broadcast_axis == 2
                     )
                     else None
                 ),
@@ -1816,6 +2307,10 @@ def _codegen_cute_store_tcgen05_tile(
     tcgen05_aux_epi_warp_count = tcgen05_value.epi_warp_count
     tcgen05_aux_epilogue_rest_mode = tcgen05_value.epilogue_rest_mode
     tcgen05_aux_use_tma_store_epilogue = tcgen05_value.use_tma_store_epilogue
+    tcgen05_aux_tmem_load_atom = tcgen05_value.tmem_load_atom
+    tcgen05_aux_tma_store_tensor = tcgen05_value.tma_store_tensor
+    tcgen05_aux_tail_tma_store_tensor = tcgen05_value.tail_tma_store_tensor
+    tcgen05_aux_segment_store_actual_m = tcgen05_value.segment_store_actual_m
     tcgen05_explicit_store_tile_expr: str | None = None
     if tcgen05_value.has_explicit_epilogue_tile:
         assert tcgen05_value.explicit_epi_tile_m is not None
@@ -1848,16 +2343,6 @@ def _codegen_cute_store_tcgen05_tile(
     # threshold needs revisiting: the materialize fallback below is always
     # correct, so the worst case is the fast-path mis-firing (caught by the
     # row-dependent colvec tests).
-    _TCGEN05_TMEM_DATAPATH_M = 128
-    if tcgen05_value.has_explicit_epilogue_tile:
-        assert tcgen05_value.explicit_epi_tile_m is not None
-        tcgen05_epi_tile_m = tcgen05_value.explicit_epi_tile_m
-    elif tcgen05_is_two_cta_m128(
-        is_two_cta=tcgen05_lifecycle.is_two_cta, bm=tcgen05_value.bm
-    ):
-        tcgen05_epi_tile_m = tcgen05_value.bm // 2
-    else:
-        tcgen05_epi_tile_m = tcgen05_value.bm
     tcgen05_colvec_fragment_single_m_row = (
         tcgen05_epi_tile_m >= _TCGEN05_TMEM_DATAPATH_M
     )
@@ -1882,7 +2367,6 @@ def _codegen_cute_store_tcgen05_tile(
     # subtile ``cute.copy(s2r, sC[..., stage], rmem)`` →
     # ``rmem.load()``). Gate-closed configs keep the historical
     # GMEM path byte-identical.
-    aux_matmul_plan = df.cute_state.matmul_plan
     aux_pipeline_plan_obj = df.cute_state.aux_pipeline_plan
     # Workstream A Stage 4 (cycle 93, Path B): when the plan carries a store
     # warp, the per-subtile R2S->TMA-D tail is split by warp role and the
@@ -2001,13 +2485,20 @@ def _codegen_cute_store_tcgen05_tile(
             rec.aux_extent,
             copy_bits=copy_bits,
         )
-        if (
+        stage_partial_tma_rowvec = (
             tcgen05_value.partial_output_tma_store
             and tcgen05_value.use_tma_store_epilogue
             and rec.broadcast_axis == 1
             and copy_elems is not None
-        ):
+        )
+        stage_rowvec_per_warp = can_stage_rowvec_per_warp(
+            rec.broadcast_axis,
+            copy_elems,
+            has_full_register_hoist=rec.aux_rmem_full is not None,
+        ) and is_profitable_rowvec_per_warp_config(rec.aux_dtype_bits)
+        if stage_partial_tma_rowvec or stage_rowvec_per_warp:
             assert rec.aux_extent is not None
+            assert copy_elems is not None
             rowvec_aux_stage_records.append(
                 _RowvecAuxStageRecord(
                     smem_layout=df.new_var(f"tcgen05_aux_rowvec_smem_layout_{aux_idx}"),
@@ -2024,6 +2515,7 @@ def _codegen_cute_store_tcgen05_tile(
                     copy_bits=copy_bits,
                     copy_elems=copy_elems,
                     aux_extent=rec.aux_extent,
+                    warp_private=stage_rowvec_per_warp,
                 )
             )
         else:
@@ -2047,7 +2539,12 @@ def _codegen_cute_store_tcgen05_tile(
                 [
                     (
                         f"{stage.smem_layout} = cute.make_layout("
-                        f"({tcgen05_aux_bn},), stride=(1,))"
+                        + (
+                            f"({tcgen05_aux_epi_warp_count}, {tcgen05_aux_bn}), "
+                            f"stride=({tcgen05_aux_bn}, 1))"
+                            if stage.warp_private
+                            else f"({tcgen05_aux_bn},), stride=(1,))"
+                        )
                     ),
                     (
                         f"{stage.smem_ptr} = cute.arch.alloc_smem("
@@ -2070,41 +2567,75 @@ def _codegen_cute_store_tcgen05_tile(
             stage = rowvec_aux_stage_records[aux_idx]
             if stage is None:
                 continue
+            if stage.warp_private:
+                copy_thread_layout = "32"
+                copy_tidx = f"{tcgen05_aux_epi_tidx} % cutlass.Int32(32)"
+                copy_smem = (
+                    f"{stage.smem}[{tcgen05_aux_epi_tidx} // cutlass.Int32(32), None]"
+                )
+                copy_source = (
+                    f"    cute.copy({stage.tiled_copy}, {stage.gmem_part}, "
+                    f"{stage.smem_part})"
+                )
+            else:
+                copy_thread_layout = str(tcgen05_aux_epi_warp_count * 32)
+                copy_tidx = tcgen05_aux_epi_tidx
+                copy_smem = stage.smem
+                copy_source = (
+                    f"    {stage.coord} = {stage.thr_copy}.partition_S("
+                    f"cute.make_identity_tensor({tcgen05_aux_bn}))\n"
+                    f"    {stage.limit} = min({n_size} - ({n_index}), "
+                    f"cutlass.Int32({stage.aux_extent}) - ({n_index}), "
+                    f"cutlass.Int32({tcgen05_aux_bn}))\n"
+                    f"    {stage.pred} = cute.make_rmem_tensor("
+                    f"(1, cute.size({stage.smem_part}.shape[1])), "
+                    "cutlass.Boolean)\n"
+                    f"    for _rowvec_i in cutlass.range("
+                    f"cute.size({stage.smem_part}.shape[1]), unroll_full=True):\n"
+                    f"        {stage.pred}[0, _rowvec_i] = "
+                    f"{stage.coord}[0, _rowvec_i] < {stage.limit}\n"
+                    f"    cute.copy({stage.tiled_copy}, {stage.gmem_part}, "
+                    f"{stage.smem_part}, pred={stage.pred})\n"
+                    "    cute.arch.fence_acq_rel_cta()\n"
+                    f"    {epilog_sync_barrier}.arrive_and_wait()"
+                )
             lines.append(
                 f"if {tcgen05_aux_epi_active}:\n"
                 f"    {stage.tiled_copy} = cute.make_tiled_copy_tv("
                 f"cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), "
                 f"{rec.aux_dtype}, num_bits_per_copy={stage.copy_bits}), "
-                f"cute.make_layout({tcgen05_aux_epi_warp_count * 32}), "
+                f"cute.make_layout({copy_thread_layout}), "
                 f"cute.make_layout({stage.copy_elems}))\n"
                 f"    {stage.thr_copy} = {stage.tiled_copy}.get_slice("
-                f"{tcgen05_aux_epi_tidx})\n"
+                f"{copy_tidx})\n"
                 f"    {stage.gmem_tile} = cute.local_tile("
                 f"{rec.aux_tensor_name}, ({tcgen05_aux_bn},), "
                 f"({tile_coord_n},))\n"
                 f"    {stage.gmem_part} = {stage.thr_copy}.partition_S("
                 f"{stage.gmem_tile})\n"
                 f"    {stage.smem_part} = {stage.thr_copy}.partition_D("
-                f"{stage.smem})\n"
-                f"    {stage.coord} = {stage.thr_copy}.partition_S("
-                f"cute.make_identity_tensor({tcgen05_aux_bn}))\n"
-                f"    {stage.limit} = min({n_size} - ({n_index}), "
-                f"cutlass.Int32({stage.aux_extent}) - ({n_index}), "
-                f"cutlass.Int32({tcgen05_aux_bn}))\n"
-                f"    {stage.pred} = cute.make_rmem_tensor("
-                f"(1, cute.size({stage.smem_part}.shape[1])), cutlass.Boolean)\n"
-                f"    for _rowvec_i in cutlass.range("
-                f"cute.size({stage.smem_part}.shape[1]), unroll_full=True):\n"
-                f"        {stage.pred}[0, _rowvec_i] = "
-                f"{stage.coord}[0, _rowvec_i] < {stage.limit}\n"
-                f"    cute.copy({stage.tiled_copy}, {stage.gmem_part}, "
-                f"{stage.smem_part}, pred={stage.pred})\n"
-                f"    cute.arch.fence_acq_rel_cta()\n"
-                f"    {epilog_sync_barrier}.arrive_and_wait()"
+                f"{copy_smem})\n"
+                f"{copy_source}"
             )
         return lines
 
     def _simt_edge_coord_subtile_source(indent: str) -> str:
+        if segment_store:
+            return (
+                f"{indent}{coord_tile} = cute.make_identity_tensor("
+                f"({tcgen05_aux_bm}, {tcgen05_aux_bn}))\n"
+                f"{indent}{tccc_base} = {tcgen05_aux_thr_mma}.partition_C("
+                f"{coord_tile})\n"
+                f"{indent}{tccc} = "
+                "cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
+                f"{tccc_base})\n"
+                f"{indent}{tccc_epi} = cute.flat_divide({tccc}, {epi_tile})\n"
+                f"{indent}{ttr_cc} = {thr_copy_t2r}.partition_D({tccc_epi})\n"
+                f"{indent}{ttr_cc_grouped} = cute.group_modes("
+                f"{ttr_cc}, 3, cute.rank({ttr_cc}))\n"
+                f"{indent}{ttr_cc_subtile} = {ttr_cc_grouped}["
+                f"(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+            )
         return (
             f"{indent}{coord_tile} = cute.local_tile("
             f"cute.make_identity_tensor(({m_size}, {n_size})), "
@@ -2123,6 +2654,86 @@ def _codegen_cute_store_tcgen05_tile(
             f"cutlass.Int32(_tcgen05_subtile))]\n"
         )
 
+    def _tma_r2s_coord_subtile_source(indent: str) -> str:
+        if segment_store:
+            return (
+                f"{indent}{coord_tile} = cute.make_identity_tensor("
+                f"({tcgen05_aux_bm}, {tcgen05_aux_bn}))\n"
+                f"{indent}{tccc_base} = {tcgen05_aux_thr_mma}.partition_C("
+                f"{coord_tile})\n"
+                f"{indent}{tccc} = "
+                "cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
+                f"{tccc_base})\n"
+                f"{indent}{tccc_epi} = cute.flat_divide({tccc}, {epi_tile})\n"
+                f"{indent}{ttr_cc} = {thr_copy_t2r}.partition_D({tccc_epi})\n"
+                f"{indent}{trs_cc} = {tiled_copy_r2s}.retile({ttr_cc})\n"
+                f"{indent}{trs_cc_grouped} = cute.group_modes("
+                f"{trs_cc}, 3, cute.rank({trs_cc}))\n"
+                f"{indent}{trs_cc_subtile} = {trs_cc_grouped}["
+                f"(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+            )
+        return (
+            f"{indent}{coord_tile} = cute.local_tile("
+            f"cute.make_identity_tensor(({m_size}, {n_size})), "
+            f"({tcgen05_aux_bm}, {tcgen05_aux_bn}), "
+            f"({tile_coord_m}, {tile_coord_n}))\n"
+            f"{indent}{tccc_base} = {tcgen05_aux_thr_mma}.partition_C("
+            f"{coord_tile})\n"
+            f"{indent}{tccc} = "
+            "cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
+            f"{tccc_base})\n"
+            f"{indent}{tccc_epi} = cute.flat_divide({tccc}, {epi_tile})\n"
+            f"{indent}{ttr_cc} = {thr_copy_t2r}.partition_D({tccc_epi})\n"
+            f"{indent}{trs_cc} = {tiled_copy_r2s}.retile({ttr_cc})\n"
+            f"{indent}{trs_cc_grouped} = cute.group_modes({trs_cc}, 3, "
+            f"cute.rank({trs_cc}))\n"
+            f"{indent}{trs_cc_subtile} = {trs_cc_grouped}[(None, None, None, "
+            f"cutlass.Int32(_tcgen05_subtile))]\n"
+        )
+
+    def _coord_subtile_source(
+        indent: str, coord_layout: str, *, include_setup: bool
+    ) -> tuple[str, str]:
+        if coord_layout == "ttr":
+            return (
+                _simt_edge_coord_subtile_source(indent) if include_setup else "",
+                ttr_cc_subtile,
+            )
+        assert coord_layout == "trs"
+        return (
+            _tma_r2s_coord_subtile_source(indent) if include_setup else "",
+            trs_cc_subtile,
+        )
+
+    worklist_nm_segment_valid_m_bound = (
+        tcgen05_value.segment_store_valid_m_bound
+        if tcgen05_value.orientation is Tcgen05Orientation.NM and segment_store
+        else ""
+    )
+
+    def _worklist_nm_segment_valid_m_prelude_and_expr(
+        prelude_indent: str,
+        carrier_name: str,
+        coord_subtile_name: str,
+    ) -> tuple[str, str]:
+        valid_row_mask = df.new_var("tcgen05_selected_valid_row_mask")
+        valid_row_coord = df.new_var("tcgen05_selected_valid_row_coord")
+        if grouped_tail_store:
+            local_m = f"{valid_row_coord}[1]"
+        else:
+            local_m = f"({segment_store_local_m}) + {valid_row_coord}[1]"
+        prelude = (
+            f"{prelude_indent}{valid_row_mask} = cute.make_rmem_tensor("
+            f"cute.make_layout({carrier_name}.shape), cutlass.Boolean)\n"
+            f"{prelude_indent}for _selected_valid_i in range("
+            f"cute.size({valid_row_mask}.shape)):\n"
+            f"{prelude_indent}    {valid_row_coord} = "
+            f"{coord_subtile_name}[_selected_valid_i]\n"
+            f"{prelude_indent}    {valid_row_mask}[_selected_valid_i] = "
+            f"{local_m} < cutlass.Int32({worklist_nm_segment_valid_m_bound})\n"
+        )
+        return prelude, f"{valid_row_mask}.load()"
+
     def _simt_edge_scalar_copy_source(
         indent: str, src: str, dst: str, *, include_coord_setup: bool = True
     ) -> str:
@@ -2132,7 +2743,7 @@ def _codegen_cute_store_tcgen05_tile(
             (_simt_edge_coord_subtile_source(indent) if include_coord_setup else "")
             + f"{indent}for _edge_i in range(cute.size({src}.shape)):\n"
             f"{indent}    _coord = {ttr_cc_subtile}[_edge_i]\n"
-            f"{indent}    if cute.elem_less(_coord, ({m_size}, {n_size})):\n"
+            f"{indent}    if {_edge_predicate_expr('_coord')}:\n"
             f"{indent}        {dst}[_edge_i] = {src}[_edge_i]\n"
         )
 
@@ -2161,7 +2772,7 @@ def _codegen_cute_store_tcgen05_tile(
             f"{indent}{edge_pred} = cute.make_rmem_tensor((1, {edge_src}.shape[1]), cutlass.Boolean)\n"
             f"{indent}for _edge_i in range(cute.size({edge_src}.shape[1])):\n"
             f"{indent}    _coord = {edge_coord}[0, _edge_i]\n"
-            f"{indent}    {edge_pred}[0, _edge_i] = cute.elem_less(_coord, ({m_size}, {n_size}))\n"
+            f"{indent}    {edge_pred}[0, _edge_i] = {_edge_predicate_expr('_coord')}\n"
             f"{indent}cute.copy({copy_atom}, {edge_src}, {edge_dst}, pred={edge_pred})\n"
         )
 
@@ -2187,7 +2798,7 @@ def _codegen_cute_store_tcgen05_tile(
 
         For the broadcast form the helper first builds a 2-D view
         of the underlying rank-1 tensor with stride 0 on the
-        orthogonal axis (see :class:`_AuxiliaryTensorStep` for the
+        orthogonal axis (see :class:`_AuxiliaryTensorLoadExpr` for the
         canonical contract).
 
         When ``define_thr_copy_t2r`` is True the helper emits the
@@ -2290,10 +2901,18 @@ def _codegen_cute_store_tcgen05_tile(
                 assert rec.broadcast_axis == 1
                 assert rec.aux_view2d is not None
                 # The compact SMEM rowvec is allocated and populated per output
-                # tile, so its 2-D broadcast view is already tile-sized.
+                # tile, so its 2-D broadcast view is already tile-sized. The
+                # full-tile bm256 path gives every epilogue warp a private copy,
+                # avoiding a CTA barrier between the copy and its first read.
+                rowvec_smem_iterator = (
+                    f"{rowvec_stage.smem}[{tcgen05_aux_epi_tidx} // "
+                    "cutlass.Int32(32), None].iterator"
+                    if rowvec_stage.warp_private
+                    else f"{rowvec_stage.smem}.iterator"
+                )
                 lines.append(
                     f"{rec.aux_view2d} = cute.make_tensor("
-                    f"{rowvec_stage.smem}.iterator, "
+                    f"{rowvec_smem_iterator}, "
                     f"cute.make_layout(({tcgen05_bm}, {tcgen05_bn}), "
                     f"stride=(0, 1)))"
                 )
@@ -2393,6 +3012,16 @@ def _codegen_cute_store_tcgen05_tile(
                             ),
                         ]
                         if rec.aux_rmem_full is not None and not force_gmem_aux
+                        else []
+                    ),
+                    *(
+                        [
+                            (
+                                f"{rec.colvec_scalar_full} = "
+                                f"{rec.ttr_aux_grouped}[(0, 0, 0, 0)]"
+                            )
+                        ]
+                        if rec.colvec_scalar_full is not None and not force_gmem_aux
                         else []
                     ),
                 ]
@@ -2551,6 +3180,56 @@ def _codegen_cute_store_tcgen05_tile(
                     + "\n",
                 ]
             )
+        # Broadcast auxiliaries are partitioned against the same accumulator
+        # carrier, so their fragments share an index domain, coordinates, and
+        # validity predicate. Load all of them in one scalar edge loop instead
+        # of traversing that coordinate fragment once per auxiliary tensor.
+        if (
+            force_simt_edge_aux
+            and len(aux_step_records) >= 2
+            and all(rec.broadcast_axis is not None for rec in aux_step_records)
+        ):
+            for rec in aux_step_records:
+                lines.extend(
+                    [
+                        (
+                            f"{prelude_indent}{rec.ttr_aux_subtile} = "
+                            f"{rec.ttr_aux_grouped}[(None, None, None, "
+                            "cutlass.Int32(_tcgen05_subtile))]\n"
+                        ),
+                        (
+                            f"{prelude_indent}{rec.aux_rmem} = "
+                            f"cute.make_rmem_tensor({rec.ttr_aux_subtile}.shape, "
+                            f"{rec.aux_dtype})\n"
+                        ),
+                        f"{prelude_indent}{rec.aux_rmem}.fill(0)\n",
+                    ]
+                )
+            first_rec = aux_step_records[0]
+            lines.extend(
+                [
+                    _simt_edge_coord_subtile_source(prelude_indent),
+                    (
+                        f"{prelude_indent}for _edge_i in range(cute.size("
+                        f"{first_rec.ttr_aux_subtile}.shape)):\n"
+                    ),
+                    f"{prelude_indent}    _coord = {ttr_cc_subtile}[_edge_i]\n",
+                    (
+                        f"{prelude_indent}    if cute.elem_less("
+                        f"_coord, ({m_size}, {n_size})):\n"
+                    ),
+                ]
+            )
+            for rec in aux_step_records:
+                lines.append(
+                    f"{prelude_indent}        {rec.aux_rmem}[_edge_i] = "
+                    f"{rec.ttr_aux_subtile}[_edge_i]\n"
+                )
+            for rec in aux_step_records:
+                lines.append(
+                    f"{prelude_indent}{rec.aux_loaded} = {rec.aux_rmem}.load()\n"
+                )
+            return "".join(lines)
         for aux_idx, rec in enumerate(aux_step_records):
             rowvec_stage = rowvec_aux_stage_records[aux_idx]
             if (
@@ -2653,11 +3332,17 @@ def _codegen_cute_store_tcgen05_tile(
                     f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
                 )
                 if tcgen05_colvec_fragment_single_m_row:
-                    lines.append(
-                        f"{prelude_indent}{rec.aux_loaded} = "
-                        f"{rec.ttr_aux_grouped}"
-                        f"[(0, 0, 0, cutlass.Int32(_tcgen05_subtile))]\n"
-                    )
+                    if rec.colvec_scalar_full is not None:
+                        lines.append(
+                            f"{prelude_indent}{rec.aux_loaded} = "
+                            f"{rec.colvec_scalar_full}\n"
+                        )
+                    else:
+                        lines.append(
+                            f"{prelude_indent}{rec.aux_loaded} = "
+                            f"{rec.ttr_aux_grouped}"
+                            "[(0, 0, 0, cutlass.Int32(_tcgen05_subtile))]\n"
+                        )
                 else:
                     lines.append(
                         _materialize_broadcast_aux_source(
@@ -2713,6 +3398,7 @@ def _codegen_cute_store_tcgen05_tile(
         *,
         force_simt_edge_aux: bool = False,
         safe_direct_aux_with_full_tile: bool = False,
+        coord_layout: str = "ttr",
     ) -> tuple[str, str, str]:
         """Return ``(early_aux_prelude, late_prelude, assignment_rhs)``.
 
@@ -2749,8 +3435,42 @@ def _codegen_cute_store_tcgen05_tile(
         chain.
         """
         load_expr = f"{carrier_name}.load()"
+        if fragment_epilogue is not None:
+            coordinate_setup, coordinate_name = _coord_subtile_source(
+                prelude_indent, coord_layout, include_setup=True
+            )
+            from .._compiler.cute.fragment_epilogue import (
+                render_tcgen05_fragment_epilogue,
+            )
+
+            fragment_prelude, fragment_expression = render_tcgen05_fragment_epilogue(
+                state,
+                fragment_epilogue,
+                carrier_name=carrier_name,
+                coordinate_name=coordinate_name,
+                target_dtype=target_dtype,
+                indent=prelude_indent,
+            )
+            return "", coordinate_setup + fragment_prelude, fragment_expression
         if epilogue_chain is None or not epilogue_chain.steps:
-            return ("", "", f"{load_expr}.to({target_dtype})")
+            rhs = load_expr
+            late_prelude = ""
+            if worklist_nm_segment_valid_m_bound:
+                coord_prelude, coord_subtile = _coord_subtile_source(
+                    prelude_indent,
+                    coord_layout,
+                    include_setup=True,
+                )
+                worklist_valid_prelude, worklist_valid_expr = (
+                    _worklist_nm_segment_valid_m_prelude_and_expr(
+                        prelude_indent,
+                        carrier_name,
+                        coord_subtile,
+                    )
+                )
+                rhs = f"cute.where({worklist_valid_expr}, {rhs}, 0.0)"
+                late_prelude = coord_prelude + worklist_valid_prelude
+            return "", late_prelude, f"({rhs}).to({target_dtype})"
         loaded = df.new_var("tcgen05_acc_loaded")
         prelude_load = f"{prelude_indent}{loaded} = {load_expr}\n"
         early_aux_prelude = _aux_subtile_load_source(
@@ -2759,12 +3479,35 @@ def _codegen_cute_store_tcgen05_tile(
             force_simt_edge_aux=force_simt_edge_aux,
             safe_direct_aux_with_full_tile=safe_direct_aux_with_full_tile,
         )
-        aux_locals: tuple[str, ...] = tuple(rec.aux_loaded for rec in aux_step_records)
+        aux_locals_by_expr = {rec.expr: rec.aux_loaded for rec in aux_step_records}
+        assert len(aux_locals_by_expr) == len(aux_step_records)
+        if (
+            len(epilogue_chain.steps) == 1
+            and epilogue_chain.steps[0].hoistable_aux_expr is not None
+        ):
+            # The auxiliary expression does not depend on the accumulator.
+            # Form it with the auxiliary-load prelude so pre-wait placement can
+            # overlap its loads and elementwise operations with the MMA tail.
+            expr_step = epilogue_chain.steps[0]
+            aux_expr_prelude, aux_expr = (
+                expr_step.render_hoistable_aux_prelude_and_expr(
+                    aux_locals_by_expr,
+                    df.new_var,
+                    prelude_indent,
+                )
+            )
+            final_expr = df.new_var("tcgen05_chain_step")
+            rendered_step = expr_step.render_with_hoisted_aux(loaded, aux_expr)
+            return (
+                early_aux_prelude + aux_expr_prelude,
+                prelude_load + f"{prelude_indent}{final_expr} = {rendered_step}\n",
+                f"({final_expr}).to({target_dtype})",
+            )
         chain_prelude, final_expr = epilogue_chain.render_prelude_and_expr(
             loaded,
             df.new_var,
             prelude_indent,
-            aux_locals_by_step=aux_locals or None,
+            aux_locals_by_expr=aux_locals_by_expr or None,
         )
         return (
             early_aux_prelude,
@@ -2772,10 +3515,37 @@ def _codegen_cute_store_tcgen05_tile(
             f"({final_expr}).to({target_dtype})",
         )
 
+    grouped_tma_plan = matmul_plan if grouped_tail_epilogue or segment_store else None
+    grouped_tma = grouped_tma_plan.grouped if grouped_tma_plan is not None else None
+    d_tma_uses_rank3_mnl_tensor = grouped_fixed_d_tensormap or (
+        grouped_tma is not None
+        and grouped_tma.d_mode is not Tcgen05GroupedDMode.NONE
+        and grouped_tma.d_tensormap is not None
+        and grouped_tma.d_mode is not Tcgen05GroupedDMode.EDGE_ONLY
+    )
+    d_tma_uses_tail_rank3_mnl_tensor = (
+        grouped_tma is not None
+        and grouped_tma.d_mode is not Tcgen05GroupedDMode.NONE
+        and grouped_tma.d_tensormap is not None
+        and grouped_tma.d_mode is Tcgen05GroupedDMode.EDGE_ONLY
+        and bool(tcgen05_value.tail_tma_store_atom)
+        and bool(tcgen05_value.tail_tma_store_tensor)
+    )
     if tcgen05_value.use_tma_store_epilogue:
         df.placeholder_args.add(tensor_name)
         df.wrapper_only_params.extend(
-            [tcgen05_value.tma_store_atom, tcgen05_value.tma_store_tensor]
+            [
+                tcgen05_value.tma_store_atom,
+                tcgen05_value.tma_store_tensor,
+                *(
+                    [
+                        tcgen05_value.tail_tma_store_atom,
+                        tcgen05_value.tail_tma_store_tensor,
+                    ]
+                    if d_tma_uses_tail_rank3_mnl_tensor
+                    else []
+                ),
+            ]
         )
         if tcgen05_value.use_role_local_epi and tcgen05_value.role_local_tile_counter:
             df.cute_state.register_tcgen05_epi_role_tile_counter(
@@ -2795,21 +3565,24 @@ def _codegen_cute_store_tcgen05_tile(
         d_tma_plan: dict[str, object] = {
             "kind": "tcgen05_d_tma",
             "d_name": tensor_name,
-            "bm": tcgen05_value.bm,
-            "bn": tcgen05_value.bn,
+            "bm": tcgen05_tma_store_bm,
+            "bn": tcgen05_tma_store_bn,
             "c_stage_count": tcgen05_value.c_stage_count,
             "output_dtype": target_dtype,
             "kernel_args": [
                 tcgen05_value.tma_store_atom,
                 tcgen05_value.tma_store_tensor,
             ],
+            **({"orientation": "nm"} if tcgen05_nm_store else {}),
+            **({"fixed_tensormap": True} if grouped_fixed_d_tensormap else {}),
+            **({"rank3_mnl_tensor": True} if d_tma_uses_rank3_mnl_tensor else {}),
             **(
                 {
                     "epi_tile_raw_expr": tcgen05_two_cta_m128_epilogue_tile_expr(
                         tcgen05_value.bm,
                         tcgen05_value.bn,
                         target_dtype,
-                        c_layout="cutlass.utils.layout.LayoutEnum.ROW_MAJOR",
+                        c_layout=tcgen05_d_store_layout,
                     )
                 }
                 if d_two_cta_m128 and not tcgen05_value.has_explicit_epilogue_tile
@@ -2827,7 +3600,19 @@ def _codegen_cute_store_tcgen05_tile(
         }
         if leading_passthrough_output:
             d_tma_plan["d_leading_passthrough"] = True
+        if tcgen05_value.output_column_major:
+            d_tma_plan["d_column_major"] = True
         state.codegen.cute_wrapper_plans.append(d_tma_plan)
+        if d_tma_uses_tail_rank3_mnl_tensor:
+            tail_d_tma_plan = {
+                **d_tma_plan,
+                "kernel_args": [
+                    tcgen05_value.tail_tma_store_atom,
+                    tcgen05_value.tail_tma_store_tensor,
+                ],
+                "rank3_mnl_tensor": True,
+            }
+            state.codegen.cute_wrapper_plans.append(tail_d_tma_plan)
 
     tcgen05_bm = tcgen05_value.bm
     tcgen05_bn = tcgen05_value.bn
@@ -2847,23 +3632,153 @@ def _codegen_cute_store_tcgen05_tile(
         bn=tcgen05_bn,
         is_two_cta=tcgen05_is_two_cta,
         elem_dtype=target_dtype,
-        c_layout="cutlass.utils.layout.LayoutEnum.ROW_MAJOR",
+        c_layout=tcgen05_d_store_layout,
         explicit_expr=tcgen05_explicit_store_tile_expr,
     )
     full_tile_expr = (
-        f"({m_index}) + cutlass.Int32({tcgen05_bm}) <= {m_size} "
-        f"and ({n_index}) + cutlass.Int32({tcgen05_bn}) <= {n_size}"
+        (
+            f"{segment_store_local_m} + cutlass.Int32({tcgen05_source_bm}) "
+            f"<= cutlass.Int32({tcgen05_value.segment_store_actual_m}) "
+            f"and {segment_store_base_m} + cutlass.Int32({tcgen05_source_bm}) "
+            f"<= {m_size} "
+        )
+        if segment_store
+        else f"({m_index}) + cutlass.Int32({tcgen05_source_bm}) <= {m_size} "
+    ) + f"and ({n_index}) + cutlass.Int32({tcgen05_source_bn}) <= {n_size}"
+    grouped_tail = grouped_tma
+    grouped_tail_store = (
+        grouped_tail is not None
+        and bool(grouped_tail.global_m_start)
+        and bool(grouped_tail.problem_m)
+        and bool(grouped_tail.problem_n)
+    )
+    grouped_tail_global_m_start = ""
+    grouped_tail_problem_m = ""
+    grouped_tail_problem_n = ""
+    grouped_dynamic_d_tensormap = False
+    grouped_tail_metadata_idx = ""
+    grouped_tail_cta_tile_idx_m = ""
+    grouped_tail_cta_tile_idx_n = ""
+    grouped_tail_d_tensormap = ""
+    grouped_tail_d_tensormap_slot = 0
+    grouped_direct_pointer_metadata = False
+    grouped_direct_pointers = ""
+    grouped_direct_strides = ""
+    grouped_dynamic_d_tensormap_edge_only = False
+    grouped_tail_store_problem_m = ""
+    grouped_tail_d_tensormap_problem_m = ""
+    if grouped_tail_store:
+        assert grouped_tail is not None
+        grouped_tail_global_m_start = grouped_tail.global_m_start
+        grouped_tail_problem_m = grouped_tail.problem_m
+        grouped_tail_problem_n = grouped_tail.problem_n
+        grouped_tail_store_problem_m = (
+            f"cutlass.Int32({tcgen05_value.segment_store_actual_m})"
+            if segment_store and tcgen05_value.orientation is Tcgen05Orientation.NM
+            else grouped_tail_problem_m
+        )
+        grouped_tail_d_tensormap_problem_m = (
+            grouped_tail_problem_m if tcgen05_nm_store else grouped_tail_store_problem_m
+        )
+        grouped_tail_metadata_idx = grouped_tail.metadata_idx
+        grouped_tail_cta_tile_idx_m = grouped_tail.cta_tile_idx_m
+        grouped_tail_cta_tile_idx_n = grouped_tail.cta_tile_idx_n
+        grouped_tail_d_tensormap = grouped_tail.d_tensormap or ""
+        grouped_tail_d_tensormap_slot = (
+            2 if grouped_tail.d_mode is Tcgen05GroupedDMode.ALL_TILES else 0
+        )
+        grouped_direct_pointer_metadata = grouped_tail.direct_pointers is not None
+        grouped_direct_pointers = grouped_tail.direct_pointers or ""
+        grouped_direct_strides = grouped_tail.direct_strides or ""
+        grouped_dynamic_d_tensormap = (
+            grouped_tail.d_mode is not Tcgen05GroupedDMode.NONE
+            and bool(grouped_tail_d_tensormap)
+        )
+        grouped_dynamic_d_tensormap_edge_only = (
+            grouped_dynamic_d_tensormap
+            and grouped_tail.d_mode is Tcgen05GroupedDMode.EDGE_ONLY
+            and tcgen05_value.tma_store_full_tiles_only
+        )
+        if segment_store:
+            segment_grouped_local_m = (
+                "cutlass.Int32(0)"
+                if tcgen05_nm_store
+                else f"(({segment_store_local_m}) - {grouped_tail_global_m_start})"
+            )
+            full_tile_expr = (
+                f"{segment_grouped_local_m} + cutlass.Int32({tcgen05_source_bm}) "
+                f"<= {grouped_tail_store_problem_m} "
+                f"and ({segment_store_base_m}) + cutlass.Int32({tcgen05_source_bm}) "
+                f"<= {m_size} "
+                f"and ({n_index}) + cutlass.Int32({tcgen05_source_bn}) "
+                f"<= {grouped_tail_problem_n} "
+                f"and ({n_index}) + cutlass.Int32({tcgen05_source_bn}) "
+                f"<= {n_size}"
+            )
+        else:
+            full_tile_expr = (
+                f"{full_tile_expr} and "
+                f"(({m_index}) - {grouped_tail_global_m_start}) "
+                f"+ cutlass.Int32({tcgen05_source_bm}) <= {grouped_tail_store_problem_m} "
+                f"and ({n_index}) + cutlass.Int32({tcgen05_source_bn}) "
+                f"<= {grouped_tail_problem_n}"
+            )
+    grouped_dynamic_d_tensormap_all_tiles = (
+        grouped_dynamic_d_tensormap and not grouped_dynamic_d_tensormap_edge_only
     )
 
+    def _edge_predicate_expr(coord: str) -> str:
+        if segment_store:
+            if grouped_tail_store:
+                local_m = (
+                    f"{coord}[0]"
+                    if tcgen05_nm_store
+                    else (
+                        f"(({segment_store_local_m}) - {grouped_tail_global_m_start}) "
+                        f"+ {coord}[0]"
+                    )
+                )
+                actual_m = grouped_tail_store_problem_m
+            else:
+                local_m = f"({segment_store_local_m}) + {coord}[0]"
+                actual_m = f"cutlass.Int32({tcgen05_aux_segment_store_actual_m})"
+            global_m = f"({segment_store_base_m}) + {coord}[0]"
+            global_n = f"({n_index}) + {coord}[1]"
+            return (
+                f"{local_m} < {actual_m} "
+                f"and cutlass.Int32(0) <= {global_m} "
+                f"and {global_m} < {m_size} "
+                f"and {global_n} < {n_size}"
+            )
+        global_pred = f"cute.elem_less({coord}, ({m_size}, {n_size}))"
+        if not grouped_tail_store:
+            return global_pred
+        return (
+            f"{global_pred} and "
+            f"({coord}[0] - {grouped_tail_global_m_start}) >= cutlass.Int32(0) "
+            f"and ({coord}[0] - {grouped_tail_global_m_start}) "
+            f"< {grouped_tail_store_problem_m} "
+            f"and {coord}[1] < {grouped_tail_problem_n}"
+        )
+
     def store_common_setup(
-        gmem_tensor: str, *, include_full_tile: bool, tma_store: bool = False
+        gmem_tensor: str,
+        *,
+        include_full_tile: bool,
+        tma_store: bool = False,
+        dynamic_d_tensormap: bool = False,
+        rank3_mnl_tensor: bool | None = None,
     ) -> tuple[list[str], list[str]]:
+        if rank3_mnl_tensor is None:
+            rank3_mnl_tensor = d_tma_uses_rank3_mnl_tensor
+        store_bm = tcgen05_tma_store_bm if tma_store else tcgen05_bm
+        store_bn = tcgen05_tma_store_bn if tma_store else tcgen05_bn
         epi_tile_expr = tcgen05_store_epi_tile_expr
         static_setup = [
             (
                 f"{kernel_desc} = type('Tcgen05KernelDesc', (), {{"
                 f"'cta_tile_shape_mnk': ({tcgen05_store_tile_m}, {tcgen05_bn}, {tcgen05_bk}), "
-                "'c_layout': cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+                f"'c_layout': {tcgen05_d_store_layout}, "
                 f"'c_dtype': {target_dtype}, "
                 "'acc_dtype': cutlass.Float32, "
                 f"'epilog_sync_bar_id': cutlass.Int32({tcgen05_epilog_sync_barrier_id}), "
@@ -2892,7 +3807,7 @@ def _codegen_cute_store_tcgen05_tile(
                 [
                     (
                         f"{gmem_tile_3d} = cute.local_tile("
-                        f"{gmem_tensor}, ({tcgen05_bm}, {tcgen05_bn}, 1), "
+                        f"{gmem_tensor}, ({store_bm}, {store_bn}, 1), "
                         f"({tile_coord_m}, {tile_coord_n}, "
                         f"cutlass.Int32({leading_index})))"
                     ),
@@ -2911,19 +3826,85 @@ def _codegen_cute_store_tcgen05_tile(
                     leading_index,
                 )
             )
-        tile_setup.extend(
-            [
-                (
-                    f"{gmem_tile} = cute.local_tile("
-                    f"{local_gmem_tensor}, ({tcgen05_bm}, {tcgen05_bn}), "
-                    f"({tile_coord_m}, {tile_coord_n}))"
-                ),
-                f"{tcgc_base} = {tcgen05_thr_mma}.partition_C({gmem_tile})",
-            ]
-        )
+        if (
+            gmem_tensor
+            in (tcgen05_aux_tma_store_tensor, tcgen05_aux_tail_tma_store_tensor)
+            and rank3_mnl_tensor
+        ):
+            if grouped_fixed_d_tensormap:
+                source_coord_m = (
+                    f"{grouped_tail_global_m_start} // "
+                    f"cutlass.Int32({tcgen05_source_bm}) + "
+                    f"{grouped_tail_cta_tile_idx_m}"
+                )
+                source_coord_n = grouped_tail_cta_tile_idx_n
+            else:
+                source_coord_m = (
+                    grouped_tail_cta_tile_idx_m
+                    if dynamic_d_tensormap
+                    else static_tile_coord_m
+                )
+                source_coord_n = (
+                    grouped_tail_cta_tile_idx_n
+                    if dynamic_d_tensormap
+                    else static_tile_coord_n
+                )
+            if tcgen05_nm_store:
+                coord_m = source_coord_n
+                coord_n = source_coord_m
+            else:
+                coord_m = source_coord_m
+                coord_n = source_coord_n
+            tile_coord = f"({coord_m}, {coord_n}, 0)"
+        else:
+            tile_coord = f"({static_tile_coord_m}, {static_tile_coord_n})"
+        if segment_store and gmem_tensor == tensor_name:
+            index_dtype = CompileEnvironment.current().index_type()
+            tile_setup.extend(
+                [
+                    (
+                        f"{gmem_tile} = cute.make_tensor("
+                        f"{gmem_tensor}.iterator + "
+                        f"{index_dtype}({segment_store_base_m}) * "
+                        f"{index_dtype}({gmem_tensor}.layout.stride[0]) + "
+                        f"{index_dtype}({n_index}) * "
+                        f"{index_dtype}({gmem_tensor}.layout.stride[1]), "
+                        "cute.make_layout("
+                        f"({store_bm}, {store_bn}), "
+                        f"stride=({gmem_tensor}.layout.stride[0], "
+                        f"{gmem_tensor}.layout.stride[1])))"
+                    ),
+                    f"{coord_tile} = cute.make_identity_tensor(({store_bm}, {store_bn}))",
+                    f"{tcgc_base} = {tcgen05_thr_mma}.partition_C({gmem_tile})",
+                ]
+            )
+        else:
+            tile_setup.extend(
+                [
+                    (
+                        f"{gmem_tile} = cute.local_tile("
+                        f"{local_gmem_tensor}, ({store_bm}, {store_bn}), "
+                        f"{tile_coord})"
+                    ),
+                    f"{tcgc_base} = {tcgen05_thr_mma}.partition_C({gmem_tile})",
+                ]
+            )
         return static_setup, tile_setup
 
-    simt_edge_only = tcgen05_value.tma_store_full_tiles_only
+    # A hybrid TMA/SIMT epilogue reaches SIMT only for edge tiles. A static
+    # output smaller than its selected tile also cannot produce a full tile,
+    # independent of whether its storage is row-major or column-major.
+    simt_edge_only = (
+        tcgen05_value.tma_store_full_tiles_only
+        and not grouped_dynamic_d_tensormap_edge_only
+    )
+    static_m_size = tensor.shape[-2]
+    static_n_size = tensor.shape[-1]
+    simt_edge_only = simt_edge_only or (
+        isinstance(static_m_size, int)
+        and isinstance(static_n_size, int)
+        and (static_m_size < tcgen05_value.bm or static_n_size < tcgen05_value.bn)
+    )
     simt_edge_aux_atoms: dict[int, str] = {}
     simt_edge_aux_atom_setup: list[str] = []
     if simt_edge_only:
@@ -2942,30 +3923,217 @@ def _codegen_cute_store_tcgen05_tile(
     simt_static_store_setup, simt_tile_store_setup = store_common_setup(
         tensor_name, include_full_tile=not simt_edge_only
     )
-    simt_early_aux, simt_late_prelude, simt_acc_vec_rhs = _splice_acc_vec(
-        ttr_racc,
-        "        ",
-        force_simt_edge_aux=tcgen05_value.tma_store_full_tiles_only,
-    )
+    if fragment_epilogue is not None and fragment_epilogue.changes_shape:
+        simt_early_aux = simt_late_prelude = ""
+        simt_acc_vec_rhs = ""
+    else:
+        simt_early_aux, simt_late_prelude, simt_acc_vec_rhs = _splice_acc_vec(
+            ttr_racc,
+            "        ",
+            force_simt_edge_aux=simt_edge_only,
+        )
     simt_acc_vec_prelude = simt_early_aux + simt_late_prelude
+    # SIMT auxiliary loads are independent of the accumulator. Edge-only
+    # stores always issue them early; full-tile SIMT stores do so when the
+    # placement config explicitly requests it. In either case their GMEM
+    # latency overlaps the MMA tail, and TMEM is copied only after the wait.
+    prefetch_simt_aux = (
+        (
+            simt_edge_only
+            or (
+                tcgen05_aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+                and not tcgen05_value.use_tma_store_epilogue
+            )
+        )
+        and bool(aux_steps_in_chain)
+        and not is_secondary_store
+    )
+    simt_acc_wait = (
+        "        if _tcgen05_subtile == 0:\n"
+        f"            {tcgen05_lifecycle.acc_pipeline}.consumer_wait("
+        f"{tcgen05_lifecycle.acc_consumer_state})\n"
+    )
     if tcgen05_value.use_tma_store_epilogue:
         tma_static_store_setup, tma_tile_store_setup = store_common_setup(
             tcgen05_value.tma_store_tensor,
             include_full_tile=partial_tma_needs_full_tile_guard,
             tma_store=True,
+            dynamic_d_tensormap=grouped_dynamic_d_tensormap_all_tiles,
+        )
+        dynamic_d_tma_tile_store_setup = (
+            store_common_setup(
+                tcgen05_value.tail_tma_store_tensor,
+                include_full_tile=False,
+                tma_store=True,
+                dynamic_d_tensormap=True,
+                rank3_mnl_tensor=True,
+            )[1]
+            if grouped_dynamic_d_tensormap_edge_only
+            else []
         )
     else:
         tma_static_store_setup, tma_tile_store_setup = [], []
+        dynamic_d_tma_tile_store_setup = []
+    grouped_d_tensormap_atom = (
+        tcgen05_value.tail_tma_store_atom
+        if grouped_dynamic_d_tensormap_edge_only
+        else tcgen05_value.tma_store_atom
+    )
+    grouped_d_tensormap_shape_expr = (
+        f"({grouped_tail_problem_n}, {grouped_tail_d_tensormap_problem_m}, cutlass.Int32(1))"
+        if tcgen05_nm_store
+        else f"({grouped_tail_d_tensormap_problem_m}, {grouped_tail_problem_n}, cutlass.Int32(1))"
+    )
+    grouped_d_tensormap_stride_expr = (
+        (
+            f"({grouped_d_tensormap_stride_n}, {grouped_d_tensormap_stride_m}, "
+            "cutlass.Int32(0))"
+        )
+        if grouped_direct_pointer_metadata and tcgen05_nm_store
+        else (
+            f"({grouped_d_tensormap_stride_m}, {grouped_d_tensormap_stride_n}, "
+            "cutlass.Int32(0))"
+        )
+        if grouped_direct_pointer_metadata
+        else (
+            f"({tensor_name}.layout.stride[1], {tensor_name}.layout.stride[0], "
+            "cutlass.Int32(0))"
+            if tcgen05_nm_store
+            else f"({tensor_name}.layout.stride[0], {tensor_name}.layout.stride[1], "
+            "cutlass.Int32(0))"
+        )
+    )
+    grouped_d_tensormap_setup: list[str] = []
+    grouped_d_tensormap_update: list[str] = []
+    if grouped_dynamic_d_tensormap:
+        index_dtype = CompileEnvironment.current().index_type()
+
+        def _grouped_direct_metadata_load(
+            tensor_name: str,
+            *indices: str | int,
+        ) -> str:
+            offset_terms = [
+                f"{index_dtype}({index}) * {index_dtype}("
+                f"{tensor_name}.layout.stride[{dim}])"
+                for dim, index in enumerate(indices)
+            ]
+            return f"({tensor_name}.iterator + {' + '.join(offset_terms)}).load()"
+
+        grouped_d_tensormap_base_expr = (
+            (
+                f"cute.make_ptr({target_dtype}, "
+                f"cutlass.Int64({grouped_d_tensormap_addr}), "
+                "cute.AddressSpace.gmem)"
+            )
+            if grouped_direct_pointer_metadata
+            else (
+                f"{tensor_name}.iterator + "
+                f"{index_dtype}({grouped_tail_global_m_start}) * "
+                f"{index_dtype}({tensor_name}.layout.stride[0])"
+            )
+        )
+        grouped_d_tensormap_direct_loads = (
+            (
+                f"    {grouped_d_tensormap_addr} = "
+                f"{_grouped_direct_metadata_load(grouped_direct_pointers, grouped_tail_metadata_idx, 2)}\n"
+                f"    {grouped_d_tensormap_stride_m} = "
+                f"{_grouped_direct_metadata_load(grouped_direct_strides, grouped_tail_metadata_idx, 2, 0)}\n"
+                f"    {grouped_d_tensormap_stride_n} = "
+                f"{_grouped_direct_metadata_load(grouped_direct_strides, grouped_tail_metadata_idx, 2, 1)}\n"
+            )
+            if grouped_direct_pointer_metadata
+            else ""
+        )
+        grouped_d_tensormap_setup = [
+            (
+                f"{grouped_d_tensormap_manager} = "
+                "cutlass.utils.TensorMapManager("
+                "cutlass.utils.TensorMapUpdateMode.SMEM, 128)"
+            ),
+            f"{grouped_d_tensormap_grid_dim} = cute.arch.grid_dim()",
+            (
+                f"{grouped_d_tensormap_workspace_idx} = ("
+                f"cute.arch.block_idx()[2] * "
+                f"{grouped_d_tensormap_grid_dim}[1] * "
+                f"{grouped_d_tensormap_grid_dim}[0] + "
+                f"cute.arch.block_idx()[1] * "
+                f"{grouped_d_tensormap_grid_dim}[0] + "
+                "cute.arch.block_idx()[0])"
+            ),
+            (
+                f"{grouped_d_tensormap_ptr} = "
+                f"{grouped_d_tensormap_manager}.get_tensormap_ptr("
+                f"{grouped_tail_d_tensormap}"
+                f"[({grouped_d_tensormap_workspace_idx}, "
+                f"{grouped_tail_d_tensormap_slot}, None)].iterator)"
+            ),
+            (
+                f"{grouped_d_tensormap_desc_ptr} = "
+                f"{grouped_d_tensormap_manager}.get_tensormap_ptr("
+                f"{grouped_d_tensormap_ptr}, cute.AddressSpace.generic)"
+            ),
+            (
+                f"{grouped_d_tensormap_smem_ptr} = "
+                "cute.arch.alloc_smem(cutlass.Int64, cutlass.Int32(16), "
+                "alignment=128)"
+            ),
+            (
+                f"{grouped_d_tensormap_manager}.init_tensormap_from_atom("
+                f"{grouped_d_tensormap_atom}, {grouped_d_tensormap_smem_ptr}, "
+                "0)"
+            ),
+            f"{grouped_d_tensormap_manager}.fence_tensormap_initialization()",
+            f"{grouped_d_tensormap_last_group} = cutlass.Int32(-1)",
+        ]
+        grouped_d_tensormap_update = [
+            (
+                f"{grouped_d_tensormap_group_changed} = "
+                f"{grouped_tail_metadata_idx} != {grouped_d_tensormap_last_group}"
+            ),
+            (
+                f"if {grouped_d_tensormap_group_changed}:\n"
+                f"{grouped_d_tensormap_direct_loads}"
+                f"    {grouped_d_tensormap_base} = "
+                f"{grouped_d_tensormap_base_expr}\n"
+                f"    {grouped_d_tensormap_real_d} = cute.make_tensor("
+                f"{grouped_d_tensormap_base}, "
+                "cute.make_layout("
+                f"{grouped_d_tensormap_shape_expr}, "
+                f"stride={grouped_d_tensormap_stride_expr}))\n"
+                f"    {grouped_d_tensormap_manager}.update_tensormap("
+                f"({grouped_d_tensormap_real_d},), "
+                f"({grouped_d_tensormap_atom},), "
+                f"({grouped_d_tensormap_ptr},), 0, "
+                f"({grouped_d_tensormap_smem_ptr},))\n"
+                f"    if {tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
+                f"        {grouped_d_tensormap_manager}.fence_tensormap_update("
+                f"{grouped_d_tensormap_ptr})\n"
+                f"    {grouped_d_tensormap_last_group} = {grouped_tail_metadata_idx}"
+            ),
+        ]
     # Role-local TMA stores reuse one C pipeline across work tiles. Static-full
     # kernels increment this counter once per role-local tile; hybrid
     # output-edge kernels increment it only in the full-tile branch so SIMT
     # fallback edge tiles do not perturb the C-pipeline SMEM stage sequence.
     tma_c_buffer_expr = "cutlass.Int32(_tcgen05_subtile)"
     if tcgen05_value.role_local_tile_counter:
-        tma_c_buffer_expr = (
-            f"{tcgen05_value.role_local_tile_counter} * "
-            f"cutlass.Int32({subtile_count}) + cutlass.Int32(_tcgen05_subtile)"
-        )
+        if tcgen05_m_subtile_count > 1:
+            # The role-local tile counter advances once per WORK tile; fold
+            # the M-subtile index in so the C-ring parity stays continuous
+            # across the two drained subtiles regardless of subtile_count
+            # parity.
+            tma_c_buffer_expr = (
+                f"{tcgen05_value.role_local_tile_counter} * "
+                f"cutlass.Int32({tcgen05_m_subtile_count}) * "
+                f"cutlass.Int32({subtile_count}) + "
+                f"cutlass.Int32(_tcgen05_msub) * cutlass.Int32({subtile_count})"
+                " + cutlass.Int32(_tcgen05_subtile)"
+            )
+        else:
+            tma_c_buffer_expr = (
+                f"{tcgen05_value.role_local_tile_counter} * "
+                f"cutlass.Int32({subtile_count}) + cutlass.Int32(_tcgen05_subtile)"
+            )
     simt_store_edge_coord_preloaded = simt_edge_only and bool(aux_steps_in_chain)
     if simt_edge_only:
         simt_store_copy_source = _simt_edge_logical_divide_copy_source(
@@ -3010,14 +4178,14 @@ def _codegen_cute_store_tcgen05_tile(
             f"(None, None, None, None, None, {tcgen05_acc_stage_index_expr})]"
         ),
         *(
-            []
-            if is_secondary_store
-            else [
+            [
                 (
                     f"if {tcgen05_lifecycle.epi_active}:\n"
                     f"    {tcgen05_lifecycle.acc_pipeline}.consumer_wait({tcgen05_lifecycle.acc_consumer_state})"
                 )
             ]
+            if not (is_secondary_store or prefetch_simt_aux)
+            else []
         ),
         f"{ttr_tacc} = cute.group_modes({ttr_tacc_stage}, 3, cute.rank({ttr_tacc_stage}))",
         f"{ttr_gc_grouped} = cute.group_modes({ttr_gc}, 3, cute.rank({ttr_gc}))",
@@ -3072,9 +4240,14 @@ def _codegen_cute_store_tcgen05_tile(
             f"    if {tcgen05_lifecycle.epi_active}:\n"
             f"        {ttr_tacc_mn} = {ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
             f"        {ttr_gc_subtile} = {ttr_gc_grouped}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
-            f"        cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
-            f"{simt_acc_vec_prelude}"
-            f"        {acc_vec} = {simt_acc_vec_rhs}\n"
+            + (f"{simt_early_aux}{simt_acc_wait}" if prefetch_simt_aux else "")
+            + f"        cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
+            + (
+                f"{simt_late_prelude}"
+                if prefetch_simt_aux
+                else f"{simt_acc_vec_prelude}"
+            )
+            + f"        {acc_vec} = {simt_acc_vec_rhs}\n"
             f"        {ttr_rd}.store({acc_vec})\n"
             # The secondary fan-out store reuses the still-live accumulator and
             # must not release it; the primary store owns the release + advance.
@@ -3110,6 +4283,240 @@ def _codegen_cute_store_tcgen05_tile(
             )
         ),
     ]
+    compact_tma_per_tile_setup: list[str] | None = None
+    if fragment_epilogue is not None and fragment_epilogue.changes_shape:
+        from .._compiler.cute.fragment_epilogue import (
+            render_tcgen05_fragment_epilogue_group,
+        )
+
+        destination_bm = fragment_epilogue.destination_shape[-2]
+        destination_bn = fragment_epilogue.destination_shape[-1]
+        destination_subtile_count = len(fragment_epilogue.programs)
+        compact_tma_store = tcgen05_value.use_tma_store_epilogue
+        assert leading_index is not None
+
+        # The normal epilogue_tmem_copy_and_partition helper couples the full
+        # accumulator partition to a destination derived from transformed
+        # thr_mma.partition_C(C). Compact fragments instead partition the
+        # destination from a separately proven logical compact tile, whose
+        # subtile count can differ from the accumulator.
+        def _compact_fragment_partition_setup(
+            *,
+            before_t2r_setup: list[str],
+            before_destination_partition: list[str],
+        ) -> list[str]:
+            return [
+                *before_t2r_setup,
+                f"{tacc_epi} = cute.flat_divide({tacc}, {epi_tile})",
+                (
+                    f"{tiled_copy_t2r} = cute.nvgpu.tcgen05.make_tmem_copy("
+                    f"{tcgen05_value.tmem_load_atom}, "
+                    f"{tacc_epi}[(None, None, 0, 0, 0)])"
+                ),
+                f"{thr_copy_t2r} = {tiled_copy_t2r}.get_slice({tcgen05_value.epi_tidx})",
+                f"{ttr_tacc_base} = {thr_copy_t2r}.partition_S({tacc_epi})",
+                *before_destination_partition,
+                f"{compact_ttr_gd} = {thr_copy_t2r}.partition_D({compact_gmem_epi})",
+                (
+                    f"{compact_ttr_gd_grouped} = cute.group_modes("
+                    f"{compact_ttr_gd}, 3, cute.rank({compact_ttr_gd}))"
+                ),
+                (
+                    f"{coord_tile} = cute.local_tile("
+                    f"cute.make_identity_tensor(({m_size}, {n_size})), "
+                    f"({destination_bm}, {destination_bn}), "
+                    f"({tile_coord_m}, {tile_coord_n}))"
+                ),
+                f"{compact_coord_epi} = cute.flat_divide({coord_tile}, {epi_tile})",
+                f"{compact_ttr_coord} = {thr_copy_t2r}.partition_D({compact_coord_epi})",
+                (
+                    f"{compact_ttr_coord_grouped} = cute.group_modes("
+                    f"{compact_ttr_coord}, 3, cute.rank({compact_ttr_coord}))"
+                ),
+                (
+                    f"{ttr_tacc_stage} = {ttr_tacc_base}["
+                    f"(None, None, None, None, None, "
+                    f"{tcgen05_acc_stage_index_expr})]"
+                ),
+                (
+                    f"if {tcgen05_lifecycle.epi_active}:\n"
+                    f"    {tcgen05_lifecycle.acc_pipeline}.consumer_wait("
+                    f"{tcgen05_lifecycle.acc_consumer_state})"
+                ),
+                (
+                    f"{ttr_tacc} = cute.group_modes({ttr_tacc_stage}, 3, "
+                    f"cute.rank({ttr_tacc_stage}))"
+                ),
+                (
+                    f"{ttr_racc} = cute.make_rmem_tensor("
+                    f"{compact_ttr_gd_grouped}["
+                    f"(None, None, None, cutlass.Int32(0))].shape, cutlass.Float32)"
+                ),
+                f"{ttr_rd} = cute.make_rmem_tensor({ttr_racc}.shape, {target_dtype})",
+            ]
+
+        # Traverse the committed fragment program exactly once. The program is
+        # independent of the drain: SIMT writes registers directly to GMEM,
+        # while TMA stages the same destination registers through SMEM.
+        scheduled_source = f"if {tcgen05_lifecycle.epi_active}:\n"
+        for destination_subtile, destination_program in enumerate(
+            fragment_epilogue.programs
+        ):
+            if compact_tma_store and destination_subtile:
+                scheduled_source += (
+                    f"    if {tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
+                    f"        {c_pipeline}.producer_acquire()\n"
+                )
+            if not compact_tma_store:
+                scheduled_source += (
+                    f"    {compact_gd_subtile} = {compact_ttr_gd_grouped}["
+                    f"(None, None, None, cutlass.Int32({destination_subtile}))]\n"
+                )
+            scheduled_source += (
+                f"    {compact_coord_subtile} = {compact_ttr_coord_grouped}["
+                f"(None, None, None, cutlass.Int32({destination_subtile}))]\n"
+            )
+            for program in destination_program.groups:
+                scheduled_source += (
+                    f"    {ttr_tacc_mn} = {ttr_tacc}["
+                    f"(None, None, None, cutlass.Int32({program.source_subtile}))]\n"
+                    f"    cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
+                )
+                scheduled_source += render_tcgen05_fragment_epilogue_group(
+                    state,
+                    fragment_epilogue,
+                    program,
+                    carrier_name=ttr_racc,
+                    destination_name=ttr_rd,
+                    coordinate_name=compact_coord_subtile,
+                    target_dtype=target_dtype,
+                    indent="    ",
+                )
+            if destination_subtile == destination_subtile_count - 1:
+                scheduled_source += (
+                    "    cute.arch.fence_view_async_tmem_load()\n"
+                    "    with cute.arch.elect_one():\n"
+                    f"        {tcgen05_lifecycle.acc_pipeline}.consumer_release("
+                    f"{tcgen05_lifecycle.acc_consumer_state})\n"
+                )
+            if compact_tma_store:
+                c_buffer_index = (
+                    f"{tcgen05_value.role_local_tile_counter} * "
+                    f"cutlass.Int32({destination_subtile_count}) + "
+                    f"cutlass.Int32({destination_subtile})"
+                    if tcgen05_value.role_local_tile_counter
+                    else f"cutlass.Int32({destination_subtile})"
+                )
+                scheduled_source += (
+                    f"    {epilog_sync_barrier}.arrive_and_wait()\n"
+                    f"    {c_buffer} = ({c_buffer_index}) % "
+                    f"cutlass.Int32({tcgen05_value.c_stage_count})\n"
+                    f"    cute.copy({tiled_copy_r2s}, {trs_rd}, "
+                    f"{trs_sd}[(None, None, None, {c_buffer})])\n"
+                    "    cute.arch.fence_view_async_shared()\n"
+                    f"    {epilog_sync_barrier}.arrive_and_wait()\n"
+                    f"    if {tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
+                    f"        cute.copy({tcgen05_value.tma_store_atom}, "
+                    f"{bsg_sd}[(None, {c_buffer})], "
+                    f"{bsg_gd}[(None, cutlass.Int32({destination_subtile}))])\n"
+                    f"        {c_pipeline}.producer_commit()\n"
+                )
+            else:
+                scheduled_source += (
+                    f"    cute.copy({simt_atom}, {ttr_rd}, {compact_gd_subtile})\n"
+                )
+        scheduled_source += emit_pipeline_advance(
+            tcgen05_lifecycle.acc_consumer_state,
+            indent="    ",
+        )
+
+        if compact_tma_store:
+            compact_tma_per_tile_setup = [
+                (
+                    f"if {tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
+                    f"    {c_pipeline}.producer_acquire()"
+                ),
+                *tma_tile_store_setup,
+                (
+                    f"{tcgc} = cutlass.utils.gemm.sm100."
+                    f"transform_partitioned_tensor_layout({tcgc_base})"
+                ),
+                (
+                    f"{tcgc_planned} = cute.make_tensor("
+                    f"{tcgc}.iterator, cute.append(cute.append(cute.append("
+                    f"{tcgc}.layout, {tcgen05_aux_epilogue_rest_mode}), "
+                    f"{tcgen05_aux_epilogue_rest_mode}), "
+                    f"{tcgen05_aux_epilogue_rest_mode}))"
+                ),
+                *_compact_fragment_partition_setup(
+                    before_t2r_setup=[],
+                    before_destination_partition=[
+                        f"{compact_gmem_epi} = cute.flat_divide({gmem_tile}, {epi_tile})"
+                    ],
+                ),
+                (
+                    f"{tiled_copy_r2s}, {trs_rd}, {trs_sd} = "
+                    "cutlass.utils.gemm.sm100.epilogue_smem_copy_and_partition("
+                    f"{kernel_desc}, {tiled_copy_t2r}, {ttr_rd}, "
+                    f"{tcgen05_aux_epi_tidx}, {smem_d})"
+                ),
+                f"{tcgc_epi} = cute.flat_divide({tcgc_planned}, {epi_tile})",
+                (
+                    f"{bsg_sd}, {bsg_gd_partitioned} = "
+                    "cute.nvgpu.cpasync.tma_partition("
+                    f"{tcgen05_value.tma_store_atom}, 0, cute.make_layout(1), "
+                    f"cute.group_modes({smem_d}, 0, 2), "
+                    f"cute.group_modes({tcgc_epi}, 0, 2))"
+                ),
+                (
+                    f"{bsg_gd} = {bsg_gd_partitioned}["
+                    "(None, None, None, cutlass.Int32(0), "
+                    "cutlass.Int32(0), cutlass.Int32(0))]"
+                ),
+                f"{bsg_gd} = cute.group_modes({bsg_gd}, 1, cute.rank({bsg_gd}))",
+                scheduled_source,
+            ]
+        else:
+            simt_store_body_core = [
+                *simt_static_store_setup,
+                _cute_leading_passthrough_view_2d(
+                    compact_gmem_2d,
+                    tensor_name,
+                    leading_index,
+                ),
+                (
+                    f"{gmem_tile} = cute.local_tile({compact_gmem_2d}, "
+                    f"({destination_bm}, {destination_bn}), "
+                    f"({tile_coord_m}, {tile_coord_n}))"
+                ),
+                *_compact_fragment_partition_setup(
+                    before_t2r_setup=[
+                        f"{compact_gmem_epi} = cute.flat_divide({gmem_tile}, {epi_tile})",
+                        (
+                            f"{tacc} = cutlass.utils.gemm.sm100."
+                            f"transform_partitioned_tensor_layout("
+                            f"{tcgen05_value.epi_acc_frag_base})"
+                        ),
+                    ],
+                    before_destination_partition=[],
+                ),
+                (
+                    f"{mcld} = cute.max_common_layout({ttr_rd}.layout, "
+                    f"{compact_ttr_gd_grouped}["
+                    f"(None, None, None, cutlass.Int32(0))].layout)"
+                ),
+                (
+                    f"{num_bits} = min({compact_ttr_gd_grouped}.iterator.alignment "
+                    f"* 8, cute.size({mcld}) * {target_dtype}.width, 256)"
+                ),
+                (
+                    f"{simt_atom} = cute.make_copy_atom(cute.nvgpu.CopyR2GOp(), "
+                    f"{target_dtype}, num_bits_per_copy={num_bits}, "
+                    "l1c_evict_priority="
+                    "cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE)"
+                ),
+                scheduled_source,
+            ]
     # Workstream A Stage 4 (cycle 93, Path B): C-store producer->consumer edge.
     # Mirrors ``_emit_tcgen05_aux_pipeline_setup``'s SIMT PipelineAsync shape.
     # producer_arrive_count = ``epi_warp_count`` (per-warp: each of the 4 epi
@@ -3224,6 +4631,14 @@ def _codegen_cute_store_tcgen05_tile(
         or diagnose_module_helper_acc_t2r
         or diagnose_module_helper_store_tail
     )
+    elide_role_local_epi_active = (
+        tcgen05_value.use_role_local_epi
+        and tcgen05_value.use_tma_store_epilogue
+        and tcgen05_pure_matmul_object is None
+        and not has_store_warp
+        and not diagnose_split_epilogue_layout
+        and not diagnose_skip_epilogue_store
+    )
     if tcgen05_pure_matmul_object is not None and diagnose_split_epilogue_layout:
         raise exc.BackendUnsupported(
             "cute",
@@ -3242,17 +4657,15 @@ def _codegen_cute_store_tcgen05_tile(
             "tcgen05_warp_spec_store_warps>0 (Workstream A Stage 4 wires the "
             "store-warp epilogue split into the non-pure WITH_SCHEDULER path)",
         )
-    # The diagnostic split / module-helper epilogue layouts route the
-    # per-subtile tail through helpers that emit ONLY the ``if epi_active``
-    # half under ``has_store_warp`` (and ``module_helper_store_tail`` keeps the
-    # OLD two-barrier warp-0 ``c_pipeline`` tail while the main path suppressed
-    # the matching acquires) — so the C-store edge would have no consumer and
-    # wedge once the ring wraps, or the ``c_pipeline`` commit/acquire counts
-    # mismatch. They are diagnostic-only source-boundary layouts; production
-    # uses the DEFAULT layout, so reject the combination loudly (same guard
-    # class as the pure-matmul tail above). ``split_first_t2r`` routes through
-    # ``tma_store_subtile_body`` and IS handled by the Stage-4 split, so it is
-    # intentionally excluded.
+    # The non-default split/helper epilogue layouts route the per-subtile tail
+    # through helpers that emit ONLY the ``if epi_active`` half under
+    # ``has_store_warp`` (and ``module_helper_store_tail`` keeps the OLD
+    # two-barrier warp-0 ``c_pipeline`` tail while the main path suppressed the
+    # matching acquires) — so the C-store edge would have no consumer and wedge
+    # once the ring wraps, or the ``c_pipeline`` commit/acquire counts mismatch.
+    # Reject the combination loudly (same guard class as the pure-matmul tail
+    # above). ``split_first_t2r`` routes through ``tma_store_subtile_body`` and
+    # IS handled by the Stage-4 split, so it is intentionally excluded.
     if has_store_warp and (
         diagnose_split_acc_t2r_store_tail
         or diagnose_module_helper_acc_t2r
@@ -3261,9 +4674,9 @@ def _codegen_cute_store_tcgen05_tile(
         raise exc.BackendUnsupported(
             "cute",
             f"{TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY}={epilogue_layout!r} does not "
-            "support tcgen05_warp_spec_store_warps>0 (the diagnostic split / "
-            "module-helper epilogue layouts do not emit the store-warp tail "
-            "half of the Workstream A Stage 4 split; use the default layout)",
+            "support tcgen05_warp_spec_store_warps>0 (the split/helper "
+            "epilogue layouts do not emit the store-warp tail half of the "
+            "Workstream A Stage 4 split; use the default layout)",
         )
     if tcgen05_pure_matmul_object is not None:
         pure_c_store_pipeline = Tcgen05TmaStorePipelineParams(
@@ -3321,8 +4734,12 @@ def _codegen_cute_store_tcgen05_tile(
             else f"{tcgen05_value.warp_idx} == cutlass.Int32(0)"
         )
         first_acquire_role_gate = (
-            f"{tcgen05_lifecycle.epi_active} and "
             f"{tcgen05_value.warp_idx} == cutlass.Int32(0)"
+            if elide_role_local_epi_active
+            else (
+                f"{tcgen05_lifecycle.epi_active} and "
+                f"{tcgen05_value.warp_idx} == cutlass.Int32(0)"
+            )
         )
         tma_store_pipeline_tail = (
             f"if {c_pipeline_owner_predicate}:\n    {c_pipeline}.producer_tail()"
@@ -3386,15 +4803,12 @@ def _codegen_cute_store_tcgen05_tile(
                 f"{TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY}={epilogue_layout!r} is only "
                 f"validated for CtaGroup.TWO block_n >= {TCGEN05_TWO_CTA_BLOCK_N}",
             )
-        # The diagnostic split-epilogue layouts emit the per-thread
-        # chain into separate ``@cute.jit`` helpers (module-helper
-        # layouts) or split source boundaries; the auxiliary-tensor
-        # splice site needs per-tile aux setup that is not currently
-        # plumbed into those helper signatures. Reject the
-        # combination loudly so a user does not silently get a
-        # kernel that drops the aux read. The diagnostic layouts
-        # are only used for source-boundary investigation and do not
-        # block any production path.
+        # The split/helper epilogue layouts emit the per-thread chain into
+        # separate ``@cute.jit`` helpers or split source boundaries; the
+        # auxiliary-tensor splice site needs per-tile aux setup that is not
+        # currently plumbed into those helper signatures. Reject the combination
+        # loudly so a user does not silently get a kernel that drops the aux
+        # read.
         if (
             diagnose_module_helper_acc_t2r
             or diagnose_module_helper_store_tail
@@ -3406,9 +4820,7 @@ def _codegen_cute_store_tcgen05_tile(
                 "auxiliary-tensor epilogue (e.g. "
                 "`out[tile] = (acc + residual[tile]).to(dtype)`) is "
                 f"not plumbed through {TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY}="
-                f"{epilogue_layout!r}. The diagnostic split-epilogue "
-                "layouts are only used for source-boundary "
-                "investigation; drop the layout config to use the "
+                f"{epilogue_layout!r}. Drop the layout config to use the "
                 "default production layout.",
             )
     tma_store_split_first_subtile_acquire = (
@@ -3468,34 +4880,45 @@ def _codegen_cute_store_tcgen05_tile(
     tcgen05_acc_consumer_state = tcgen05_lifecycle.acc_consumer_state
     tcgen05_warp_idx = tcgen05_value.warp_idx
     tcgen05_tma_store_atom = tcgen05_value.tma_store_atom
+    grouped_d_tensormap_desc_arg = (
+        f", tma_desc_ptr={grouped_d_tensormap_desc_ptr}"
+        if grouped_dynamic_d_tensormap
+        else ""
+    )
+    tma_store_desc_arg = (
+        grouped_d_tensormap_desc_arg if grouped_dynamic_d_tensormap_all_tiles else ""
+    )
     # Locals for the store-warp tail closure (Pyrefly drops the non-None
     # tcgen05_value narrowing inside nested source formatters; see above).
     tcgen05_role_local_tile_counter = tcgen05_value.role_local_tile_counter
+    tma_store_d_subtile_expr = "cutlass.Int32(_tcgen05_subtile)"
 
     def tma_store_acc_t2r_region_body(
         *, acc_wait: str, allow_aux_chain: bool = False
     ) -> str:
         """Return the t2r/math/store-source region.
 
-        The aux prelude is rendered inside ``body`` immediately after
-        the TMEM→register copy and before ``acc.load()`` / fused math.
-        Keeping residual and bias fragments out of the acquire/T2R
-        prefix shortens their live ranges through the R2S store path;
-        the long-scoreboard overlap from the older hoist was less
-        valuable on the packed Target8 epilogue than eliminating the
-        resulting local-memory spills.
+        The default path renders the aux prelude after the TMEM→register
+        copy to keep large residual fragments out of the store prefix. The
+        compact M64 and two-CTA M128 scaled-FP8 paths prefetch their small
+        scale fragments before the accumulator wait to hide the LDG latency.
         """
         assert allow_aux_chain or not aux_steps_in_chain, (
-            "diagnostic / module-helper layouts reject aux-tensor chains at "
-            "validate time; use allow_aux_chain=True only for the default TMA "
-            "store body that threads the aux LDG through the main T2R body."
+            "split/helper epilogue layouts reject aux-tensor chains at validate "
+            "time; use allow_aux_chain=True only for the default TMA store body "
+            "that threads the aux LDG through the main T2R body."
         )
         carrier = trs_racc
         store_target = trs_rd
+        worklist_nm_identity_store = bool(
+            worklist_nm_segment_valid_m_bound
+            and (epilogue_chain is None or not epilogue_chain.steps)
+        )
         early_aux_prelude, late_prelude, rhs = _splice_acc_vec(
             carrier,
-            "        ",
+            "            " if worklist_nm_identity_store else "        ",
             safe_direct_aux_with_full_tile=partial_tma_needs_full_tile_guard,
+            coord_layout="trs",
         )
         # The secondary fan-out store reuses the still-live accumulator TMEM and
         # must not release it: the primary store already owns the accumulator
@@ -3511,15 +4934,52 @@ def _codegen_cute_store_tcgen05_tile(
                 f"                {tcgen05_acc_pipeline}.consumer_release({tcgen05_acc_consumer_state})\n"
             )
         )
+        pre_wait_aux = (
+            tcgen05_aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+        )
+        if worklist_nm_identity_store:
+            # Identity-store means the epilogue chain is empty, so
+            # ``_splice_acc_vec`` returns no auxiliary-load prelude by
+            # construction.
+            if early_aux_prelude:
+                raise RuntimeError(
+                    "worklist identity store unexpectedly produced an aux prelude"
+                )
+            # The generated worklist clamps valid_m to source_tile_m.  Almost
+            # every scheduled tile therefore needs no padding fixup at all.
+            # Keep the existing coordinate-derived predicate only in the
+            # uniform tail branch; this removes identity-tensor partitioning,
+            # predicate construction, and cute.where from full output tiles.
+            full_acc_vec = df.new_var("tcgen05_full_acc_vec")
+            tail_acc_vec = df.new_var("tcgen05_tail_acc_vec")
+            branch_acc_release = textwrap.indent(acc_release, "    ")
+            store_source = (
+                f"        if {worklist_nm_segment_valid_m_bound} == "
+                f"cutlass.Int32({tcgen05_source_bm}):\n"
+                f"            {full_acc_vec} = "
+                f"({carrier}.load()).to({target_dtype})\n"
+                f"{branch_acc_release}"
+                f"            {store_target}.store({full_acc_vec})\n"
+                f"        else:\n"
+                f"{late_prelude}"
+                f"            {tail_acc_vec} = {rhs}\n"
+                f"{branch_acc_release}"
+                f"            {store_target}.store({tail_acc_vec})\n"
+            )
+        else:
+            store_source = (
+                f"{'' if pre_wait_aux else early_aux_prelude}"
+                f"{late_prelude}"
+                f"        {acc_vec} = {rhs}\n"
+                f"{acc_release}"
+                f"        {store_target}.store({acc_vec})\n"
+            )
         return (
+            f"{early_aux_prelude if pre_wait_aux else ''}"
             f"{acc_wait}"
             f"        {ttr_tacc_mn} = {ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
             f"        cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
-            f"{early_aux_prelude}"
-            f"{late_prelude}"
-            f"        {acc_vec} = {rhs}\n"
-            f"{acc_release}"
-            f"        {store_target}.store({acc_vec})\n"
+            f"{store_source}"
         )
 
     def tma_store_tail_params(
@@ -3541,7 +5001,16 @@ def _codegen_cute_store_tcgen05_tile(
             c_pipeline=c_pipeline,
         )
 
-    def tma_store_tail_region(*, late_later_subtile_acquire: str) -> str:
+    def tma_store_tail_region(
+        *,
+        late_later_subtile_acquire: str,
+        tma_desc_arg: str | None = None,
+        tma_store_atom: str | None = None,
+    ) -> str:
+        if tma_desc_arg is None:
+            tma_desc_arg = tma_store_desc_arg
+        if tma_store_atom is None:
+            tma_store_atom = tcgen05_tma_store_atom
         if tcgen05_pure_matmul_object is not None:
             return tcgen05_pure_matmul_object.render_tma_store_tail_region(
                 tma_store_tail_params(
@@ -3571,6 +5040,11 @@ def _codegen_cute_store_tcgen05_tile(
                 f"            {c_store_edge}.producer_commit({c_store_edge_producer_state})\n"
                 f"        {c_store_edge_producer_state}.advance()\n"
             )
+        tma_copy_line = (
+            f"            cute.copy({tma_store_atom}, "
+            f"{bsg_sd}[(None, {c_buffer})], "
+            f"{bsg_gd}[(None, {tma_store_d_subtile_expr})]{tma_desc_arg})\n"
+        )
         return (
             f"{late_later_subtile_acquire}"
             f"        {epilog_sync_barrier}.arrive_and_wait()\n"
@@ -3579,11 +5053,17 @@ def _codegen_cute_store_tcgen05_tile(
             f"        cute.arch.fence_view_async_shared()\n"
             f"        {epilog_sync_barrier}.arrive_and_wait()\n"
             f"        if {tcgen05_warp_idx} == cutlass.Int32(0):\n"
-            f"            cute.copy({tcgen05_tma_store_atom}, {bsg_sd}[(None, {c_buffer})], {bsg_gd}[(None, cutlass.Int32(_tcgen05_subtile))])\n"
+            f"{tma_copy_line}"
             f"            {c_pipeline}.producer_commit()\n"
         )
 
-    def tma_store_store_warp_tail_region() -> str:
+    def tma_store_store_warp_tail_region(
+        *, tma_desc_arg: str | None = None, tma_store_atom: str | None = None
+    ) -> str:
+        if tma_desc_arg is None:
+            tma_desc_arg = tma_store_desc_arg
+        if tma_store_atom is None:
+            tma_store_atom = tcgen05_tma_store_atom
         # Path B store-warp tail (inside ``if store_warp_predicate:``): consume
         # the C-store edge, issue the TMA-D, and recycle the C-ring SMEM stage
         # with a ``c_stages - 1`` lagged release so a stage is only freed for
@@ -3609,11 +5089,16 @@ def _codegen_cute_store_tcgen05_tile(
             if tcgen05_role_local_tile_counter
             else "cutlass.Int32(_tcgen05_subtile)"
         )
+        tma_copy_line = (
+            f"        cute.copy({tma_store_atom}, "
+            f"{bsg_sd}[(None, {c_buffer})], "
+            f"{bsg_gd}[(None, {tma_store_d_subtile_expr})]{tma_desc_arg})\n"
+        )
         return (
             f"        {c_store_edge}.consumer_wait({c_store_edge_consumer_state})\n"
             f"        {c_store_edge_consumer_state}.advance()\n"
             f"        {c_buffer} = ({tma_c_buffer_expr}) % cutlass.Int32({tcgen05_c_stage_count})\n"
-            f"        cute.copy({tcgen05_tma_store_atom}, {bsg_sd}[(None, {c_buffer})], {bsg_gd}[(None, cutlass.Int32(_tcgen05_subtile))])\n"
+            f"{tma_copy_line}"
             f"        {c_pipeline}.producer_commit()\n"
             f"        {c_pipeline}.producer_acquire()\n"
             f"        if {global_subtile} >= cutlass.Int32({lag}):\n"
@@ -3628,7 +5113,14 @@ def _codegen_cute_store_tcgen05_tile(
         later_subtile_acquire: str,
         acc_wait: str,
         late_later_subtile_acquire: str,
+        tma_desc_arg: str | None = None,
+        tma_store_atom: str | None = None,
+        gate_epi_active: bool = True,
     ) -> str:
+        if tma_desc_arg is None:
+            tma_desc_arg = tma_store_desc_arg
+        if tma_store_atom is None:
+            tma_store_atom = tcgen05_tma_store_atom
         # The aux LDG depends on ``_tcgen05_subtile`` and stays inside
         # the per-subtile T2R body. It intentionally runs after the
         # c_pipeline acquire and TMEM→register copy so the residual/bias
@@ -3648,17 +5140,19 @@ def _codegen_cute_store_tcgen05_tile(
             return (
                 f"    if {tcgen05_epi_active}:\n"
                 f"{t2r_body}"
-                f"{tma_store_tail_region(late_later_subtile_acquire='')}"
+                f"{tma_store_tail_region(late_later_subtile_acquire='', tma_desc_arg=tma_desc_arg, tma_store_atom=tma_store_atom)}"
                 f"    if {store_warp_predicate}:\n"
-                f"{tma_store_store_warp_tail_region()}"
+                f"{tma_store_store_warp_tail_region(tma_desc_arg=tma_desc_arg, tma_store_atom=tma_store_atom)}"
             )
-        return (
-            f"    if {tcgen05_epi_active}:\n"
+        epi_body = (
             f"{first_subtile_acquire}"
             f"{later_subtile_acquire}"
             f"{t2r_body}"
-            f"{tma_store_tail_region(late_later_subtile_acquire=late_later_subtile_acquire)}"
+            f"{tma_store_tail_region(late_later_subtile_acquire=late_later_subtile_acquire, tma_desc_arg=tma_desc_arg, tma_store_atom=tma_store_atom)}"
         )
+        if gate_epi_active:
+            return f"    if {tcgen05_epi_active}:\n{epi_body}"
+        return textwrap.indent(textwrap.dedent(epi_body), "    ")
 
     def indented_diagnostic_region(source: str) -> str:
         if not source:
@@ -3822,7 +5316,29 @@ def _codegen_cute_store_tcgen05_tile(
             f"{tma_store_module_tail_helper_call()}"
         )
 
-    if diagnose_split_first_t2r:
+    def default_tma_store_subtile_loop(
+        tma_desc_arg: str | None = None,
+        tma_store_atom: str | None = None,
+    ) -> str:
+        tma_store_default_subtile_body = tma_store_subtile_body(
+            first_subtile_acquire=tma_store_loop_first_subtile_acquire,
+            later_subtile_acquire=tma_store_loop_later_subtile_acquire,
+            acc_wait=tma_store_loop_acc_wait,
+            late_later_subtile_acquire=tma_store_loop_late_later_subtile_acquire,
+            tma_desc_arg=tma_desc_arg,
+            tma_store_atom=tma_store_atom,
+            gate_epi_active=not elide_role_local_epi_active,
+        )
+        return (
+            f"for _tcgen05_subtile in cutlass.range({subtile_count}, unroll_full=True):\n"
+            f"{tma_store_default_subtile_body}"
+        )
+
+    if fragment_epilogue is not None and fragment_epilogue.changes_shape:
+        # The compact SIMT schedule above owns T2R and never instantiates the
+        # same-shape TMA renderer. Avoid eagerly formatting that unused body.
+        tma_store_subtile_loop = ""
+    elif diagnose_split_first_t2r:
         tma_store_split_first_subtile_body = tma_store_subtile_body(
             first_subtile_acquire=tma_store_split_first_subtile_acquire,
             later_subtile_acquire="",
@@ -3910,22 +5426,21 @@ def _codegen_cute_store_tcgen05_tile(
             f"{tma_store_module_tail_body}"
         )
     else:
-        tma_store_default_subtile_body = tma_store_subtile_body(
-            first_subtile_acquire=tma_store_loop_first_subtile_acquire,
-            later_subtile_acquire=tma_store_loop_later_subtile_acquire,
-            acc_wait=tma_store_loop_acc_wait,
-            late_later_subtile_acquire=tma_store_loop_late_later_subtile_acquire,
+        tma_store_subtile_loop = default_tma_store_subtile_loop()
+    dynamic_d_tma_store_subtile_loop = (
+        default_tma_store_subtile_loop(
+            grouped_d_tensormap_desc_arg,
+            tcgen05_value.tail_tma_store_atom,
         )
-        tma_store_subtile_loop = (
-            f"for _tcgen05_subtile in cutlass.range({subtile_count}, unroll_full=True):\n"
-            f"{tma_store_default_subtile_body}"
-        )
+        if grouped_dynamic_d_tensormap_edge_only
+        else ""
+    )
     tma_store_smem_setup = [
         # Must match the wrapper-side `tcgen05_d_tma` TMA atom layout in
         # `helion/runtime/__init__.py`; both describe one D SMEM stage.
         (
             f"{smem_d_layout} = cutlass.utils.blackwell_helpers.make_smem_layout_epi("
-            f"{target_dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+            f"{target_dtype}, {tcgen05_d_store_layout}, "
             f"{epi_tile}, {tcgen05_value.c_stage_count})"
         ),
         (
@@ -4016,80 +5531,147 @@ def _codegen_cute_store_tcgen05_tile(
         and not split_hybrid_tma_store_role
         and not diagnose_skip_epilogue_store
     )
-    tma_store_body_setup_core = [
-        *(tma_static_store_setup if not hoist_tma_store_resources else []),
-        *(
-            tma_store_pipeline_setup
-            if not (hoist_tma_store_resources or hoist_hybrid_tma_store_pipeline)
-            else []
+
+    def worklist_nm_explicit_store_wave_setup_lines() -> list[str]:
+        return [
+            f"{tacc_epi} = cute.flat_divide({tacc}, {epi_tile})",
+            (
+                f"{tiled_copy_t2r} = cute.nvgpu.tcgen05.make_tmem_copy("
+                f"{tcgen05_aux_tmem_load_atom}, "
+                f"{tacc_epi}[(None, None, 0, 0, 0)])"
+            ),
+            f"{thr_copy_t2r} = {tiled_copy_t2r}.get_slice({tcgen05_aux_epi_tidx})",
+            f"{ttr_tacc_base} = {thr_copy_t2r}.partition_S({tacc_epi})",
+            f"{tcgc_epi} = cute.flat_divide({tcgc_planned}, {epi_tile})",
+            f"{ttr_gc} = {thr_copy_t2r}.partition_D({tcgc_epi})",
+            (
+                f"{ttr_racc} = cute.make_rmem_tensor("
+                f"{ttr_gc}[(None, None, None, 0, 0, 0, 0, 0)].shape, "
+                "cutlass.Float32)"
+            ),
+            f"{ttr_rd} = cute.make_rmem_tensor({ttr_racc}.shape, {target_dtype})",
+            (
+                f"{copy_atom_r2s} = cute.make_copy_atom("
+                "cute.nvgpu.warp.StMatrix8x8x16bOp("
+                "transpose=True, num_matrices=4), "
+                f"{target_dtype})"
+            ),
+            (
+                f"{tiled_copy_r2s} = cute.make_tiled_copy_D("
+                f"{copy_atom_r2s}, {tiled_copy_t2r})"
+            ),
+            f"{thr_copy_r2s} = {tiled_copy_r2s}.get_slice({tcgen05_aux_epi_tidx})",
+            f"{trs_sd} = {thr_copy_r2s}.partition_D({smem_d})",
+            f"{trs_rd} = {tiled_copy_r2s}.retile({ttr_rd})",
+            f"{trs_racc} = {tiled_copy_r2s}.retile({ttr_racc})",
+        ]
+
+    def default_store_wave_setup_lines() -> list[str]:
+        return [
+            (
+                f"{tiled_copy_t2r}, {ttr_tacc_base}, {ttr_racc} = "
+                "cutlass.utils.gemm.sm100.epilogue_tmem_copy_and_partition("
+                f"{kernel_desc}, {tcgen05_aux_epi_tidx}, {tacc}, "
+                f"{tcgc_planned}, {epi_tile}, {tcgen05_lifecycle.is_two_cta!s})"
+            ),
+            *(
+                [f"{thr_copy_t2r} = {tiled_copy_t2r}.get_slice({tcgen05_aux_epi_tidx})"]
+                if fragment_epilogue is not None
+                else []
+            ),
+            f"{ttr_rd} = cute.make_rmem_tensor({ttr_racc}.shape, {target_dtype})",
+            (
+                f"{tiled_copy_r2s}, {trs_rd}, {trs_sd} = "
+                "cutlass.utils.gemm.sm100.epilogue_smem_copy_and_partition("
+                f"{kernel_desc}, {tiled_copy_t2r}, {ttr_rd}, "
+                f"{tcgen05_aux_epi_tidx}, {smem_d})"
+            ),
+            f"{trs_racc} = {tiled_copy_r2s}.retile({ttr_racc})",
+            f"{tcgc_epi} = cute.flat_divide({tcgc_planned}, {epi_tile})",
+        ]
+
+    def build_tma_store_body_setup_core(
+        *,
+        tma_store_atom: str,
+        tile_store_setup: list[str],
+        dynamic_d_setup: list[str],
+        dynamic_d_update: list[str],
+    ) -> list[str]:
+        return [
+            *(tma_static_store_setup if not hoist_tma_store_resources else []),
+            *(
+                tma_store_pipeline_setup
+                if not (hoist_tma_store_resources or hoist_hybrid_tma_store_pipeline)
+                else []
+            ),
+            *(tma_store_smem_setup if not hoist_tma_store_resources else []),
+            *_rowvec_aux_copy_lines(),
+            *tma_store_first_subtile_acquire,
+            *dynamic_d_setup,
+            *dynamic_d_update,
+            *tile_store_setup,
+            (
+                f"{tcgc} = cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
+                f"{tcgc_base})"
+            ),
+            (
+                f"{tcgc_planned} = cute.make_tensor("
+                f"{tcgc}.iterator, "
+                f"cute.append(cute.append(cute.append({tcgc}.layout, {tcgen05_aux_epilogue_rest_mode}), {tcgen05_aux_epilogue_rest_mode}), {tcgen05_aux_epilogue_rest_mode}))"
+            ),
+            *(tma_store_acc_layout_setup if not hoist_tma_store_resources else []),
+            *(
+                worklist_nm_explicit_store_wave_setup_lines()
+                if tcgen05_nm_store
+                else default_store_wave_setup_lines()
+            ),
+            # Per-aux-step partitioning lines (one chain per auxiliary tensor).
+            # No-op when the chain has no aux steps; the TMA path requires an
+            # explicit ``thr_copy_t2r`` slice because it consumes the partition
+            # through SMEM-staged stores rather than via partition_D.
+            *_aux_tile_setup_lines(
+                thr_copy_t2r_var=thr_copy_t2r,
+                define_thr_copy_t2r=not tcgen05_nm_store,
+                retile_for_r2s=True,
+            ),
+            (
+                f"{bsg_sd}, {bsg_gd_partitioned} = cute.nvgpu.cpasync.tma_partition("
+                f"{tma_store_atom}, 0, cute.make_layout(1), "
+                f"cute.group_modes({smem_d}, 0, 2), "
+                f"cute.group_modes({tcgc_epi}, 0, 2))"
+            ),
+            (
+                f"{bsg_gd} = {bsg_gd_partitioned}["
+                f"(None, None, None, cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0))]"
+            ),
+            f"{bsg_gd} = cute.group_modes({bsg_gd}, 1, cute.rank({bsg_gd}))",
+            (
+                f"{ttr_tacc_stage} = {ttr_tacc_base}["
+                f"(None, None, None, None, None, {tcgen05_acc_stage_index_expr})]"
+            ),
+            f"{ttr_tacc} = cute.group_modes({ttr_tacc_stage}, 3, cute.rank({ttr_tacc_stage}))",
+            f"{subtile_count} = cutlass.const_expr(cute.size({ttr_tacc}.shape, mode=[3]))",
+            *tma_store_pre_loop_acc_wait,
+        ]
+
+    tma_store_body_setup_core = build_tma_store_body_setup_core(
+        tma_store_atom=tcgen05_value.tma_store_atom,
+        tile_store_setup=tma_tile_store_setup,
+        dynamic_d_setup=[],
+        dynamic_d_update=(
+            [] if grouped_dynamic_d_tensormap_edge_only else grouped_d_tensormap_update
         ),
-        *(tma_store_smem_setup if not hoist_tma_store_resources else []),
-        *_rowvec_aux_copy_lines(),
-        *tma_store_first_subtile_acquire,
-        *tma_tile_store_setup,
-        (
-            f"{tcgc} = cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
-            f"{tcgc_base})"
-        ),
-        (
-            f"{tcgc_planned} = cute.make_tensor("
-            f"{tcgc}.iterator, "
-            f"cute.append(cute.append(cute.append({tcgc}.layout, {tcgen05_value.epilogue_rest_mode}), {tcgen05_value.epilogue_rest_mode}), {tcgen05_value.epilogue_rest_mode}))"
-        ),
-        *(tma_store_acc_layout_setup if not hoist_tma_store_resources else []),
-        (
-            f"{tiled_copy_t2r}, {ttr_tacc_base}, {ttr_racc} = "
-            "cutlass.utils.gemm.sm100.epilogue_tmem_copy_and_partition("
-            f"{kernel_desc}, {tcgen05_value.epi_tidx}, {tacc}, {tcgc_planned}, {epi_tile}, {tcgen05_lifecycle.is_two_cta!s})"
-        ),
-        (f"{ttr_rd} = cute.make_rmem_tensor({ttr_racc}.shape, {target_dtype})"),
-        (
-            f"{tiled_copy_r2s}, {trs_rd}, {trs_sd} = "
-            "cutlass.utils.gemm.sm100.epilogue_smem_copy_and_partition("
-            f"{kernel_desc}, {tiled_copy_t2r}, {ttr_rd}, "
-            f"{tcgen05_value.epi_tidx}, {smem_d})"
-        ),
-        f"{trs_racc} = {tiled_copy_r2s}.retile({ttr_racc})",
-        f"{tcgc_epi} = cute.flat_divide({tcgc_planned}, {epi_tile})",
-        # Per-aux-step partitioning lines (one chain per auxiliary
-        # tensor). No-op when the chain has no aux steps; the TMA
-        # path requires an explicit ``thr_copy_t2r`` slice because
-        # (unlike the SIMT path) the TMA path does not otherwise
-        # create one — the t2r partition is consumed directly by
-        # the SMEM-staged store, never via partition_D. The aux
-        # load needs partition_D to compute a per-thread GMEM read
-        # for the auxiliary tile so we create the slice here.
-        # When the C-input warp productive-body gate is open the
-        # source switches from per-tile GMEM to the per-subtile
-        # SMEM ring stage (see ``_aux_tile_setup_lines`` SMEM
-        # branch); the partition pipeline is layout-only and
-        # compiles unchanged, and the per-subtile ``consumer_wait``
-        # / lane-0-gated ``consumer_release`` are emitted by
-        # ``_aux_subtile_load_source`` inside the per-subtile loop.
-        *_aux_tile_setup_lines(
-            thr_copy_t2r_var=thr_copy_t2r,
-            define_thr_copy_t2r=True,
-            retile_for_r2s=True,
-        ),
-        (
-            f"{bsg_sd}, {bsg_gd_partitioned} = cute.nvgpu.cpasync.tma_partition("
-            f"{tcgen05_value.tma_store_atom}, 0, cute.make_layout(1), "
-            f"cute.group_modes({smem_d}, 0, 2), "
-            f"cute.group_modes({tcgc_epi}, 0, 2))"
-        ),
-        (
-            f"{bsg_gd} = {bsg_gd_partitioned}["
-            f"(None, None, None, cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0))]"
-        ),
-        f"{bsg_gd} = cute.group_modes({bsg_gd}, 1, cute.rank({bsg_gd}))",
-        (
-            f"{ttr_tacc_stage} = {ttr_tacc_base}["
-            f"(None, None, None, None, None, {tcgen05_acc_stage_index_expr})]"
-        ),
-        f"{ttr_tacc} = cute.group_modes({ttr_tacc_stage}, 3, cute.rank({ttr_tacc_stage}))",
-        f"{subtile_count} = cutlass.const_expr(cute.size({ttr_tacc}.shape, mode=[3]))",
-        *tma_store_pre_loop_acc_wait,
-    ]
+    )
+    dynamic_d_tma_store_body_setup_core = (
+        build_tma_store_body_setup_core(
+            tma_store_atom=tcgen05_value.tail_tma_store_atom,
+            tile_store_setup=dynamic_d_tma_tile_store_setup,
+            dynamic_d_setup=grouped_d_tensormap_setup,
+            dynamic_d_update=grouped_d_tensormap_update,
+        )
+        if grouped_dynamic_d_tensormap_edge_only
+        else []
+    )
     # Warp 0 pre-acquires the first TMA-store SMEM stage before per-tile
     # C-store setup. The subtile loop acquires only later stages, so C-stage
     # waits can overlap setup, the first acc-pipeline wait, and the other epi
@@ -4125,6 +5707,7 @@ def _codegen_cute_store_tcgen05_tile(
         if not (hoist_tma_store_resources or hoist_hybrid_tma_store_pipeline)
         else []
     )
+    dynamic_d_tma_store_body_core: list[str] = []
     if tcgen05_pure_matmul_object is not None:
         tma_store_body_core = tcgen05_pure_matmul_object.build_tma_store_body_core(
             Tcgen05TmaStoreBodyCoreParams(
@@ -4166,6 +5749,22 @@ def _codegen_cute_store_tcgen05_tile(
             tma_store_subtile_loop + tma_store_acc_advance,
             *tma_store_pipeline_tail_lines,
         ]
+        if grouped_dynamic_d_tensormap_edge_only:
+            dynamic_d_tma_store_body_core = [
+                *dynamic_d_tma_store_body_setup_core,
+                dynamic_d_tma_store_subtile_loop + tma_store_acc_advance,
+                *tma_store_pipeline_tail_lines,
+            ]
+    if compact_fragment_store and tcgen05_value.use_tma_store_epilogue:
+        assert compact_tma_per_tile_setup is not None
+        tma_store_body_core = [
+            *(tma_static_store_setup if not hoist_tma_store_resources else []),
+            *(tma_store_pipeline_setup if not hoist_tma_store_resources else []),
+            *(tma_store_smem_setup if not hoist_tma_store_resources else []),
+            *(tma_store_acc_layout_setup if not hoist_tma_store_resources else []),
+            *compact_tma_per_tile_setup,
+            *tma_store_pipeline_tail_lines,
+        ]
     tma_store_full_tile_body_core = list(tma_store_body_core)
     if (
         tcgen05_value.tma_store_full_tiles_only
@@ -4175,15 +5774,25 @@ def _codegen_cute_store_tcgen05_tile(
             f"{tcgen05_value.role_local_tile_counter} = "
             f"{tcgen05_value.role_local_tile_counter} + cutlass.Int32(1)"
         )
+        if grouped_dynamic_d_tensormap_edge_only:
+            dynamic_d_tma_store_body_core.append(
+                f"{tcgen05_value.role_local_tile_counter} = "
+                f"{tcgen05_value.role_local_tile_counter} + cutlass.Int32(1)"
+            )
     tma_store_body_source = "\n".join(tma_store_full_tile_body_core)
     simt_store_body_source = "\n".join(simt_store_body_core)
+    edge_store_body_source = (
+        "\n".join(dynamic_d_tma_store_body_core)
+        if grouped_dynamic_d_tensormap_edge_only and dynamic_d_tma_store_body_core
+        else simt_store_body_source
+    )
     hybrid_tma_store_body_core = [
         f"{full_tile} = {full_tile_expr}",
         (
             f"if {full_tile}:\n"
             f"{textwrap.indent(tma_store_body_source, '    ')}\n"
             "else:\n"
-            f"{textwrap.indent(simt_store_body_source, '    ')}"
+            f"{textwrap.indent(edge_store_body_source, '    ')}"
         ),
     ]
     if diagnose_skip_epilogue_store:
@@ -4206,6 +5815,15 @@ def _codegen_cute_store_tcgen05_tile(
             if (hoist_tma_store_resources or hoist_hybrid_tma_store_pipeline)
             else []
         )
+        grouped_d_tensormap_hoisted_stmts = (
+            [statement_from_string(line) for line in grouped_d_tensormap_setup]
+            if grouped_d_tensormap_setup
+            and (
+                hoist_tma_store_resources
+                or tcgen05_value.orientation is Tcgen05Orientation.NM
+            )
+            else []
+        )
         tma_store_role_invariant_stmts = (
             [statement_from_string(line) for line in tma_store_role_invariant_setup]
             if hoist_tma_store_resources
@@ -4216,10 +5834,11 @@ def _codegen_cute_store_tcgen05_tile(
         elif hoist_tma_store_resources or hoist_hybrid_tma_store_pipeline:
             tma_store_hoisted_stmts = [
                 *tma_store_pipeline_hoisted_stmts,
+                *grouped_d_tensormap_hoisted_stmts,
                 *tma_store_role_invariant_stmts,
             ]
         else:
-            tma_store_hoisted_stmts = []
+            tma_store_hoisted_stmts = grouped_d_tensormap_hoisted_stmts
         if tcgen05_pure_matmul_object is not None:
             assert not split_hybrid_tma_store_role, (
                 "pure lifecycle is admitted only for static-full pure matmul"
@@ -4240,7 +5859,7 @@ def _codegen_cute_store_tcgen05_tile(
                 + textwrap.indent("\n".join(tma_store_full_tile_body_core), "    ")
             )
             edge_main_stmt = statement_from_string(
-                "if True:\n" + textwrap.indent("\n".join(simt_store_body_core), "    ")
+                "if True:\n" + textwrap.indent(edge_store_body_source, "    ")
             )
             df.cute_state.register_tcgen05_per_tile_stmts(
                 [sync_before_stmt, full_main_stmt, edge_main_stmt, sync_after_stmt]
@@ -4256,7 +5875,10 @@ def _codegen_cute_store_tcgen05_tile(
             # without making the shared-memory reservation data-dependent on
             # the runtime epi-warp predicate.
             df.cute_state.register_tcgen05_epi_role_prelude_stmts(
-                tma_store_role_invariant_stmts
+                [
+                    *grouped_d_tensormap_hoisted_stmts,
+                    *tma_store_role_invariant_stmts,
+                ]
             )
             main_stmts = [
                 *tcgen05_acc_stage_index_top_level_stmts,
@@ -4270,9 +5892,20 @@ def _codegen_cute_store_tcgen05_tile(
         else:
             sync_before_stmt = statement_from_string("cute.arch.sync_threads()")
             sync_after_stmt = statement_from_string("cute.arch.sync_threads()")
-            main_stmt = statement_from_string(
-                "if True:\n" + textwrap.indent("\n".join(store_body_core), "    ")
-            )
+            if tcgen05_m_subtile_count > 1:
+                # M-paired tiles: drain both 256-row subtiles per work tile
+                # (their acc stages committed together after the shared-B K
+                # loop). ``unroll_full`` keeps ``_tcgen05_msub`` a trace-time
+                # Python int so tile coordinates stay static expressions.
+                main_stmt = statement_from_string(
+                    f"for _tcgen05_msub in cutlass.range("
+                    f"{tcgen05_m_subtile_count}, unroll_full=True):\n"
+                    + textwrap.indent("\n".join(store_body_core), "    ")
+                )
+            else:
+                main_stmt = statement_from_string(
+                    "if True:\n" + textwrap.indent("\n".join(store_body_core), "    ")
+                )
             df.cute_state.register_tcgen05_per_tile_stmts(
                 [sync_before_stmt, main_stmt, sync_after_stmt]
             )

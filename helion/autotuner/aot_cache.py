@@ -25,11 +25,14 @@ import importlib.util
 import inspect
 import json
 import logging
+import marshal
 import operator
 import os
 from pathlib import Path
 import sys
+import threading
 import traceback
+import types
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import ClassVar
@@ -45,6 +48,7 @@ from .aot_kernel import extract_shape_features
 from .base_cache import AutotuneCacheBase
 from .base_cache import BoundKernelInMemoryCacheKey
 from .base_cache import LooseAutotuneCacheKey
+from .benchmark_provider import _MultiShapeAutotuneArgs
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -207,14 +211,18 @@ class ShapeKey:
     kernel_name: str
     specialization_key: tuple[Any, ...]
     hardware_id: str
+    search_policy_hash: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to a JSON-serializable dict."""
-        return {
+        result = {
             "kernel_name": self.kernel_name,
             "specialization_key": _serialize_tuple(self.specialization_key),
             "hardware_id": self.hardware_id,
         }
+        if self.search_policy_hash:
+            result["search_policy_hash"] = self.search_policy_hash
+        return result
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ShapeKey:
@@ -223,6 +231,7 @@ class ShapeKey:
             kernel_name=data["kernel_name"],
             specialization_key=_deserialize_tuple(data["specialization_key"]),
             hardware_id=data["hardware_id"],
+            search_policy_hash=data.get("search_policy_hash", ""),
         )
 
     def stable_hash(self) -> str:
@@ -296,6 +305,15 @@ class AOTAutotuneCache(AutotuneCacheBase):
     _no_heuristic_warned: ClassVar[set[str]] = set()
     # Tracks which kernels have already been compiled in compile mode
     _compiled_kernels: ClassVar[set[str]] = set()
+    # Static-shape compile mode accumulates one source variant per normalized
+    # call signature and rewrites the dispatcher whenever a shape is observed.
+    _compiled_kernel_variants: ClassVar[
+        dict[
+            tuple[str, str, str, str, str],
+            dict[tuple[object, ...], tuple[str, str]],
+        ]
+    ] = {}
+    _compiled_kernel_variants_lock: ClassVar[Any] = threading.RLock()
 
     @classmethod
     def clear_caches(cls) -> None:
@@ -304,6 +322,8 @@ class AOTAutotuneCache(AutotuneCacheBase):
         cls._heuristic_results.clear()
         cls._no_heuristic_warned.clear()
         cls._compiled_kernels.clear()
+        with cls._compiled_kernel_variants_lock:
+            cls._compiled_kernel_variants.clear()
         clear_heuristic_cache()  # Clear module-level cache
         cls._mode_announced.clear()
         log.debug("Cleared AOTAutotuneCache caches")
@@ -315,6 +335,8 @@ class AOTAutotuneCache(AutotuneCacheBase):
         autotuner_factory: Callable[[], BaseSearch] | None = None,
     ) -> None:
         super().__init__(autotuner, autotuner_factory=autotuner_factory)
+        if not isinstance(self.args, _MultiShapeAutotuneArgs):
+            self.args = self.kernel.kernel.normalize_args(*self.args)
         self.mode = get_aot_mode()
         self.hardware_id = get_hardware_info().hardware_id
         self.data_dir = get_aot_data_dir()
@@ -347,6 +369,20 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
     def _should_report_cache_hit(self) -> bool:
         return self.mode not in ("evaluate", "compile") or self._verbose
+
+    def _search_policy_allows_cache_io(self) -> bool:
+        # Evaluate/compile/disabled select an AOT heuristic or default config;
+        # they are not search-result cache reads and must never start tuning.
+        if self.mode in ("disabled", "evaluate", "compile"):
+            return True
+        return super()._search_policy_allows_cache_io()
+
+    def _search_policy_allows_cache_write(self) -> bool:
+        # Collect must record a newly tuned config even when its custom search
+        # policy is intentionally ineligible for later cache reuse.
+        if self.mode == "collect":
+            return True
+        return super()._search_policy_allows_cache_write()
 
     @property
     def _configs_file(self) -> Path:
@@ -489,10 +525,19 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
     def _create_shape_key(self) -> ShapeKey:
         """Create a shape key for the current kernel invocation."""
+        from .local_cache import _cute_flash_search_policy_hash
+
+        search_policy_hash = _cute_flash_search_policy_hash(
+            self.autotuner,
+            cute_flash_search_enabled=bool(
+                getattr(self.kernel.config_spec, "cute_flash_search_enabled", False)
+            ),
+        )
         return ShapeKey(
             kernel_name=self.kernel.kernel.name,
             specialization_key=self.kernel.kernel.specialization_key(self.args),
             hardware_id=self.hardware_id,
+            search_policy_hash=search_policy_hash,
         )
 
     def _extract_shape_features(
@@ -538,7 +583,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
         # For disabled/evaluate/compile modes: try heuristic, fall back to default config
         # (never trigger autotuning for aot_kernel)
-        config = self._get_heuristic_config()
+        config = self._get_heuristic_config(self.args)
         if config is not None:
             return config
 
@@ -788,16 +833,16 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
     def _maybe_run_compile(self) -> None:
         """
-        In compile mode, generate Triton code for all heuristic-selected
-        configs and write a standalone ``.py`` file with zero Helion deps.
+        In compile mode, generate code for all heuristic-selected configs and
+        write a standalone ``.py`` file. Backends with a dependency-free
+        launcher need no Helion runtime; CuTe currently retains its launcher
+        import.
 
-        Runs at most once per kernel (tracked by ``_compiled_kernels``).
+        Dynamic-shape kernels compile every heuristic config once. Static-shape
+        kernels compile the selected config for each observed BoundKernel and
+        dispatch by a normalized call signature.
         """
         kernel_name = self.kernel.kernel.name
-        if kernel_name in AOTAutotuneCache._compiled_kernels:
-            return
-        AOTAutotuneCache._compiled_kernels.add(kernel_name)
-
         heuristic_file = self._find_heuristic_file()
         if heuristic_file is None:
             log.warning(
@@ -816,6 +861,10 @@ class AOTAutotuneCache(AutotuneCacheBase):
             spec.loader.exec_module(module)
             AOTAutotuneCache._heuristic_modules[heuristic_file] = module
 
+        if self.kernel.settings.static_shapes:
+            self._compile_current_static_shape(heuristic_file, kernel_name)
+            return
+
         # -- extract selected configs ---------------------------------------
         # nearest_neighbor backend: module-level CONFIGS
         # decision_tree backend: _C = [...] inside autotune_<kernel>
@@ -825,6 +874,10 @@ class AOTAutotuneCache(AutotuneCacheBase):
         if configs_list is None:
             log.warning("Cannot extract configs from heuristic for '%s'", kernel_name)
             return
+
+        if kernel_name in AOTAutotuneCache._compiled_kernels:
+            return
+        AOTAutotuneCache._compiled_kernels.add(kernel_name)
 
         # -- generate Triton code for each config --------------------------
         triton_codes: list[str] = []
@@ -854,6 +907,90 @@ class AOTAutotuneCache(AutotuneCacheBase):
             output_dir=self.data_dir,
             kernel_source_file=self.kernel.kernel.__code__.co_filename,
         )
+        print(f"[AOT] Standalone: {out_path}", file=sys.stderr)
+
+    def _compile_current_static_shape(
+        self,
+        heuristic_file: Path,
+        kernel_name: str,
+    ) -> None:
+        """Compile one observed static call and update its exact dispatcher."""
+        normalized_args = self.kernel.kernel.normalize_args(*self.args)
+        config = self._get_heuristic_config(normalized_args)
+        if config is None:
+            log.warning(
+                "No heuristic config for static kernel '%s', skipping standalone compile",
+                kernel_name,
+            )
+            return
+
+        from .aot_compile import _standalone_call_key
+        from .aot_compile import generate_standalone_file
+
+        call_key = _standalone_call_key(normalized_args)
+        code_object = self.kernel.kernel.__code__
+        source_path = Path(code_object.co_filename).resolve()
+        if source_path.is_file():
+            source_digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
+            kernel_source_file: str | None = str(source_path)
+            output_identity = str(
+                source_path.parent / f"{source_path.stem}_{kernel_name}_standalone.py"
+            )
+        else:
+            source_digest = hashlib.sha256(marshal.dumps(code_object)).hexdigest()
+            kernel_source_file = None
+            output_identity = str(
+                (self.data_dir / f"{kernel_name}_standalone.py").resolve()
+            )
+        variants_key = (
+            output_identity,
+            kernel_name,
+            self.hardware_id,
+            hashlib.sha256(heuristic_file.read_bytes()).hexdigest(),
+            source_digest,
+        )
+        config_fingerprint = json.dumps(dict(config), sort_keys=True, default=repr)
+        try:
+            code = self.kernel.to_triton_code(config)
+        except Exception as error:
+            raise RuntimeError(
+                f"static standalone variant failed to compile for {kernel_name}"
+            ) from error
+        if code is None:
+            raise RuntimeError(
+                f"static standalone variant emitted no code for {kernel_name}"
+            )
+
+        # The compile workflow runs in one process. Serialize concurrent calls
+        # in that process so two newly observed signatures cannot each rewrite
+        # an incomplete dispatcher. ``generate_standalone_file`` replaces the
+        # output atomically, so readers never observe a partial module.
+        with AOTAutotuneCache._compiled_kernel_variants_lock:
+            variants = AOTAutotuneCache._compiled_kernel_variants.setdefault(
+                variants_key, {}
+            )
+            existing = variants.get(call_key)
+            if existing is not None:
+                if existing != (config_fingerprint, code):
+                    raise RuntimeError(
+                        f"static standalone call-key collision for {kernel_name}: "
+                        "the normalized arguments do not distinguish all generated "
+                        "specializations; expose value-derived compile-time metadata "
+                        "as scalar or container kernel arguments"
+                    )
+                return
+
+            updated = {**variants, call_key: (config_fingerprint, code)}
+            ordered = sorted(updated.items(), key=lambda item: repr(item[0]))
+            out_path = generate_standalone_file(
+                kernel_name=kernel_name,
+                triton_codes=[variant[1][1] for variant in ordered],
+                heuristic_code=heuristic_file.read_text(),
+                output_dir=self.data_dir,
+                kernel_source_file=kernel_source_file,
+                dispatch_keys=[variant[0] for variant in ordered],
+            )
+            variants[call_key] = (config_fingerprint, code)
         print(f"[AOT] Standalone: {out_path}", file=sys.stderr)
 
     @staticmethod
@@ -1036,11 +1173,18 @@ class AOTAutotuneCache(AutotuneCacheBase):
         return super().autotune(skip_cache=skip_cache)
 
 
+def _code_identity(
+    code: types.CodeType,
+) -> tuple[bytes, tuple[Any, ...], tuple[str, ...]]:
+    """Semantic identity of a code object: bytecode + constants + referenced names."""
+    return (code.co_code, code.co_consts, code.co_names)
+
+
 def _serialize_value(val: object) -> object:
     """Serialize a single value to JSON-compatible format.
 
     Supports: None, bool, int, float, str, type, tuple, frozenset, set,
-    torch.dtype, torch.device, list, dict.
+    torch.dtype, torch.device, list, dict, code, bytes, ellipsis, complex.
     """
     if val is None:
         return None
@@ -1062,13 +1206,25 @@ def _serialize_value(val: object) -> object:
         return [_serialize_value(v) for v in val]
     if isinstance(val, dict):
         return {k: _serialize_value(v) for k, v in val.items()}
+    if isinstance(val, types.CodeType):
+        return _serialize_value(_code_identity(val))
+    if isinstance(val, bytes):
+        return {"__bytes__": val.hex()}
+    if isinstance(val, types.EllipsisType):
+        return {"__ellipsis__": True}
+    if isinstance(val, complex):
+        return {"__complex__": [val.real, val.imag]}
     raise TypeError(f"Cannot serialize type: {type(val).__name__}")
 
 
 def _deserialize_value(val: object) -> object:
     """Deserialize a JSON value back to Python object.
 
-    Handles tagged dicts: __tuple__, __frozenset__, __set__, __dtype__, __device__, __type__.
+    Handles tagged dicts: __tuple__, __frozenset__, __set__, __dtype__, __device__,
+    __type__, __bytes__, __ellipsis__, __complex__.
+
+    Note: __code__ is not turned back into a code object. This is fine because the AOT
+    cache only compares specialization keys, it never calls the original function.
     """
     if isinstance(val, dict):
         if "__tuple__" in val:
@@ -1084,6 +1240,13 @@ def _deserialize_value(val: object) -> object:
             return torch.device(val["__device__"])
         if "__type__" in val:
             return _import_type(val["__type__"])
+        if "__bytes__" in val:
+            return bytes.fromhex(val["__bytes__"])
+        if "__ellipsis__" in val:
+            return ...
+        if "__complex__" in val:
+            real, imag = _deserialize_tuple(val["__complex__"])
+            return complex(real, imag)
         return {k: _deserialize_value(v) for k, v in val.items()}
     if isinstance(val, list):
         return [_deserialize_value(v) for v in val]

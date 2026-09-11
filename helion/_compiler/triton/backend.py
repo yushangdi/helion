@@ -17,6 +17,7 @@ import torch
 
 from ... import exc
 from ..backend import Backend
+from ..backend import LauncherInfo
 from ..backend import log
 
 if TYPE_CHECKING:
@@ -56,6 +57,10 @@ class TritonBackend(Backend):
     def experimental(self) -> bool:
         return False
 
+    @property
+    def supports_eager_prepared_call(self) -> bool:
+        return True
+
     def transform_host_arg(
         self,
         arg: Argument,
@@ -73,6 +78,10 @@ class TritonBackend(Backend):
         return host_str
 
     def supports_config_key(self, key: str) -> bool:
+        if key == "cross_loop_schedule":
+            from ..._compat import is_hip
+
+            return self.name == "triton" and not is_hip()
         if key in ("load_cache_modifiers", "store_cache_modifiers"):
             return True
         if key == "waves_per_eu":
@@ -355,6 +364,19 @@ class TritonBackend(Backend):
         return "_default_launcher"
 
     @property
+    def dependency_free_launcher_info(self) -> LauncherInfo:
+        # get_num_sm / get_num_xcd / set_triton_allocator are launcher functions
+        # the generated host wrapper calls as ``helion.runtime.<fn>(``; the shim
+        # re-exports them (with the launcher) so those verbatim calls resolve.
+        return LauncherInfo(
+            launcher_module="helion.runtime.triton.launcher",
+            launcher_symbol="default_launcher",
+            launcher_alias="_default_launcher",
+            deps="torch + triton",
+            runtime_helper_names=("get_num_sm", "get_num_xcd", "set_triton_allocator"),
+        )
+
+    @property
     def library_imports(self) -> dict[str, str]:
         return {
             "math": "import math",
@@ -367,6 +389,9 @@ class TritonBackend(Backend):
             "triton_helpers": "from torch._inductor.runtime import triton_helpers",
             "tl_math": "from torch._inductor.runtime.triton_helpers import math as tl_math",
             "libdevice": "from torch._inductor.runtime.triton_compat import libdevice",
+            "helion_dist_utils": "from helion.runtime.triton import dist_utils as helion_dist_utils",
+            "nvshmem": "import torch.distributed._symmetric_memory._nvshmem_triton as nvshmem",
+            "requires_nvshmem": "from torch.distributed._symmetric_memory._nvshmem_triton import requires_nvshmem",
             "_default_launcher": "from helion.runtime import default_launcher as _default_launcher",
             "fast_dividef": "from triton.language.extra.libdevice import fast_dividef",
             "fast_expf": "from triton.language.extra.libdevice import fast_expf",
@@ -402,6 +427,7 @@ class TritonBackend(Backend):
         *,
         block_size_var: str | None = None,
         threads_in_group: int | None = None,
+        dtype: torch.dtype | None = None,
     ) -> str:
         if reduction_type in {"sum", "max", "min"}:
             return f"tl.{reduction_type}({input_name}, {dim})"
@@ -423,6 +449,7 @@ class TritonBackend(Backend):
         block_size_var: str | None = None,
         index_dtype: torch.dtype | None = None,
         threads_in_group: int | None = None,
+        dtype: torch.dtype | None = None,
     ) -> str:
         helper = "max" if reduction_type == "argmax" else "min"
         return (
@@ -438,6 +465,7 @@ class TritonBackend(Backend):
         acc_index: str,
         value: str,
         index: str,
+        dtype: torch.dtype | None = None,
     ) -> list[str]:
         helper = "maximum" if reduction_type == "argmax" else "minimum"
         return [
@@ -454,17 +482,19 @@ class TritonBackend(Backend):
             f"tl.full([{', '.join(shape_dims)}], {value_expr}, {self.dtype_str(dtype)})"
         )
 
-    def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
-        from ..._compat import supports_maxnreg
-
+    def effective_num_warps(self, config: Config) -> int:
         # Workaround for triton bug: warp_specialize requires at least 4 warps
         # See: https://github.com/triton-lang/triton/issues/7354
         num_warps = config.num_warps
         if any(config.range_warp_specializes):
             num_warps = max(4, num_warps)
+        return num_warps
+
+    def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
+        from ..._compat import supports_maxnreg
 
         args = [
-            f"num_warps={num_warps}",
+            f"num_warps={self.effective_num_warps(config)}",
             f"num_stages={config.num_stages}",
             *(["launch_cooperative_grid=True"] if has_barrier else []),
         ] + [
@@ -505,6 +535,54 @@ class TritonBackend(Backend):
         out = [*args]
         if has_rng_ops:
             out.append("_rng_seed_buffer")
+        from ..compile_environment import CompileEnvironment
+        from ..device_function import DeviceFunction
+
+        device_fn = DeviceFunction.current()
+        if device_fn.triton_remote_copy_signal_slots:
+            signal_dst = device_fn.triton_remote_copy_signal_dst
+            assert signal_dst is not None
+            process_group_name = CompileEnvironment.current().process_group_name
+            if process_group_name is None:
+                raise exc.BackendUnsupported(
+                    "triton", "remote copies require an active process group"
+                )
+            out.extend(
+                [
+                    f"_remote_copy_signal_dst={signal_dst}",
+                    f"_remote_copy_signal_slots_per_program={device_fn.triton_remote_copy_signal_slots}",
+                    f"_remote_copy_process_group_name={process_group_name!r}",
+                ]
+            )
+        if device_fn.triton_remote_barrier_signal_slots:
+            process_group_name = CompileEnvironment.current().process_group_name
+            if process_group_name is None:
+                raise exc.BackendUnsupported(
+                    "triton", "remote barriers require an active process group"
+                )
+            out.extend(
+                [
+                    f"_remote_barrier_signal_slots_per_program={device_fn.triton_remote_barrier_signal_slots}",
+                    f"_remote_barrier_process_group_name={process_group_name!r}",
+                ]
+            )
+        if device_fn.triton_remote_copy_scratch_specs:
+            specs = ", ".join(
+                f"({tensor}, {numel})"
+                for tensor, numel in device_fn.triton_remote_copy_scratch_specs
+            )
+            out.append(f"_remote_copy_scratch_specs=({specs},)")
+        if device_fn.triton_persistent_state_specs:
+            specs = ", ".join(
+                f"({tensor}, {numel}, {dtype})"
+                for tensor, numel, dtype in device_fn.triton_persistent_state_specs
+            )
+            out.append(f"_persistent_state_specs=({specs},)")
+        if device_fn.triton_minimum_resident_programs is not None:
+            out.append(
+                "_minimum_resident_programs="
+                f"{device_fn.triton_minimum_resident_programs}"
+            )
         out.extend(self.launcher_keyword_args(config, has_barrier=has_barrier))
         return out
 

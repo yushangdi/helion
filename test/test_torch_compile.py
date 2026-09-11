@@ -13,6 +13,8 @@ import torch
 from torch._inductor import config as inductor_config
 from torch._inductor.codecache import FxGraphCache
 from torch._inductor.codecache import PyCodeCache
+from torch._inductor.compile_fx import compile_fx
+from torch._inductor.exc import InductorError
 from torch._inductor.ir import MutationOutput
 from torch._inductor.utils import fresh_cache
 from torch._inductor.utils import run_and_get_code
@@ -430,6 +432,15 @@ def k_create_return_view_ref(x, y):
 
 
 GLOBAL_SCALE_FACTOR = 2.5
+LOWERING_STATE_TENSOR = torch.empty(0)
+
+
+def _select_input_for_default_dtype(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    return x if torch.get_default_dtype() == torch.float32 else y
+
+
+def _apply_global_scale(value: torch.Tensor) -> torch.Tensor:
+    return value * GLOBAL_SCALE_FACTOR
 
 
 @helion.kernel(autotune_effort="none")
@@ -443,6 +454,19 @@ def k_scale_with_global_var(x: torch.Tensor) -> torch.Tensor:
 
 def k_scale_with_global_var_ref(x):
     return x * GLOBAL_SCALE_FACTOR
+
+
+@helion.kernel(
+    static_shapes=True,
+    config=helion.Config(block_sizes=[64]),
+    torch_compile_fusion=True,
+)
+def k_default_dtype_output(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([x.size(0)], device=x.device)
+    value = 2.0 if out.dtype == torch.float64 else 1.0
+    for tile in hl.tile(out.size(0)):
+        out[tile] = value
+    return out
 
 
 # =============================================================================
@@ -517,13 +541,14 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         expected_num_compilations: list[int] | None = None,
         kernels_ref: list | None = None,
         expected_num_kernels_ref: int | None = None,
+        ref_on_fusion_leg: bool = False,
     ):
         """Run torch.compile test comparing eager vs compiled execution."""
+        # The upgrade-error path for fusion on unsupported builds is covered
+        # once by test_fusion_unsupported_raises_upgrade_error; skip the many
+        # parametrized fusion legs that would otherwise all re-check it.
         if allow_torch_compile_fusion and not supports_torch_compile_fusion():
-            expected_error = (
-                RuntimeError,
-                "torch_compile_fusion=True requires PyTorch nightly build",
-            )
+            self.skipTest("torch.compile fusion not supported by this PyTorch build")
 
         # Reset specific kernels and configure fusion setting
         for kernel in kernels:
@@ -592,8 +617,14 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 f"Expected {expected_num_kernels} triton kernel(s), got {kernel_count}",
             )
 
-        # Ref baseline kernel count check
-        if expected_num_kernels_ref is not None:
+        # Ref baseline kernel count check. The *_ref baselines are pure torch
+        # (no helion kernels), so this compile is identical on both fusion
+        # legs; check it on only one leg to avoid duplicate compiles. Tests
+        # that skip their fusion=False leg opt in via ref_on_fusion_leg.
+        if (
+            expected_num_kernels_ref is not None
+            and allow_torch_compile_fusion == ref_on_fusion_leg
+        ):
             assert kernels_ref is not None, (
                 "kernels_ref must be provided when expected_num_kernels_ref is set"
             )
@@ -620,6 +651,34 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                     f"Expected {expected} helion compilation(s) for {kernel}, "
                     f"got {len(kernel._bound_kernels)}",
                 )
+
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_fusion_unsupported_raises_upgrade_error(self):
+        """Fusion requested on a build without fusion support: eager still
+        works, but torch.compile raises the upgrade error at trace time."""
+        if supports_torch_compile_fusion():
+            self.skipTest("this PyTorch build supports torch.compile fusion")
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            return k_add(x, y)
+
+        self.addCleanup(
+            setattr,
+            k_add.settings,
+            "torch_compile_fusion",
+            k_add.settings.torch_compile_fusion,
+        )
+        k_add.settings.torch_compile_fusion = True
+        k_add.reset()
+        torch._dynamo.reset()
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        torch.testing.assert_close(f(x, y), x + y)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "torch_compile_fusion=True requires PyTorch nightly build",
+        ):
+            torch.compile(f, fullgraph=True, backend="inductor")(x, y)
 
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -3091,6 +3150,331 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
+    @requires_fusion_support
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_fused_lowering_revalidates_eager_bound_host_trace(self):
+        def f(x: torch.Tensor) -> torch.Tensor:
+            return k_default_dtype_output(x)
+
+        original_default_dtype = torch.get_default_dtype()
+        x = torch.randn(8, device=DEVICE, dtype=torch.float32)
+        try:
+            torch.set_default_dtype(torch.float32)
+            k_default_dtype_output.reset()
+            warm = k_default_dtype_output(x)
+            self.assertEqual(warm.dtype, torch.float32)
+            warm_bound = next(iter(k_default_dtype_output._bound_kernels.values()))
+
+            torch.set_default_dtype(torch.float64)
+            torch._dynamo.reset()
+            with fresh_cache():
+                actual = torch.compile(f, fullgraph=True, backend="inductor")(x)
+
+            torch.testing.assert_close(
+                actual,
+                torch.full((8,), 2.0, device=DEVICE, dtype=torch.float64),
+            )
+            self.assertIs(
+                next(iter(k_default_dtype_output._bound_kernels.values())),
+                warm_bound,
+            )
+        finally:
+            torch.set_default_dtype(original_default_dtype)
+            k_default_dtype_output.reset()
+            torch._dynamo.reset()
+
+    @requires_fusion_support
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_fused_lowering_revalidates_changed_index_dtype(self):
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[64]),
+            index_dtype=torch.int32,
+            torch_compile_fusion=True,
+        )
+        def add_one(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
+        def f(x: torch.Tensor) -> torch.Tensor:
+            return add_one(x)
+
+        x = torch.randn(128, device=DEVICE)
+        try:
+            add_one(x)
+            warm_bound = next(iter(add_one._bound_kernels.values()))
+            self.assertEqual(warm_bound.env.index_dtype, torch.int32)
+
+            add_one.settings.index_dtype = torch.int64
+            torch._dynamo.reset()
+            with fresh_cache():
+                actual, (code,) = run_and_get_code(
+                    torch.compile(f, fullgraph=True, backend="inductor"),
+                    x,
+                )
+
+            torch.testing.assert_close(actual, x + 1)
+            self.assertIn("tl.program_id(0).to(tl.int64)", code)
+            self.assertIs(next(iter(add_one._bound_kernels.values())), warm_bound)
+        finally:
+            add_one.settings.index_dtype = torch.int32
+            add_one.reset()
+            torch._dynamo.reset()
+
+    @requires_fusion_support
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    @parametrize("static_shapes", (True, False))
+    def test_fused_lowering_rejects_host_trace_change_during_compile(
+        self, static_shapes
+    ):
+        @helion.kernel(
+            static_shapes=static_shapes,
+            config=helion.Config(block_sizes=[64]),
+            torch_compile_fusion=True,
+        )
+        def default_dtype_output(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            selected = _select_input_for_default_dtype(x, y)
+            out = torch.empty_like(x)
+            for tile in hl.tile(out.size(0)):
+                out[tile] = selected[tile]
+            return out
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            return default_dtype_output(x, y)
+
+        def backend(gm, example_inputs):
+            self.assertEqual(torch.get_default_dtype(), torch.float32)
+            torch.set_default_dtype(torch.float64)
+            try:
+                return compile_fx(gm, example_inputs)
+            finally:
+                torch.set_default_dtype(torch.float32)
+
+        original_default_dtype = torch.get_default_dtype()
+        x = torch.randn(7, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(11, device=DEVICE, dtype=torch.float32)
+        try:
+            torch.set_default_dtype(torch.float32)
+            torch._dynamo.reset()
+            with fresh_cache():
+                compiled = torch.compile(
+                    f,
+                    fullgraph=True,
+                    backend=backend,
+                    dynamic=not static_shapes,
+                )
+                with self.assertRaisesRegex(
+                    InductorError,
+                    "Helion kernel trace or compile environment differed",
+                ):
+                    compiled(x, y)
+        finally:
+            torch.set_default_dtype(original_default_dtype)
+            default_dtype_output.reset()
+            torch._dynamo.reset()
+
+    @requires_fusion_support
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_fused_lowering_rejects_container_argument_alias_change(self):
+        @helion.kernel(
+            static_shapes=False,
+            config=helion.Config(block_sizes=[64]),
+            torch_compile_fusion=True,
+        )
+        def default_dtype_output(
+            tensors: tuple[torch.Tensor, torch.Tensor],
+        ) -> torch.Tensor:
+            selected = _select_input_for_default_dtype(tensors[0], tensors[1])
+            out = torch.empty_like(tensors[0])
+            for tile in hl.tile(out.size(0)):
+                out[tile] = selected[tile]
+            return out
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            return default_dtype_output((x, y))
+
+        def backend(gm, example_inputs):
+            self.assertEqual(torch.get_default_dtype(), torch.float32)
+            torch.set_default_dtype(torch.float64)
+            try:
+                return compile_fx(gm, example_inputs)
+            finally:
+                torch.set_default_dtype(torch.float32)
+
+        original_default_dtype = torch.get_default_dtype()
+        x = torch.randn(7, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(11, device=DEVICE, dtype=torch.float32)
+        try:
+            torch.set_default_dtype(torch.float32)
+            torch._dynamo.reset()
+            with fresh_cache():
+                compiled = torch.compile(
+                    f,
+                    fullgraph=True,
+                    backend=backend,
+                    dynamic=True,
+                )
+                with self.assertRaisesRegex(
+                    InductorError,
+                    "Helion kernel trace or compile environment differed",
+                ):
+                    compiled(x, y)
+        finally:
+            torch.set_default_dtype(original_default_dtype)
+            default_dtype_output.reset()
+            torch._dynamo.reset()
+
+    @requires_fusion_support
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_fused_lowering_isolates_user_global_bound(self):
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[64]),
+            torch_compile_fusion=True,
+        )
+        def global_size_output(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                [LOWERING_STATE_TENSOR.size(0)],
+                dtype=x.dtype,
+                device=x.device,
+            )
+            for tile in hl.tile(out.size(0)):
+                out[tile] = 1.0
+            return out
+
+        def f(x: torch.Tensor) -> torch.Tensor:
+            return global_size_output(x)
+
+        original_state_size = LOWERING_STATE_TENSOR.size(0)
+        x = torch.randn(8, device=DEVICE, dtype=torch.float32)
+        try:
+            LOWERING_STATE_TENSOR.resize_(3)
+            warm = global_size_output(x)
+            self.assertEqual(warm.shape, torch.Size([3]))
+            warm_bound = next(iter(global_size_output._bound_kernels.values()))
+
+            LOWERING_STATE_TENSOR.resize_(5)
+            torch._dynamo.reset()
+            with fresh_cache():
+                actual = torch.compile(f, fullgraph=True, backend="inductor")(x)
+
+            torch.testing.assert_close(
+                actual,
+                torch.ones(5, device=DEVICE, dtype=x.dtype),
+            )
+            self.assertIs(
+                next(iter(global_size_output._bound_kernels.values())),
+                warm_bound,
+            )
+        finally:
+            LOWERING_STATE_TENSOR.resize_(original_state_size)
+            global_size_output.reset()
+            torch._dynamo.reset()
+
+    @requires_fusion_support
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_fused_lowering_rejects_dynamic_user_global_change(self):
+        @helion.kernel(
+            static_shapes=False,
+            config=helion.Config(block_sizes=[64]),
+            torch_compile_fusion=True,
+        )
+        def global_size_output(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                [LOWERING_STATE_TENSOR.size(0)],
+                dtype=x.dtype,
+                device=x.device,
+            )
+            for tile in hl.tile(out.size(0)):
+                out[tile] = 1.0
+            return out
+
+        def f(x: torch.Tensor) -> torch.Tensor:
+            return global_size_output(x)
+
+        def backend(gm, example_inputs):
+            self.assertEqual(LOWERING_STATE_TENSOR.size(0), 3)
+            LOWERING_STATE_TENSOR.resize_(5)
+            try:
+                return compile_fx(gm, example_inputs)
+            finally:
+                LOWERING_STATE_TENSOR.resize_(3)
+
+        original_state_size = LOWERING_STATE_TENSOR.size(0)
+        x = torch.randn(8, device=DEVICE, dtype=torch.float32)
+        try:
+            LOWERING_STATE_TENSOR.resize_(3)
+            torch._dynamo.reset()
+            with fresh_cache():
+                compiled = torch.compile(
+                    f,
+                    fullgraph=True,
+                    backend=backend,
+                    dynamic=True,
+                )
+                with self.assertRaisesRegex(
+                    InductorError,
+                    "Helion kernel trace or compile environment differed",
+                ):
+                    compiled(x)
+        finally:
+            LOWERING_STATE_TENSOR.resize_(original_state_size)
+            global_size_output.reset()
+            torch._dynamo.reset()
+
+    @requires_fusion_support
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_fused_lowering_rejects_device_constant_change(self):
+        global GLOBAL_SCALE_FACTOR
+
+        @helion.kernel(
+            static_shapes=False,
+            config=helion.Config(block_sizes=[64]),
+            torch_compile_fusion=True,
+        )
+        def scale_with_global(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = _apply_global_scale(x[tile])
+            return out
+
+        def f(x: torch.Tensor) -> torch.Tensor:
+            return scale_with_global(x)
+
+        def backend(gm, example_inputs):
+            global GLOBAL_SCALE_FACTOR
+
+            self.assertEqual(GLOBAL_SCALE_FACTOR, 2.5)
+            GLOBAL_SCALE_FACTOR = 3.5
+            try:
+                return compile_fx(gm, example_inputs)
+            finally:
+                GLOBAL_SCALE_FACTOR = 2.5
+
+        original_scale = GLOBAL_SCALE_FACTOR
+        x = torch.randn(8, device=DEVICE, dtype=torch.float32)
+        try:
+            GLOBAL_SCALE_FACTOR = 2.5
+            torch._dynamo.reset()
+            with fresh_cache():
+                compiled = torch.compile(
+                    f,
+                    fullgraph=True,
+                    backend=backend,
+                    dynamic=True,
+                )
+                with self.assertRaisesRegex(
+                    InductorError,
+                    "Helion kernel trace or compile environment differed",
+                ):
+                    compiled(x)
+        finally:
+            GLOBAL_SCALE_FACTOR = original_scale
+            scale_with_global.reset()
+            torch._dynamo.reset()
+
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @unittest.skip("Correctness bug with overlapping views mutation")
@@ -3458,6 +3842,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     ):
         """Test: kernel returning (tensor, scalar) called twice with different scalar literals
         inside the compile region. Verifies no helion recompilation."""
+        if not allow_torch_compile_fusion and not supports_torch_compile_fusion():
+            self.skipTest("fullgraph capture requires Helion's fusion integration")
 
         def f(
             x: torch.Tensor, *, _kernels=(k_scale_with_scalar_output,)
@@ -4103,6 +4489,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_tuple_input(self, allow_torch_compile_fusion):
         """Test: kernel with tuple of tensors as input."""
+        if not allow_torch_compile_fusion and not supports_torch_compile_fusion():
+            self.skipTest("fullgraph capture requires Helion's fusion integration")
 
         @helion.kernel(autotune_effort="none")
         def k_sum_tuple(tensors: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
@@ -4175,6 +4563,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_dict_input(self, allow_torch_compile_fusion):
         """Test: kernel with dict of tensors as input."""
+        if not allow_torch_compile_fusion and not supports_torch_compile_fusion():
+            self.skipTest("fullgraph capture requires Helion's fusion integration")
 
         @helion.kernel(autotune_effort="none")
         def k_sum_dict(tensors: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -4251,6 +4641,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             compare_fn=compare,
             kernels_ref=[k_returns_string_ref],
             expected_num_kernels_ref=1,
+            # This test skips its fusion=False leg, so check the ref here.
+            ref_on_fusion_leg=True,
         )
 
     @requires_fusion_support

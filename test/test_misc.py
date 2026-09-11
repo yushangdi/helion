@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from collections import namedtuple
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import math
 import os
@@ -9,6 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 from typing import cast
 import unittest
 from unittest.mock import patch
@@ -33,6 +35,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfPyTorchBaseVerLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 from helion.runtime.settings import _get_backend
@@ -204,28 +207,33 @@ class TestMisc(RefEagerTestBase, TestCase):
         def foo(x: torch.Tensor) -> torch.Tensor:
             return x
 
-        # Case 1: Register new lowering for the custom op
-        @register_inductor_lowering(
-            torch.ops.helion_test.foo, lowering_dict=inductor_lowering_dispatch
-        )
-        def foo_lowering(x):
-            return x
-
-        # Case 2: Register a patched lowering for add.Tensor
-        @register_inductor_lowering(
-            torch.ops.aten.add.Tensor, lowering_dict=inductor_lowering_dispatch
-        )
-        def add_lowering(*args, **kwargs):
-            pass
-
-        # Check that within `patch_inductor_lowerings()` context manager, the patched lowerings are used.
-        with patch_inductor_lowerings():
-            assert torch.ops.helion_test.foo in torch._inductor.lowering.lowerings
-            assert torch.ops.aten.add.Tensor in torch._inductor.lowering.lowerings
-            assert (
-                torch._inductor.lowering.lowerings[torch.ops.aten.add.Tensor]
-                != inductor_lowerings_orig[torch.ops.aten.add.Tensor]
+        with patch.dict(inductor_lowering_dispatch):
+            # Case 1: Register new lowering for the custom op
+            @register_inductor_lowering(
+                torch.ops.helion_test.foo, lowering_dict=inductor_lowering_dispatch
             )
+            def foo_lowering(x):
+                return x
+
+            # Case 2: Register a patched lowering for add.Tensor
+            @register_inductor_lowering(
+                torch.ops.aten.add.Tensor, lowering_dict=inductor_lowering_dispatch
+            )
+            def add_lowering(*args, **kwargs):
+                pass
+
+            # Check that the patched lowerings are installed only in the context.
+            with patch_inductor_lowerings():
+                assert torch.ops.helion_test.foo in torch._inductor.lowering.lowerings
+                assert torch.ops.aten.add.Tensor in torch._inductor.lowering.lowerings
+                assert (
+                    torch._inductor.lowering.lowerings[torch.ops.aten.add.Tensor]
+                    != inductor_lowerings_orig[torch.ops.aten.add.Tensor]
+                )
+                with pytest.raises(KeyError):
+                    torch._inductor.lowering.lowerings[torch.ops.helion_test.foo](
+                        object()
+                    )
 
         # Check that outside the context manager, the original lowerings are restored.
         assert len(torch._inductor.lowering.lowerings.keys()) == len(
@@ -233,6 +241,136 @@ class TestMisc(RefEagerTestBase, TestCase):
         )
         for op in torch._inductor.lowering.lowerings:
             assert torch._inductor.lowering.lowerings[op] == inductor_lowerings_orig[op]
+
+    @skipIfRefEager("Inductor lowering tests not applicable in ref eager mode")
+    def test_overlapping_inductor_lowering_patches_restore_once(self):
+        from helion._compiler.inductor_lowering_extra import patch_inductor_lowerings
+
+        lowerings = torch._inductor.lowering.lowerings
+        restored_op = torch.ops.aten.rsqrt.default
+        replaced_op = torch.ops.aten.sqrt.default
+        restored_original = lowerings[restored_op]
+        replaced_original = lowerings[replaced_op]
+
+        def replacement_lowering() -> None:
+            pass
+
+        entered = [threading.Event(), threading.Event()]
+        release = [threading.Event(), threading.Event()]
+
+        def use_patch(index: int) -> None:
+            with patch_inductor_lowerings():
+                entered[index].set()
+                self.assertTrue(release[index].wait(5))
+                if index == 0:
+                    raise RuntimeError("test exceptional cleanup")
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(use_patch, index) for index in range(2)]
+                try:
+                    self.assertTrue(entered[0].wait(5))
+                    self.assertTrue(entered[1].wait(5))
+                    installed = lowerings[restored_op]
+                    self.assertIsNot(installed, restored_original)
+                    lowerings[replaced_op] = replacement_lowering
+
+                    release[0].set()
+                    with self.assertRaisesRegex(
+                        RuntimeError, "test exceptional cleanup"
+                    ):
+                        futures[0].result(timeout=5)
+                    self.assertIs(lowerings[restored_op], installed)
+                    self.assertIs(lowerings[replaced_op], replacement_lowering)
+
+                    release[1].set()
+                    futures[1].result(timeout=5)
+                finally:
+                    release[0].set()
+                    release[1].set()
+
+            self.assertIs(torch._inductor.lowering.lowerings, lowerings)
+            self.assertIs(lowerings[restored_op], restored_original)
+            self.assertIs(lowerings[replaced_op], replacement_lowering)
+        finally:
+            lowerings[restored_op] = restored_original
+            lowerings[replaced_op] = replaced_original
+
+    @skipIfRefEager("Inductor lowering tests not applicable in ref eager mode")
+    def test_inductor_lowering_override_is_helion_scoped(self):
+        from helion._compiler.compile_environment import CompileEnvironment
+        from helion._compiler.inductor_lowering_extra import (
+            _compile_environment_lowering,
+        )
+
+        previous_result = object()
+        patched_result = object()
+        scoped = _compile_environment_lowering(
+            "test_op",
+            lambda: patched_result,
+            lambda: previous_result,
+        )
+
+        self.assertIs(scoped(), previous_result)
+        with patch.object(CompileEnvironment, "has_current", return_value=True):
+            self.assertIs(scoped(), patched_result)
+
+    @skipIfRefEager("Inductor lowering tests not applicable in ref eager mode")
+    def test_fp32_fallback_is_scoped_to_helion_triton(self):
+        from helion._compiler import inductor_lowering_extra
+        from helion._compiler.compile_environment import CompileEnvironment
+
+        class FakeTensorBox:
+            def __init__(self, dtype: torch.dtype) -> None:
+                self.dtype = dtype
+
+            def get_dtype(self) -> torch.dtype:
+                return self.dtype
+
+        value = FakeTensorBox(torch.bfloat16)
+        fp32_value = FakeTensorBox(torch.float32)
+        fp32_result = FakeTensorBox(torch.float32)
+        final_result = FakeTensorBox(torch.bfloat16)
+        bypass_result = object()
+        calls: list[FakeTensorBox] = []
+
+        def original(arg: object) -> object:
+            assert isinstance(arg, FakeTensorBox)
+            calls.append(arg)
+            return fp32_result if arg is fp32_value else bypass_result
+
+        with (
+            patch.object(inductor_lowering_extra, "TensorBox", FakeTensorBox),
+            patch.object(
+                inductor_lowering_extra,
+                "to_dtype",
+                side_effect=(fp32_value, final_result),
+            ) as to_dtype,
+        ):
+            fallback = (
+                inductor_lowering_extra.create_fp16_to_fp32_unary_fallback_lowering(
+                    original
+                )
+            )
+            self.assertIs(fallback(value), bypass_result)
+            with (
+                patch.object(CompileEnvironment, "has_current", return_value=True),
+                patch.object(CompileEnvironment, "current") as current,
+            ):
+                current.return_value.backend_name = "pallas"
+                self.assertIs(fallback(value), bypass_result)
+
+                current.return_value.backend_name = "triton"
+                self.assertIs(fallback(value), final_result)
+
+        self.assertEqual(calls, [value, value, fp32_value])
+        self.assertEqual(
+            to_dtype.call_args_list,
+            [
+                unittest.mock.call(value, torch.float32),
+                unittest.mock.call(fp32_result, torch.bfloat16),
+            ],
+        )
 
     @skipIfRefEager("Inductor config tests not applicable in ref eager mode")
     def test_patched_inductor_config(self):
@@ -584,16 +722,55 @@ class TestMisc(RefEagerTestBase, TestCase):
     def test_sequence_assert(self, static_shapes):
         @helion.kernel(static_shapes=static_shapes)
         def kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-            assert a.size() == b.size()
+            assert a.shape == b.shape
             out = torch.empty_like(a)
 
             for tile in hl.tile(a.size()):
-                out[tile] = a[tile] + b[tile]
+                out[tile] = a[tile] + b[tile] + b.size(0) + b.size(1)
             return out
 
-        a = torch.randn(16, 1, device=DEVICE)
-        code, result = code_and_output(kernel, (a, a))
-        torch.testing.assert_close(result, a + a)
+        a = torch.randn(16, 8, device=DEVICE)
+        b = torch.randn_like(a)
+        code, result = code_and_output(kernel, (a, b))
+        torch.testing.assert_close(result, a + b + sum(b.shape))
+
+        if (
+            not static_shapes
+            and _get_backend() == "triton"
+            and not self._in_ref_eager_mode
+        ):
+            self.assertIn("a_size_0", code)
+            self.assertNotIn("b_size_", code)
+            bound = kernel.bind((a, b))
+            compiled = bound.compile_config(bound.config_spec.default_config())
+            with self.assertRaises(AssertionError):
+                compiled(a, torch.randn(16, 7, device=DEVICE))
+
+    def test_size_assert_unifies_symbols(self):
+        @helion.kernel(static_shapes=False)
+        def kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            # Equality expressions in messages and nested asserts must not unify.
+            assert a.size(0) == b.size(1), a.size(1) == b.size(0)
+            if a.size(0) > 0:
+                assert a.size(1) == b.size(0)
+            out = torch.empty_like(a)
+
+            for tile in hl.tile((b.size(1), a.size(1))):
+                out[tile] = a[tile] + a.size(0) + b.size(0) + b.size(1)
+            return out
+
+        a = torch.randn(16, 8, device=DEVICE)
+        b = torch.randn(8, 16, device=DEVICE)
+        code, result = code_and_output(kernel, (a, b), block_size=[8, 8])
+        torch.testing.assert_close(
+            result,
+            a + a.size(0) + b.size(0) + b.size(1),
+        )
+
+        if _get_backend() == "triton":
+            self.assertIn("a_size_0", code)
+            self.assertNotIn("b_size_1", code)
+            self.assertIn("b_size_0", code)
 
     @skipIfRefEager("no code execution")
     def test_triton_repro_add(self):
@@ -734,6 +911,25 @@ class TestMisc(RefEagerTestBase, TestCase):
         ref_out = ref_max(x)
 
         torch.testing.assert_close(helion_out, ref_out, rtol=1e-3, atol=1e-3)
+
+    def test_builtin_min_max_over_scalar_tensors(self) -> None:
+        """min()/max() mixing a loaded 0-D tensor with an int must pick correctly.
+
+        The Pallas worklist rewrites such a bound into its own metadata, so the
+        traced op is dead there and a min/max mix-up would not show up in those
+        numerics.  Here the value reaches the output.
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def clamp_kernel(values):
+            out = torch.zeros_like(values)
+            for i in hl.grid(values.size(0)):
+                out[i] = min(max(values[i], 3), 7)
+            return out
+
+        values = torch.tensor([-5, 0, 3, 4, 7, 9], dtype=torch.int32, device=DEVICE)
+        _, result = code_and_output(clamp_kernel, (values,))
+        torch.testing.assert_close(result, values.clamp(3, 7))
 
     def test_torch_tensor_constant_in_kernel(self):
         """Test that torch.tensor() with a constant value works inside a kernel."""
@@ -911,6 +1107,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         if _get_backend() == "triton":
             self.assertIn("tl.associative_scan", code)
 
+    @skipIfXPU("Triton topk produces incorrect values on XPU")
     def test_torch_topk_in_kernel(self):
         """Test that torch.topk works inside Helion kernels.
 
@@ -941,6 +1138,7 @@ class TestMisc(RefEagerTestBase, TestCase):
             # Uses tl.topk for largest=True
             self.assertIn("tl.topk", code)
 
+    @skipIfXPU("Triton sort produces incorrect values on XPU")
     def test_torch_topk_smallest(self):
         """Test torch.topk with largest=False (k smallest elements)."""
 
@@ -1171,6 +1369,36 @@ class TestTritonExactGelu(RefEagerTestBase, TestCase):
         self.assertIn("libdevice.erf", code)
         self.assertIn("tl.float32", code)
         self.assertIn("tl.bfloat16", code)
+
+
+class TestHelionCutePrinter(TestCase):
+    def test_compound_division_operands_are_parenthesized(self) -> None:
+        import sympy
+        from torch.utils._sympy.functions import CeilDiv
+        from torch.utils._sympy.functions import CleanDiv
+        from torch.utils._sympy.functions import FloorDiv
+        from torch.utils._sympy.functions import PythonMod
+
+        from helion._compiler.cute.printer import cute_texpr
+
+        x = sympy.Symbol("x", integer=True)
+        expressions = (
+            FloorDiv(2 * x + 1, 128),
+            PythonMod(2 * x + 1, 32),
+            sympy.Function.__new__(
+                CleanDiv, 2 * x + 1, sympy.Integer(128), evaluate=False
+            ),
+            sympy.Function.__new__(
+                CeilDiv, 2 * x + 1, sympy.Integer(128), evaluate=False
+            ),
+        )
+        for expression in expressions:
+            rendered = cute_texpr(expression)
+            for value in (0, 31, 64, 129):
+                self.assertEqual(
+                    eval(rendered, {"__builtins__": {}}, {"x": value}),
+                    int(expression.subs(x, value)),
+                )
 
 
 @onlyBackends(["triton"])
